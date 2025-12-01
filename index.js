@@ -1779,26 +1779,23 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
     let canonicalByEpisodeId = {};
 
     if (episodeIds.length > 0) {
-      // 3) Hent "kanoniske" episode-trips som eier galleri / hoteller
+      // 3) Hent canonical galleri / hoteller / pakkeliste direkte fra grenselos_episodes
       const canonRes = await query(
         `
-        SELECT
-          source_episode_id,
-          gallery,
-          hotels,
-          packing_list
-        FROM trips
-        WHERE user_id = $1
-          AND source_type = 'grenselos_episode'
-          AND source_episode_id = ANY($2)
+          SELECT
+            episode_id,
+            gallery,
+            hotels,
+            packing_list
+          FROM grenselos_episodes
+          WHERE episode_id = ANY($1)
         `,
-        [req.user.id, episodeIds]
+        [episodeIds]
       );
 
       canonicalByEpisodeId = canonRes.rows.reduce((acc, row) => {
-        if (!row.source_episode_id) return acc;
+        if (!row.episode_id) return acc;
 
-        // Parse feltene én gang
         let gallery = row.gallery;
         let hotels  = row.hotels;
         let packing = row.packing_list;
@@ -1813,7 +1810,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
           try { packing = JSON.parse(packing); } catch { packing = []; }
         }
 
-        acc[row.source_episode_id] = {
+        acc[row.episode_id] = {
           gallery: Array.isArray(gallery) ? gallery : [],
           hotels: Array.isArray(hotels) ? hotels : [],
           packing_list: Array.isArray(packing) ? packing : []
@@ -1822,7 +1819,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       }, {});
     }
 
-    // 4) Normaliser alle brukerreiser + legg inn fallback fra episode-trips
+    // 4) Normaliser alle brukerreiser + legg inn fallback fra canonical episode-data
     const trips = rows.map((row) => {
       let stops   = row.stops;
       let packing = row.packing_list;
@@ -1848,22 +1845,26 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       hotels  = Array.isArray(hotels) ? hotels : [];
 
       // 🔁 Fallback: hvis denne reisen er basert på en episode,
-      // og den reisen har tomt gallery / tomme hotels,
-      // så bruk verdiene fra den kanoniske episode-trippen.
+      // og reisen har tomt gallery / tomme hotels / tom pakkeliste,
+      // bruk canonical verdier fra grenselos_episodes.
       const episodeId = row.source_episode_id;
       if (episodeId && canonicalByEpisodeId[episodeId]) {
-        const canon = canonicalByEpisodeId[episodeId];
+        const canon = canonicalByEpisodeId[episodeId] || {};
 
-        if (!gallery.length && Array.isArray(canon.gallery) && canon.gallery.length) {
-          gallery = canon.gallery;
+        const canonGallery = Array.isArray(canon.gallery) ? canon.gallery : [];
+        const canonHotels  = Array.isArray(canon.hotels) ? canon.hotels : [];
+        const canonPacking = Array.isArray(canon.packing_list) ? canon.packing_list : [];
+
+        if (!gallery.length && canonGallery.length) {
+          gallery = canonGallery;
         }
 
-        if (!hotels.length && Array.isArray(canon.hotels) && canon.hotels.length) {
-          hotels = canon.hotels;
+        if (!hotels.length && canonHotels.length) {
+          hotels = canonHotels;
         }
 
-        if (!packing.length && Array.isArray(canon.packing_list) && canon.packing_list.length) {
-          packing = canon.packing_list;
+        if (!packing.length && canonPacking.length) {
+          packing = canonPacking;
         }
       }
 
@@ -1892,7 +1893,7 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       packing_list,
       hotels,
       source_type,
-      source_episode_id  // 👈 NYTT FRA KLIENT
+      source_episode_id // 👈 fra klient
     } = req.body ?? {};
 
     if (!title || !Array.isArray(stops)) {
@@ -1901,26 +1902,23 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
         .json({ error: "Mangler title eller stops (array) i request body." });
     }
 
-    // Kvote-sjekk som før
+    // Kvote-sjekk
     const { isPremium, tripCount, freeLimit } = await getUserTripStats(req.user.id);
 
     if (!isPremium && tripCount >= freeLimit) {
       return res.status(402).json({
         error: "Gratisgrensen er nådd.",
         code: "FREE_LIMIT_REACHED",
-        details: {
-          tripCount,
-          freeLimit
-        }
+        details: { tripCount, freeLimit }
       });
     }
 
     // ---------- Normaliser innkommende data ----------
-    let finalStops = Array.isArray(stops) ? stops : [];
+    let finalStops   = Array.isArray(stops) ? stops : [];
     let finalPacking = Array.isArray(packing_list) ? packing_list : [];
-    let finalHotels = Array.isArray(hotels) ? hotels : [];
+    let finalHotels  = Array.isArray(hotels) ? hotels : [];
     let finalGallery = [];
-    let sourceType = null;
+    let sourceType   = null;
 
     // Hjelper for å parse ev. JSON-strenger fra DB
     const parseArrayField = (value) => {
@@ -1941,6 +1939,7 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
     if (source_episode_id) {
       sourceType = "user_episode_trip";
 
+      // 1) Forsøk å arve fra system-trip (gammel modell)
       const sysRes = await query(
         `
           SELECT packing_list, hotels, gallery
@@ -1957,8 +1956,6 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       if (sysRes.rowCount > 0) {
         const sys = sysRes.rows[0];
 
-        // Hvis klienten IKKE har sendt egen pakkeliste/hoteller,
-        // arver vi disse fra system-trippen.
         if (!finalPacking.length) {
           finalPacking = parseArrayField(sys.packing_list);
         }
@@ -1966,8 +1963,42 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
           finalHotels = parseArrayField(sys.hotels);
         }
 
-        finalGallery = parseArrayField(sys.gallery);
+        const g = parseArrayField(sys.gallery);
+        if (Array.isArray(g) && g.length) {
+          finalGallery = g;
+        }
       }
+
+      // 2) Hvis vi fortsatt mangler data, arver vi direkte fra grenselos_episodes
+      if (!finalPacking.length || !finalHotels.length || !finalGallery.length) {
+        const epRes = await query(
+          `
+            SELECT gallery, hotels, packing_list
+            FROM grenselos_episodes
+            WHERE episode_id = $1
+            LIMIT 1
+          `,
+          [source_episode_id]
+        );
+
+        if (epRes.rowCount > 0) {
+          const ep = epRes.rows[0];
+
+          if (!finalPacking.length) {
+            finalPacking = parseArrayField(ep.packing_list);
+          }
+          if (!finalHotels.length) {
+            finalHotels = parseArrayField(ep.hotels);
+          }
+          if (!finalGallery.length) {
+            finalGallery = parseArrayField(ep.gallery);
+          }
+        }
+      }
+    } else {
+      // Vanlige KI-/manuelle reiser: hvis du vil, kan du beholde ev. source_type
+      // som kommer fra klienten:
+      sourceType = source_type || null;
     }
 
     // ---------- Lagre reisen ----------
