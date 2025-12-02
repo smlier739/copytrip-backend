@@ -1779,22 +1779,25 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
     let canonicalByEpisodeId = {};
 
     if (episodeIds.length > 0) {
-      // 3) Hent canonical galleri / hoteller / pakkeliste direkte fra grenselos_episodes
+      // 3) Hent canonical galleri / hoteller / pakkeliste fra SYSTEM-TRIPS i trips
       const canonRes = await query(
         `
           SELECT
-            episode_id,
+            source_episode_id,
             gallery,
             hotels,
             packing_list
-          FROM grenselos_episodes
-          WHERE episode_id = ANY($1)
+          FROM trips
+          WHERE source_type = 'grenselos_episode'
+            AND source_episode_id = ANY($1)
+            AND user_id = $2
         `,
-        [episodeIds]
+        [episodeIds, req.user.id]
       );
 
       canonicalByEpisodeId = canonRes.rows.reduce((acc, row) => {
-        if (!row.episode_id) return acc;
+        const episodeId = row.source_episode_id;
+        if (!episodeId) return acc;
 
         let gallery = row.gallery;
         let hotels  = row.hotels;
@@ -1810,7 +1813,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
           try { packing = JSON.parse(packing); } catch { packing = []; }
         }
 
-        acc[row.episode_id] = {
+        acc[episodeId] = {
           gallery: Array.isArray(gallery) ? gallery : [],
           hotels: Array.isArray(hotels) ? hotels : [],
           packing_list: Array.isArray(packing) ? packing : []
@@ -1819,7 +1822,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       }, {});
     }
 
-    // 4) Normaliser alle brukerreiser + legg inn fallback fra canonical episode-data
+    // 4) Normaliser alle brukerreiser + legg inn fallback fra canonical system-trip
     const trips = rows.map((row) => {
       let stops   = row.stops;
       let packing = row.packing_list;
@@ -1846,10 +1849,10 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
 
       // 🔁 Fallback: hvis denne reisen er basert på en episode,
       // og reisen har tomt gallery / tomme hotels / tom pakkeliste,
-      // bruk canonical verdier fra grenselos_episodes.
+      // bruk canonical verdier fra system-trip (source_type='grenselos_episode').
       const episodeId = row.source_episode_id;
       if (episodeId && canonicalByEpisodeId[episodeId]) {
-        const canon = canonicalByEpisodeId[episodeId] || {};
+        const canon = canonicalByEpisodeId[episodeId];
 
         const canonGallery = Array.isArray(canon.gallery) ? canon.gallery : [];
         const canonHotels  = Array.isArray(canon.hotels) ? canon.hotels : [];
@@ -1939,7 +1942,7 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
     if (source_episode_id) {
       sourceType = "user_episode_trip";
 
-      // 1) Forsøk å arve fra system-trip (gammel modell)
+      // 1) Forsøk å arve fra system-trip i trips-tabellen
       const sysRes = await query(
         `
           SELECT packing_list, hotels, gallery
@@ -1968,36 +1971,8 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
           finalGallery = g;
         }
       }
-
-      // 2) Hvis vi fortsatt mangler data, arver vi direkte fra grenselos_episodes
-      if (!finalPacking.length || !finalHotels.length || !finalGallery.length) {
-        const epRes = await query(
-          `
-            SELECT gallery, hotels, packing_list
-            FROM grenselos_episodes
-            WHERE episode_id = $1
-            LIMIT 1
-          `,
-          [source_episode_id]
-        );
-
-        if (epRes.rowCount > 0) {
-          const ep = epRes.rows[0];
-
-          if (!finalPacking.length) {
-            finalPacking = parseArrayField(ep.packing_list);
-          }
-          if (!finalHotels.length) {
-            finalHotels = parseArrayField(ep.hotels);
-          }
-          if (!finalGallery.length) {
-            finalGallery = parseArrayField(ep.gallery);
-          }
-        }
-      }
     } else {
-      // Vanlige KI-/manuelle reiser: hvis du vil, kan du beholde ev. source_type
-      // som kommer fra klienten:
+      // Vanlige KI-/manuelle reiser
       sourceType = source_type || null;
     }
 
