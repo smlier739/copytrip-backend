@@ -1,0 +1,15 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "6ead4af8-70ac-4d07-a3f5-ca699a8a18ba"
+      }
+    },
+    "ios": {
+      "bundleIdentifier": "com.smlier67.copytripbackend",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    }
+  }
+}
