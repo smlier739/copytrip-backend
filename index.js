@@ -1365,6 +1365,109 @@ app.get(
   }
 );
 
+// -------------------------------------------------------
+//  DEBUG: INSPEKTÉR ÉN TRIP + EV. SYSTEM-TRIP
+// -------------------------------------------------------
+
+app.get(
+  "/api/debug/trip/:id",
+  authMiddleware,
+  adminOnlyMiddleware,
+  async (req, res) => {
+    try {
+      const tripId = req.params.id;
+
+      // Hjelper for å parse felt som kan være JSON-string/array/null
+      const parseJsonArray = (value) => {
+        if (!value) return [];
+        if (Array.isArray(value)) return value;
+        if (typeof value === "string") {
+          try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed) ? parsed : [];
+          } catch {
+            return [];
+          }
+        }
+        return [];
+      };
+
+      // 1) Hent selve trip-en (den du ser i appen under "Lagrede reiser")
+      const tripRes = await query(
+        `
+        SELECT *
+        FROM trips
+        WHERE id = $1
+        `,
+        [tripId]
+      );
+
+      if (tripRes.rowCount === 0) {
+        return res.status(404).json({ error: "Fant ikke trip med denne ID-en." });
+      }
+
+      const tripRow = tripRes.rows[0];
+
+      const parsedTrip = {
+        ...tripRow,
+        stops:        parseJsonArray(tripRow.stops),
+        packing_list: parseJsonArray(tripRow.packing_list),
+        gallery:      parseJsonArray(tripRow.gallery),
+        hotels:       parseJsonArray(tripRow.hotels)
+      };
+
+      // 2) Hvis den er knyttet til en Grenseløs-episode:
+      //    hent "canonical" system-trip for samme episode
+      let systemTripRaw = null;
+      let systemTripParsed = null;
+
+      if (tripRow.source_episode_id) {
+        const sysRes = await query(
+          `
+          SELECT *
+          FROM trips
+          WHERE source_type = 'grenselos_episode'
+            AND source_episode_id = $1
+          ORDER BY created_at ASC
+          LIMIT 1
+          `,
+          [tripRow.source_episode_id]
+        );
+
+        if (sysRes.rowCount > 0) {
+          systemTripRaw = sysRes.rows[0];
+          systemTripParsed = {
+            ...systemTripRaw,
+            stops:        parseJsonArray(systemTripRaw.stops),
+            packing_list: parseJsonArray(systemTripRaw.packing_list),
+            gallery:      parseJsonArray(systemTripRaw.gallery),
+            hotels:       parseJsonArray(systemTripRaw.hotels)
+          };
+        }
+      }
+
+      // 3) Returnér alt samlet, så du kan se forskjellen tydelig
+      res.json({
+        ok: true,
+        tripId,
+        userTrip: {
+          raw: tripRow,
+          parsed: parsedTrip
+        },
+        systemTrip: systemTripRaw
+          ? {
+              raw: systemTripRaw,
+              parsed: systemTripParsed
+            }
+          : null
+      });
+    } catch (e) {
+      console.error("/api/debug/trip/:id-feil:", e);
+      res.status(500).json({ error: "Kunne ikke inspisere trip." });
+    }
+  }
+);
+
 app.post(
   "/api/admin/grenselos-episodes/:episodeId/gallery",
   authMiddleware,
@@ -1758,20 +1861,20 @@ VIKTIG:
 });
 
 // -------------------------------------------------------
-//  TRIPS — brukerreiser + evt. fallback til episode-galleri/hoteller
+//  TRIPS — brukerreiser + fallback til episode-galleri/hoteller
 // -------------------------------------------------------
 
 app.get("/api/trips", authMiddleware, async (req, res) => {
   try {
-    // 1) Hent brukerreiser (ikke de rene system-reisene)
+    // 1) Hent brukerreiser (ikke selve system-reisene)
     const baseRes = await query(
       `
       SELECT *
       FROM trips
       WHERE user_id = $1
         AND (
-          source_type IS NULL          -- vanlige KI-/manuelle reiser
-          OR source_type = 'template'  -- maler
+          source_type IS NULL               -- vanlige KI-/manuelle reiser
+          OR source_type = 'template'       -- maler
           OR source_type = 'user_episode_trip' -- reiser laget fra episode
         )
       ORDER BY created_at DESC
@@ -1781,7 +1884,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
 
     const rows = baseRes.rows || [];
 
-    // 2) Finn alle episodene disse reisene evt. peker på
+    // 2) Finn alle episoder disse reisene evt. peker på
     const episodeIds = [
       ...new Set(
         rows
@@ -1790,10 +1893,25 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       )
     ];
 
+    // Hjelper: parse et felt som kan være JSON-string, array eller null
+    const parseJsonArray = (value) => {
+      if (!value) return [];
+      if (Array.isArray(value)) return value;
+      if (typeof value === "string") {
+        try {
+          const parsed = JSON.parse(value);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch {
+          return [];
+        }
+      }
+      return [];
+    };
+
     let canonicalByEpisodeId = {};
 
     if (episodeIds.length > 0) {
-      // 3) Hent canonical galleri / hoteller / pakkeliste fra SYSTEM-TRIPS i trips
+      // 3) Hent canonical galleri / hoteller / pakkeliste fra SYSTEM-TRIPS
       const canonRes = await query(
         `
           SELECT
@@ -1813,76 +1931,32 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
         const episodeId = row.source_episode_id;
         if (!episodeId) return acc;
 
-        let gallery = row.gallery;
-        let hotels  = row.hotels;
-        let packing = row.packing_list;
-
-        if (typeof gallery === "string") {
-          try { gallery = JSON.parse(gallery); } catch { gallery = []; }
-        }
-        if (typeof hotels === "string") {
-          try { hotels = JSON.parse(hotels); } catch { hotels = []; }
-        }
-        if (typeof packing === "string") {
-          try { packing = JSON.parse(packing); } catch { packing = []; }
-        }
-
         acc[episodeId] = {
-          gallery: Array.isArray(gallery) ? gallery : [],
-          hotels: Array.isArray(hotels) ? hotels : [],
-          packing_list: Array.isArray(packing) ? packing : []
+          gallery: parseJsonArray(row.gallery),
+          hotels: parseJsonArray(row.hotels),
+          packing_list: parseJsonArray(row.packing_list)
         };
         return acc;
       }, {});
     }
 
-    // 4) Normaliser alle brukerreiser + legg inn fallback fra canonical system-trip
+    // 4) Normaliser alle brukerreiser + legg inn *overstyrende* fallback
     const trips = rows.map((row) => {
-      let stops   = row.stops;
-      let packing = row.packing_list;
-      let gallery = row.gallery;
-      let hotels  = row.hotels;
+      let stops   = parseJsonArray(row.stops);
+      let packing = parseJsonArray(row.packing_list);
+      let gallery = parseJsonArray(row.gallery);
+      let hotels  = parseJsonArray(row.hotels);
 
-      if (typeof stops === "string") {
-        try { stops = JSON.parse(stops); } catch { stops = []; }
-      }
-      if (typeof packing === "string") {
-        try { packing = JSON.parse(packing); } catch { packing = []; }
-      }
-      if (typeof gallery === "string") {
-        try { gallery = JSON.parse(gallery); } catch { gallery = []; }
-      }
-      if (typeof hotels === "string") {
-        try { hotels = JSON.parse(hotels); } catch { hotels = []; }
-      }
-
-      stops   = Array.isArray(stops) ? stops : [];
-      packing = Array.isArray(packing) ? packing : [];
-      gallery = Array.isArray(gallery) ? gallery : [];
-      hotels  = Array.isArray(hotels) ? hotels : [];
-
-      // 🔁 Fallback: hvis denne reisen er basert på en episode,
-      // og reisen har tomt gallery / tomme hotels / tom pakkeliste,
-      // bruk canonical verdier fra system-trip (source_type='grenselos_episode').
       const episodeId = row.source_episode_id;
+
+      // 🔁 Hvis denne reisen er basert på en Grenseløs-episode,
+      // overstyr galleri/hotels/packing_list med canonical data
       if (episodeId && canonicalByEpisodeId[episodeId]) {
         const canon = canonicalByEpisodeId[episodeId];
 
-        const canonGallery = Array.isArray(canon.gallery) ? canon.gallery : [];
-        const canonHotels  = Array.isArray(canon.hotels) ? canon.hotels : [];
-        const canonPacking = Array.isArray(canon.packing_list) ? canon.packing_list : [];
-
-        if (!gallery.length && canonGallery.length) {
-          gallery = canonGallery;
-        }
-
-        if (!hotels.length && canonHotels.length) {
-          hotels = canonHotels;
-        }
-
-        if (!packing.length && canonPacking.length) {
-          packing = canonPacking;
-        }
+        gallery = parseJsonArray(canon.gallery);
+        hotels  = parseJsonArray(canon.hotels);
+        packing = parseJsonArray(canon.packing_list);
       }
 
       return {
