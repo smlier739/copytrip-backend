@@ -1975,6 +1975,46 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
   }
 });
 
+// -------------------------------------------------------
+//  GENERISKE BILDER FOR VIRTUELL REISE (IKKE-EPISODE-TRIPS)
+// -------------------------------------------------------
+
+// En liten liste med generiske reisebilder (fri bruk via picsum.photos)
+// Disse ligger EKSTERN på nett og trenger ikke å lastes opp i backend.
+const GENERIC_VIRTUAL_TRIP_IMAGES = [
+  {
+    url: "https://picsum.photos/seed/grenselos1/1200/800",
+    title: "Utsikt over fjell og dal",
+    caption: "Illustrasjonsfoto – generisk reisebilde."
+  },
+  {
+    url: "https://picsum.photos/seed/grenselos2/1200/800",
+    title: "Kystlinje og hav",
+    caption: "Illustrasjonsfoto – inspirasjon til kystreiser."
+  },
+  {
+    url: "https://picsum.photos/seed/grenselos3/1200/800",
+    title: "Bygate på kveldstid",
+    caption: "Illustrasjonsfoto – storbyfølelse."
+  },
+  {
+    url: "https://picsum.photos/seed/grenselos4/1200/800",
+    title: "Små vei og åpent landskap",
+    caption: "Illustrasjonsfoto – roadtrip-stemning."
+  }
+];
+
+// Hent et lite sett (f.eks. 3) tilfeldige generiske bilder
+function getGenericVirtualTripGallery(count = 3) {
+  if (!Array.isArray(GENERIC_VIRTUAL_TRIP_IMAGES) || GENERIC_VIRTUAL_TRIP_IMAGES.length === 0) {
+    return [];
+  }
+
+  // Enkel shuffle + slice
+  const shuffled = [...GENERIC_VIRTUAL_TRIP_IMAGES].sort(() => 0.5 - Math.random());
+  return shuffled.slice(0, Math.min(count, GENERIC_VIRTUAL_TRIP_IMAGES.length));
+}
+
 app.post("/api/trips", authMiddleware, async (req, res) => {
   try {
     const {
@@ -2060,8 +2100,14 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
         }
       }
     } else {
-      // Vanlige KI-/manuelle reiser
+      // Vanlige KI-/manuelle reiser (IKKE fra episode)
       sourceType = source_type || null;
+
+      // 🌍 NYTT: Gi “fra scratch”-reiser et generisk galleri,
+      // slik at de også får virtuell reise rett ut av boksen.
+      if (!finalGallery.length) {
+        finalGallery = getGenericVirtualTripGallery(3);
+      }
     }
 
     // ---------- Lagre reisen ----------
