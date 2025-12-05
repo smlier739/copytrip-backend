@@ -2136,6 +2136,23 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
         }
       }
 
+      // 🏨 NORMALISER HOTELLER: sørg for at alle har .url
+      hotels = (hotels || [])
+        .filter((h) => h && typeof h === "object")
+        .map((h) => {
+          const url =
+            h.url ||
+            h.booking_url ||
+            h.link ||
+            h.external_url ||
+            null;
+
+          return {
+            ...h,
+            url
+          };
+        });
+
       // 🌟 Normaliser pakkelista til formatet appen forventer
       const normalizedPacking = normalizePackingForClient(packing);
 
