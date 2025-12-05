@@ -252,23 +252,37 @@ function normalizeTripStructure(parsed) {
     };
   });
 
-  // ---- PACKING LIST ----
-  const rawPacking =
-    parsed.packing_list ||
-    parsed.packingList ||
-    parsed.packing ||
-    [];
+    // ---- PACKING LIST ----
+    const rawPacking =
+      parsed.packing_list ||
+      parsed.packingList ||
+      parsed.packing ||
+      [];
 
-  const packing_list = Array.isArray(rawPacking)
-    ? rawPacking.map((group) => {
+    let packing_list = [];
+
+    if (Array.isArray(rawPacking)) {
+      packing_list = rawPacking.map((group) => {
+        // Hvis KI har sendt en ren streng, gjør den om til et "group"-objekt
+        if (typeof group === "string") {
+          return {
+            category: "Annet",
+            items: group
+              .split(/[\n,]/)
+              .map((s) => s.trim())
+              .filter(Boolean)
+          };
+        }
+
         const category =
           typeof group.category === "string" && group.category.trim()
             ? group.category.trim()
             : "Generelt";
 
         let items = group.items;
+
         if (!Array.isArray(items)) {
-          // Hvis KI sender streng, splitt på komma / linjeskift
+          // Hvis KI sender én streng, splitt på komma / linjeskift
           if (typeof items === "string") {
             items = items
               .split(/[\n,]/)
@@ -283,9 +297,56 @@ function normalizeTripStructure(parsed) {
           category,
           items
         };
-      })
-    : [];
+      });
+    }
 
+    // 🔒 Tving til nøyaktig 4 kategorier hver gang
+    const defaultCategories = ["Klær", "Toalettsaker", "Elektronikk", "Annet"];
+
+    // Flat ut alle items som finnes
+    const allItems = [];
+    for (const group of packing_list) {
+      if (Array.isArray(group.items)) {
+        for (const item of group.items) {
+          if (typeof item === "string" && item.trim()) {
+            allItems.push(item.trim());
+          }
+        }
+      }
+    }
+
+    // Hvis KI ikke ga oss noe fornuftig → lag en enkel standardliste
+    const fallbackItems =
+      allItems.length === 0
+        ? [
+            "Undertøy",
+            "Sokker",
+            "T-skjorter",
+            "Bukse/shorts",
+            "Toalettsaker",
+            "Lader til mobil",
+            "Powerbank",
+            "Pass/ID-kort",
+            "Reiseforsikring",
+            "Solbriller",
+            "Regnjakke",
+            "Behagelige sko"
+          ]
+        : allItems;
+
+    // Fordel items jevnt over 4 kategorier
+    const distributed = defaultCategories.map((cat, catIndex) => {
+      const itemsForCat = [];
+      for (let i = catIndex; i < fallbackItems.length; i += defaultCategories.length) {
+        itemsForCat.push(fallbackItems[i]);
+      }
+      return {
+        category: cat,
+        items: itemsForCat
+      };
+    });
+
+    packing_list = distributed;
   // ---- HOTELLER / OVERNATTING ----
   const rawHotels =
     parsed.hotels ||
@@ -1735,7 +1796,7 @@ app.post("/api/ai/generate-trip", authMiddleware, async (req, res) => {
       }
     }
 
-    // --- 2) Systemprompt: nå med PACKING_LIST + HOTELS ---
+    // --- 2) Systemprompt: med STRENG pakkeliste-regel (4 kategorier) ---
     const systemPrompt = `
 Du er en erfaren reiseplanlegger som lager konkrete reiseforslag.
 
@@ -1759,16 +1820,37 @@ Output-format (mal):
     {
       "category": "Klær",
       "items": [
-        "Vindjakke",
+        "Vind- og regnjakke",
         "Gode joggesko",
-        "To ekstra t-skjorter"
+        "2–3 t-skjorter",
+        "Behagelig bukse/shorts"
+      ]
+    },
+    {
+      "category": "Toalettsaker",
+      "items": [
+        "Tannbørste og tannkrem",
+        "Deodorant",
+        "Solkrem",
+        "Eventuelle faste medisiner"
+      ]
+    },
+    {
+      "category": "Elektronikk",
+      "items": [
+        "Mobil og lader",
+        "Powerbank",
+        "Adapter om nødvendig",
+        "Hodetelefoner"
       ]
     },
     {
       "category": "Annet",
       "items": [
-        "Hodetelefoner",
-        "Powerbank"
+        "Pass/ID-kort",
+        "Reiseforsikringsbevis",
+        "Solbriller",
+        "Liten dagstursekk"
       ]
     }
   ],
@@ -1783,12 +1865,29 @@ Output-format (mal):
   ]
 }
 
-VIKTIG:
-- Alltid gyldig JSON (ingen kommentarer, ingen trailing-komma).
+VIKTIG OM PACKING_LIST:
+- "packing_list" SKAL ALLTID være en liste (array) med NØYAKTIG 4 elementer.
+- De 4 elementene SKAL ha "category" lik:
+    1) "Klær"
+    2) "Toalettsaker"
+    3) "Elektronikk"
+    4) "Annet"
+- Rekkefølgen på kategoriene kan være denne, men kategorinavnene MÅ være akkurat disse.
+- Hver kategori SKAL ha en "items"-liste med 3–10 KONKRETE ting (strenger).
+- Ikke skriv generelle ting som "annet", "diverse", "osv." som item. Hver item skal være en konkret gjenstand.
+
+VIKTIG OM STOPS:
+- "stops" SKAL være en liste (array).
 - Bruk helst 3–10 stopp.
+- Hvert stopp SKAL ha "name" og "description".
+- "day" skal være et positivt heltall som angir rekkefølgen (1, 2, 3 ...).
 - Hvis du ikke vet koordinater, sett "lat" og "lng" til null.
-- Hvis du er usikker på hotell, foreslå likevel 2–4 steder per reise,
-  men pris kan være null hvis du ikke vet.
+
+VIKTIG OM HOTELS:
+- "hotels" SKAL være en liste (array) med 2–6 forslag totalt.
+- Hvert hotell SKAL ha "name".
+- "price_per_night" skal være et tall (omtrentlig pris per natt) i NOK hvis det er naturlig.
+- Hvis du er usikker på pris, kan "price_per_night" være null.
 `.trim();
 
     // --- 3) Bygg userPrompt ---
@@ -1810,7 +1909,7 @@ VIKTIG:
 
     if (!userPrompt.trim()) {
       userPrompt =
-        "Lag et konkret reiseforslag (5–7 dager) et sted i Europa, med stopp, pakkeliste og 2–4 hotellforslag.";
+        "Lag et konkret reiseforslag (5–7 dager) et sted i Europa, med stopp, pakkeliste i 4 kategorier (Klær, Toalettsaker, Elektronikk, Annet) og 2–6 hotellforslag.";
     }
 
     // --- 4) Kall OpenAI ---
@@ -1860,117 +1959,126 @@ VIKTIG:
   }
 });
 
-// -------------------------------------------------------
-//  TRIPS — brukerreiser + fallback til episode-galleri/hoteller
-// -------------------------------------------------------
+// Helper for å normalisere pakkeliste-struktur
+function normalizePackingForClient(rawPacking) {
+  if (!rawPacking) return [];
 
+  // Hvis JSON-string → parse
+  if (typeof rawPacking === "string") {
+    try {
+      return normalizePackingForClient(JSON.parse(rawPacking));
+    } catch {
+      return [];
+    }
+  }
+
+  // Hvis objekt: { "Klær": ["T-skjorte", ...] }
+  if (!Array.isArray(rawPacking) && typeof rawPacking === "object") {
+    const groups = [];
+    for (const [key, value] of Object.entries(rawPacking)) {
+      const category = key?.trim() || "Annet";
+
+      let items = value;
+      if (typeof items === "string") {
+        items = items.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
+      }
+      if (!Array.isArray(items)) items = [];
+
+      items = items.map((x) => x.trim()).filter(Boolean);
+
+      if (items.length) {
+        groups.push({ category, items });
+      }
+    }
+    return groups;
+  }
+
+  // Hvis array
+  if (Array.isArray(rawPacking)) {
+    // Streng-liste → én gruppe
+    if (rawPacking.length && typeof rawPacking[0] === "string") {
+      const items = rawPacking
+        .map((x) => x.trim())
+        .filter(Boolean);
+      return items.length ? [{ category: "Annet", items }] : [];
+    }
+
+    // Gruppe-liste
+    return rawPacking
+      .map((group) => {
+        if (typeof group === "string") {
+          return { category: "Annet", items: [group.trim()] };
+        }
+        if (!group || typeof group !== "object") {
+          return { category: "Annet", items: [] };
+        }
+
+        const category = group.category?.trim() || "Annet";
+
+        let items = group.items;
+        if (typeof items === "string") {
+          items = items.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
+        }
+        if (!Array.isArray(items)) items = [];
+
+        items = items.map((x) => x.trim()).filter(Boolean);
+
+        return { category, items };
+      })
+      .filter((g) => g.items.length > 0);
+  }
+
+  return [];
+}
+
+
+// ----------------------------------------------------------------------
+// 📌 API: Hent alle brukerens reiser
+// ----------------------------------------------------------------------
 app.get("/api/trips", authMiddleware, async (req, res) => {
   try {
-    // 1) Hent brukerreiser (ikke selve system-reisene)
-    const baseRes = await query(
+    const dbRes = await query(
       `
       SELECT *
       FROM trips
       WHERE user_id = $1
-        AND (
-          source_type IS NULL               -- vanlige KI-/manuelle reiser
-          OR source_type = 'template'       -- maler
-          OR source_type = 'user_episode_trip' -- reiser laget fra episode
-        )
       ORDER BY created_at DESC
       `,
       [req.user.id]
     );
 
-    const rows = baseRes.rows || [];
+    const trips = dbRes.rows.map((row) => {
+      let stops = row.stops;
+      let packing = row.packing_list;
+      let gallery = row.gallery;
+      let hotels = row.hotels;
 
-    // 2) Finn alle episoder disse reisene evt. peker på
-    const episodeIds = [
-      ...new Set(
-        rows
-          .map((r) => r.source_episode_id)
-          .filter((id) => typeof id === "string" && id.trim() !== "")
-      )
-    ];
+      // Parse JSON-felter hvis de kommer som string
+      try { if (typeof stops === "string") stops = JSON.parse(stops); } catch {}
+      try { if (typeof packing === "string") packing = JSON.parse(packing); } catch {}
+      try { if (typeof gallery === "string") gallery = JSON.parse(gallery); } catch {}
+      try { if (typeof hotels === "string") hotels = JSON.parse(hotels); } catch {}
 
-    // Hjelper: parse et felt som kan være JSON-string, array eller null
-    const parseJsonArray = (value) => {
-      if (!value) return [];
-      if (Array.isArray(value)) return value;
-      if (typeof value === "string") {
-        try {
-          const parsed = JSON.parse(value);
-          return Array.isArray(parsed) ? parsed : [];
-        } catch {
-          return [];
-        }
-      }
-      return [];
-    };
+      // Sikre riktig formaterte arrays
+      stops = Array.isArray(stops) ? stops : [];
+      gallery = Array.isArray(gallery) ? gallery : [];
+      hotels = Array.isArray(hotels) ? hotels : [];
 
-    let canonicalByEpisodeId = {};
-
-    if (episodeIds.length > 0) {
-      // 3) Hent canonical galleri / hoteller / pakkeliste fra SYSTEM-TRIPS
-      const canonRes = await query(
-        `
-          SELECT
-            source_episode_id,
-            gallery,
-            hotels,
-            packing_list
-          FROM trips
-          WHERE source_type = 'grenselos_episode'
-            AND source_episode_id = ANY($1)
-            AND user_id = $2
-        `,
-        [episodeIds, req.user.id]
-      );
-
-      canonicalByEpisodeId = canonRes.rows.reduce((acc, row) => {
-        const episodeId = row.source_episode_id;
-        if (!episodeId) return acc;
-
-        acc[episodeId] = {
-          gallery: parseJsonArray(row.gallery),
-          hotels: parseJsonArray(row.hotels),
-          packing_list: parseJsonArray(row.packing_list)
-        };
-        return acc;
-      }, {});
-    }
-
-    // 4) Normaliser alle brukerreiser + legg inn *overstyrende* fallback
-    const trips = rows.map((row) => {
-      let stops   = parseJsonArray(row.stops);
-      let packing = parseJsonArray(row.packing_list);
-      let gallery = parseJsonArray(row.gallery);
-      let hotels  = parseJsonArray(row.hotels);
-
-      const episodeId = row.source_episode_id;
-
-      // 🔁 Hvis denne reisen er basert på en Grenseløs-episode,
-      // overstyr galleri/hotels/packing_list med canonical data
-      if (episodeId && canonicalByEpisodeId[episodeId]) {
-        const canon = canonicalByEpisodeId[episodeId];
-
-        gallery = parseJsonArray(canon.gallery);
-        hotels  = parseJsonArray(canon.hotels);
-        packing = parseJsonArray(canon.packing_list);
-      }
+      // 🌟 Viktig: Normaliser pakkelista riktig
+      const normalizedPacking = normalizePackingForClient(packing);
 
       return {
         ...row,
         stops,
-        packing_list: packing,
         gallery,
-        hotels
+        hotels,
+        packing_list: normalizedPacking
       };
     });
 
     res.json({ trips });
-  } catch (e) {
-    console.error("/api/trips GET-feil:", e);
+  } catch (err) {
+    console.error("/api/trips GET-feil:", err);
     res.status(500).json({ error: "Kunne ikke hente reiser." });
   }
 });
