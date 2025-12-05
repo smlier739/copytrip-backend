@@ -2033,7 +2033,8 @@ function normalizePackingForClient(rawPacking) {
 
 
 // ----------------------------------------------------------------------
-// 📌 API: Hent alle brukerens reiser (med canonical galleri fra episoder)
+// 📌 API: Hent alle brukerens reiser (med canonical galleri fra episoder
+//     + generisk galleri for "fra scratch"-reiser uten egne bilder)
 // ----------------------------------------------------------------------
 app.get("/api/trips", authMiddleware, async (req, res) => {
   try {
@@ -2120,14 +2121,19 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
 
       const episodeId = row.source_episode_id;
 
-      // Hvis denne reisen er basert på en Grenseløs-episode,
-      // overstyr galleri/hotels/packing_list med canonical data
       if (episodeId && canonicalByEpisodeId[episodeId]) {
+        // 🎧 Reise basert på Grenseløs-episode → bruk canonical data
         const canon = canonicalByEpisodeId[episodeId];
 
         gallery = parseJsonArray(canon.gallery);
         hotels  = parseJsonArray(canon.hotels);
         packing = canon.packing_list;
+      } else {
+        // 🧳 Vanlige KI-/manuelle reiser ("fra scratch"):
+        // hvis galleriet fortsatt er tomt → gi generiske bilder
+        if (!gallery || !Array.isArray(gallery) || gallery.length === 0) {
+          gallery = getGenericVirtualTripGallery(3);
+        }
       }
 
       // 🌟 Normaliser pakkelista til formatet appen forventer
@@ -2148,6 +2154,35 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "Kunne ikke hente reiser." });
   }
 });
+
+// -------------------------------------------------------
+//  GENERISKE BILDER FOR VIRTUELL REISE (IKKE-EPISODE-TRIPS)
+// -------------------------------------------------------
+
+// En liten liste med generiske reisebilder (fri bruk via picsum.photos)
+// Disse ligger EKSTERN på nett og trenger ikke å lastes opp i backend.
+const GENERIC_VIRTUAL_TRIP_IMAGES = [
+  {
+    url: "https://picsum.photos/seed/grenselos1/1200/800",
+    title: "Utsikt over fjell og dal",
+    caption: "Illustrasjonsfoto – generisk reisebilde."
+  },
+  {
+    url: "https://picsum.photos/seed/grenselos2/1200/800",
+    title: "Kystlinje og hav",
+    caption: "Illustrasjonsfoto – inspirasjon til kystreiser."
+  },
+  {
+    url: "https://picsum.photos/seed/grenselos3/1200/800",
+    title: "Bygate på kveldstid",
+    caption: "Illustrasjonsfoto – storbyfølelse."
+  },
+  {
+    url: "https://picsum.photos/seed/grenselos4/1200/800",
+    title: "Små vei og åpent landskap",
+    caption: "Illustrasjonsfoto – roadtrip-stemning."
+  }
+];
 
 // Hent et lite sett (f.eks. 3) tilfeldige generiske bilder
 function getGenericVirtualTripGallery(count = 3) {
