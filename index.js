@@ -2033,38 +2033,104 @@ function normalizePackingForClient(rawPacking) {
 
 
 // ----------------------------------------------------------------------
-// 📌 API: Hent alle brukerens reiser
+// 📌 API: Hent alle brukerens reiser (med canonical galleri fra episoder)
 // ----------------------------------------------------------------------
 app.get("/api/trips", authMiddleware, async (req, res) => {
   try {
-    const dbRes = await query(
+    // 1) Hent "brukerreiser" – ikke selve system-reisene
+    const baseRes = await query(
       `
       SELECT *
       FROM trips
       WHERE user_id = $1
+        AND (
+          source_type IS NULL                -- vanlige KI-/manuelle reiser
+          OR source_type = 'template'        -- maler
+          OR source_type = 'user_episode_trip' -- reiser laget fra episode
+        )
       ORDER BY created_at DESC
       `,
       [req.user.id]
     );
 
-    const trips = dbRes.rows.map((row) => {
-      let stops = row.stops;
+    const rows = baseRes.rows || [];
+
+    // 2) Finn alle episoder disse reisene evt. peker på
+    const episodeIds = [
+      ...new Set(
+        rows
+          .map((r) => r.source_episode_id)
+          .filter((id) => typeof id === "string" && id.trim() !== "")
+      )
+    ];
+
+    // Hjelper: parse et felt som kan være JSON-string, array eller null
+    const parseJsonArray = (value) => {
+      if (!value) return [];
+      if (Array.isArray(value)) return value;
+      if (typeof value === "string") {
+        try {
+          const parsed = JSON.parse(value);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch {
+          return [];
+        }
+      }
+      return [];
+    };
+
+    let canonicalByEpisodeId = {};
+
+    if (episodeIds.length > 0) {
+      // 3) Hent canonical galleri / hoteller / pakkeliste fra SYSTEM-TRIPS
+      const canonRes = await query(
+        `
+          SELECT
+            source_episode_id,
+            gallery,
+            hotels,
+            packing_list
+          FROM trips
+          WHERE source_type = 'grenselos_episode'
+            AND source_episode_id = ANY($1)
+            AND user_id = $2
+        `,
+        [episodeIds, req.user.id]
+      );
+
+      canonicalByEpisodeId = canonRes.rows.reduce((acc, row) => {
+        const episodeId = row.source_episode_id;
+        if (!episodeId) return acc;
+
+        acc[episodeId] = {
+          gallery: parseJsonArray(row.gallery),
+          hotels: parseJsonArray(row.hotels),
+          packing_list: row.packing_list  // pakkeliste normaliseres senere
+        };
+        return acc;
+      }, {});
+    }
+
+    // 4) Normaliser alle brukerreiser + legg inn canonical fallback
+    const trips = rows.map((row) => {
+      let stops   = parseJsonArray(row.stops);
+      let gallery = parseJsonArray(row.gallery);
+      let hotels  = parseJsonArray(row.hotels);
       let packing = row.packing_list;
-      let gallery = row.gallery;
-      let hotels = row.hotels;
 
-      // Parse JSON-felter hvis de kommer som string
-      try { if (typeof stops === "string") stops = JSON.parse(stops); } catch {}
-      try { if (typeof packing === "string") packing = JSON.parse(packing); } catch {}
-      try { if (typeof gallery === "string") gallery = JSON.parse(gallery); } catch {}
-      try { if (typeof hotels === "string") hotels = JSON.parse(hotels); } catch {}
+      const episodeId = row.source_episode_id;
 
-      // Sikre riktig formaterte arrays
-      stops = Array.isArray(stops) ? stops : [];
-      gallery = Array.isArray(gallery) ? gallery : [];
-      hotels = Array.isArray(hotels) ? hotels : [];
+      // Hvis denne reisen er basert på en Grenseløs-episode,
+      // overstyr galleri/hotels/packing_list med canonical data
+      if (episodeId && canonicalByEpisodeId[episodeId]) {
+        const canon = canonicalByEpisodeId[episodeId];
 
-      // 🌟 Viktig: Normaliser pakkelista riktig
+        gallery = parseJsonArray(canon.gallery);
+        hotels  = parseJsonArray(canon.hotels);
+        packing = canon.packing_list;
+      }
+
+      // 🌟 Normaliser pakkelista til formatet appen forventer
       const normalizedPacking = normalizePackingForClient(packing);
 
       return {
@@ -2082,35 +2148,6 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
     res.status(500).json({ error: "Kunne ikke hente reiser." });
   }
 });
-
-// -------------------------------------------------------
-//  GENERISKE BILDER FOR VIRTUELL REISE (IKKE-EPISODE-TRIPS)
-// -------------------------------------------------------
-
-// En liten liste med generiske reisebilder (fri bruk via picsum.photos)
-// Disse ligger EKSTERN på nett og trenger ikke å lastes opp i backend.
-const GENERIC_VIRTUAL_TRIP_IMAGES = [
-  {
-    url: "https://picsum.photos/seed/grenselos1/1200/800",
-    title: "Utsikt over fjell og dal",
-    caption: "Illustrasjonsfoto – generisk reisebilde."
-  },
-  {
-    url: "https://picsum.photos/seed/grenselos2/1200/800",
-    title: "Kystlinje og hav",
-    caption: "Illustrasjonsfoto – inspirasjon til kystreiser."
-  },
-  {
-    url: "https://picsum.photos/seed/grenselos3/1200/800",
-    title: "Bygate på kveldstid",
-    caption: "Illustrasjonsfoto – storbyfølelse."
-  },
-  {
-    url: "https://picsum.photos/seed/grenselos4/1200/800",
-    title: "Små vei og åpent landskap",
-    caption: "Illustrasjonsfoto – roadtrip-stemning."
-  }
-];
 
 // Hent et lite sett (f.eks. 3) tilfeldige generiske bilder
 function getGenericVirtualTripGallery(count = 3) {
