@@ -2034,7 +2034,7 @@ function normalizePackingForClient(rawPacking) {
 
 // ----------------------------------------------------------------------
 // 📌 API: Hent alle brukerens reiser (med canonical galleri fra episoder
-//     + generisk galleri for "fra scratch"-reiser uten egne bilder)
+//     + generisk galleri for "fra scratch"-reiser + klikkbare hoteller)
 // ----------------------------------------------------------------------
 app.get("/api/trips", authMiddleware, async (req, res) => {
   try {
@@ -2078,6 +2078,38 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
         }
       }
       return [];
+    };
+
+    // Hjelper: sørg for at hotell alltid har en .url som frontend kan klikke på
+    const makeHotelUrl = (h) => {
+      const raw =
+        (typeof h.url === "string" && h.url.trim()) ||
+        (typeof h.booking_url === "string" && h.booking_url.trim()) ||
+        (typeof h.link === "string" && h.link.trim()) ||
+        (typeof h.external_url === "string" && h.external_url.trim()) ||
+        null;
+
+      if (raw) {
+        return raw;
+      }
+
+      // Fallback: generer en Google Maps-søke-URL basert på navn + sted
+      const name = (h.name || h.title || "").toString().trim();
+      const location = (
+        h.location ||
+        h.city ||
+        h.area ||
+        ""
+      ).toString().trim();
+
+      if (!name) {
+        return null; // har verken URL eller navn – da lar vi den være tom
+      }
+
+      const query = encodeURIComponent(
+        location ? `${name} ${location}` : name
+      );
+      return `https://www.google.com/maps/search/?api=1&query=${query}`;
     };
 
     let canonicalByEpisodeId = {};
@@ -2136,17 +2168,11 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
         }
       }
 
-      // 🏨 NORMALISER HOTELLER: sørg for at alle har .url
+      // 🏨 NORMALISER HOTELLER: sørg for at alle har .url frontend kan bruke
       hotels = (hotels || [])
         .filter((h) => h && typeof h === "object")
         .map((h) => {
-          const url =
-            h.url ||
-            h.booking_url ||
-            h.link ||
-            h.external_url ||
-            null;
-
+          const url = makeHotelUrl(h);
           return {
             ...h,
             url
