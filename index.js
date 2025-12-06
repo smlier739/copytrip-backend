@@ -848,42 +848,142 @@ ${profileText}
 }
 
 // -------------------------------------------------------
-//  KI: EPISODE-BASERT TRIP
+//  KI: EPISODE-BASERT TRIP (PERSONLIG + TILPASNING)
 // -------------------------------------------------------
+async function generateTripFromEpisode({
+  episodeId,
+  name,
+  description,
+  userPreferences,
+  userProfile
+}) {
+  const profileText = userProfile
+    ? `
+- Navn: ${userProfile.full_name || ""}
+- Bosted: ${userProfile.home_city || ""}, ${userProfile.home_country || ""}
+- Født: ${userProfile.birth_year || ""}
+- Reisestil: ${userProfile.travel_style || ""}
+- Budsjett per dag: ${userProfile.budget_per_day || ""}
+- Erfaring: ${userProfile.experience_level || ""}
+`.trim()
+    : "Ingen personlig profil tilgjengelig.";
 
-async function generateTripFromEpisode({ episodeId, name, description }) {
-  const prompt = `
-Lag et konkret reiseforslag inspirert av Grenseløs-episoden:
+  const systemPrompt = `
+Du er en erfaren reiseplanlegger som lager konkrete reiseforslag basert på
+Grenseløs-episoder OG brukerens ønsker.
 
-ID: ${episodeId}
-Tittel: ${name}
-Beskrivelse: ${description}
+Du MÅ ALLTID svare med gyldig JSON, uten forklaringstekst rundt.
 
-Returner KUN JSON:
+Output-format:
+
 {
-  "title": "...",
-  "description": "...",
-  "stops": [ ... ]
+  "title": "Kort og konkret tittel på reisen",
+  "description": "Kort intro til reisen (2–5 setninger).",
+  "stops": [
+    {
+      "day": 1,
+      "name": "Stedsnavn",
+      "description": "Hva gjør man denne dagen, konkrete forslag.",
+      "lat": 40.8518,
+      "lng": 14.2681
+    }
+  ],
+  "packing_list": [
+    {
+      "category": "Klær",
+      "items": [ "Vind- og regnjakke", "Gode joggesko" ]
+    },
+    {
+      "category": "Toalettsaker",
+      "items": [ "Tannbørste og tannkrem", "Solkrem" ]
+    },
+    {
+      "category": "Elektronikk",
+      "items": [ "Mobil og lader", "Powerbank" ]
+    },
+    {
+      "category": "Annet",
+      "items": [ "Pass/ID-kort", "Reiseforsikringsbevis" ]
+    }
+  ],
+  "hotels": [
+    {
+      "name": "Eksempel Hotel",
+      "location": "By / område",
+      "description": "Kort hvorfor dette passer til turen.",
+      "price_per_night": 1200,
+      "url": "https://…"
+    }
+  ]
 }
-`;
+
+KRAV FOR PACKING_LIST:
+- "packing_list" SKAL ALLTID være en liste med NØYAKTIG 4 elementer.
+- De 4 elementene SKAL ha "category" lik:
+    1) "Klær"
+    2) "Toalettsaker"
+    3) "Elektronikk"
+    4) "Annet"
+- Kategorinavnene må være akkurat disse.
+- Hver kategori SKAL ha en "items"-liste med 3–10 KONKRETE ting.
+- Ikke skriv generelle ting som "annet", "diverse", "osv." som item.
+
+KRAV FOR STOPS:
+- 3–10 stopp.
+- Hvert stopp SKAL ha "day", "name" og "description".
+- Hvis du ikke vet koordinater, sett "lat" og "lng" til null.
+
+KRAV FOR HOTELS:
+- 2–6 forslag totalt.
+- Hvert hotell SKAL ha "name".
+- "price_per_night" skal være et tall (omtrentlig pris per natt) i NOK hvis naturlig, ellers null.
+`.trim();
+
+  const userPrompt = `
+GRUNNLAG: Grenseløs-episode
+
+- Episode-ID: ${episodeId}
+- Tittel: ${name}
+- Beskrivelse:
+${description}
+
+BRUKERENS TILPASNING/ØNSKER:
+${userPreferences && userPreferences.trim()
+  ? userPreferences.trim()
+  : "Ingen spesifikke ønsker – lag et balansert forslag."}
+
+BRUKERPROFIL (hvis tilgjengelig):
+${profileText}
+`.trim();
 
   const completion = await openai.chat.completions.create({
-    model: "gpt-4.1-mini",
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
     messages: [
-      {
-        role: "system",
-        content: "Du svarer med ren JSON.",
-      },
-      { role: "user", content: prompt },
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
     ],
-    temperature: 0.7,
+    temperature: 0.7
   });
 
-  let text = completion.choices[0]?.message?.content?.trim() || "{}";
-  if (text.startsWith("```")) {
-    text = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+  const aiText =
+    completion.choices?.[0]?.message?.content?.trim() || "";
+
+  const parsed = extractJson(aiText);
+
+  let trip;
+  if (parsed && typeof parsed === "object") {
+    trip = normalizeTripStructure(parsed);
+  } else {
+    trip = {
+      title: name || "Reiseforslag fra episode",
+      description: description || null,
+      stops: [],
+      packing_list: [],
+      hotels: []
+    };
   }
-  return JSON.parse(text);
+
+  return { trip, raw: aiText };
 }
 
 // -------------------------------------------------------
@@ -966,9 +1066,10 @@ async function ensureTripForEpisode(episode, userId) {
         hotels,
         source_type,
         source_episode_id,
-        gallery
+        gallery,
+        episode_url
       )
-      VALUES ($1,$2,$3,$4,$5,$6,'grenselos_episode',$7,$8)
+      VALUES ($1,$2,$3,$4,$5,$6,'grenselos_episode',$7,$8,$9)
       RETURNING id
     `,
     [
@@ -979,7 +1080,8 @@ async function ensureTripForEpisode(episode, userId) {
       JSON.stringify(packingList),
       JSON.stringify(hotels),
       episode.id,
-      JSON.stringify([])   // galleri fylles KUN via admin-endepunktene
+      JSON.stringify([]),   // galleri fylles KUN via admin-endepunktene
+      episode.external_url || null
     ]
   );
 
@@ -2247,7 +2349,8 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       packing_list,
       hotels,
       source_type,
-      source_episode_id // 👈 fra klient
+      source_episode_id, // 👈 fra klient
+      episode_url
     } = req.body ?? {};
 
     if (!title || !Array.isArray(stops)) {
@@ -2345,9 +2448,10 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
         hotels,
         source_type,
         source_episode_id,
-        gallery
+        gallery,
+        episode_url
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       RETURNING *
       `,
       [
@@ -2359,7 +2463,8 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
         JSON.stringify(finalHotels),
         sourceType,
         source_episode_id || null,
-        JSON.stringify(finalGallery)
+        JSON.stringify(finalGallery),
+        episode_url || null
       ]
     );
 
@@ -2683,28 +2788,119 @@ app.get('/api/grenselos/episodes', async (req, res) => {
 });
 
 // -------------------------------------------------------
-//  ANALYSER ÉN EPISODE
+//  ANALYSER ÉN EPISODE → PERSONLIG REISE + LAGRE I MINE REISER
 // -------------------------------------------------------
+app.post(
+  "/api/grenselos/episodes/:id/analyze",
+  authMiddleware,
+  async (req, res) => {
+    try {
+      const episodeId = req.params.id;
+      const {
+        name,
+        description,
+        userPreferences,  // 💬 fritekst fra brukeren
+        useProfile        // bool – bruk profil for tilpasning
+      } = req.body ?? {};
 
-app.post("/api/grenselos/episodes/:id/analyze", async (req, res) => {
-  try {
-    const { name, description } = req.body ?? {};
+      if (!name || !description) {
+        return res
+          .status(400)
+          .json({ error: "Mangler navn eller beskrivelse." });
+      }
 
-    if (!name || !description)
-      return res.status(400).json({ error: "Mangler navn eller beskrivelse." });
+      // 1) Hent evt. profil til prompten
+      let profile = null;
+      if (useProfile && req.user && req.user.id) {
+        try {
+          const result = await query(
+            `
+            SELECT
+              email,
+              full_name,
+              birth_year,
+              home_city,
+              home_country,
+              travel_style,
+              budget_per_day,
+              experience_level
+            FROM users
+            WHERE id = $1
+            `,
+            [req.user.id]
+          );
+          profile = result.rows[0] || null;
+        } catch (e) {
+          console.warn(
+            "Klarte ikke å hente profil til episode-KI-prompt:",
+            e.message
+          );
+        }
+      }
 
-    const data = await generateTripFromEpisode({
-      episodeId: req.params.id,
-      name,
-      description,
-    });
+      // 2) La KI lage personlig reise basert på episode + ønsker + profil
+      const { trip, raw } = await generateTripFromEpisode({
+        episodeId,
+        name,
+        description,
+        userPreferences,
+        userProfile: profile
+      });
 
-    res.json({ trip: data });
-  } catch (e) {
-    console.error("episode analyze-feil:", e);
-    res.status(500).json({ error: "Analyse feilet." });
+      // 3) Lagre som brukerreise (user_episode_trip) i trips-tabellen
+      const insert = await query(
+        `
+        INSERT INTO trips (
+          user_id,
+          title,
+          description,
+          stops,
+          packing_list,
+          hotels,
+          source_type,
+          source_episode_id,
+          gallery
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,'user_episode_trip',$7,$8)
+        RETURNING *
+        `,
+        [
+          req.user.id,
+          trip.title || name,
+          trip.description || description || null,
+          JSON.stringify(trip.stops || []),
+          JSON.stringify(trip.packing_list || []),
+          JSON.stringify(trip.hotels || []),
+          episodeId,
+          JSON.stringify([]) // galleri kommer fra canonical / generiske bilder senere
+        ]
+      );
+
+      const row = insert.rows[0];
+
+      // 4) For direkte bruk i appen: normaliser pakkeliste til klientformat
+      const clientPacking = normalizePackingForClient(trip.packing_list || []);
+
+      const savedTrip = {
+        ...row,
+        stops: trip.stops || [],
+        hotels: trip.hotels || [],
+        gallery: [],
+        packing_list: clientPacking
+      };
+
+      // 5) Returnér både lagret trip og rå KI-tekst (for debug om du vil)
+      res.json({
+        ok: true,
+        trip: savedTrip,
+        raw
+      });
+    } catch (e) {
+      console.error("/api/grenselos/episodes/:id/analyze-feil:", e);
+      res.status(500).json({ error: "Analyse og lagring feilet." });
+    }
   }
-});
+);
 
 // -------------------------------------------------------
 //  GLOBAL FEILHANDLER
