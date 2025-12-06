@@ -2352,19 +2352,21 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       stops,
       packing_list,
       hotels,
+      gallery,                // 👈 Hentet fra klient hvis KI genererer galleri
       source_type,
-      source_episode_id, // 👈 fra klient
-      episode_url
+      source_episode_id,      // 👈 ID fra Spotify-episoden
+      episode_url             // optional
     } = req.body ?? {};
 
     if (!title || !Array.isArray(stops)) {
-      return res
-        .status(400)
-        .json({ error: "Mangler title eller stops (array) i request body." });
+      return res.status(400).json({
+        error: "Mangler title eller stops (array) i request body."
+      });
     }
 
-    // Kvote-sjekk
-    const { isPremium, tripCount, freeLimit } = await getUserTripStats(req.user.id);
+    // ---------------- Kvote-sjekk ----------------
+    const { isPremium, tripCount, freeLimit } =
+      await getUserTripStats(req.user.id);
 
     if (!isPremium && tripCount >= freeLimit) {
       return res.status(402).json({
@@ -2374,14 +2376,7 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       });
     }
 
-    // ---------- Normaliser innkommende data ----------
-    let finalStops   = Array.isArray(stops) ? stops : [];
-    let finalPacking = Array.isArray(packing_list) ? packing_list : [];
-    let finalHotels  = Array.isArray(hotels) ? hotels : [];
-    let finalGallery = [];
-    let sourceType   = null;
-
-    // Hjelper for å parse ev. JSON-strenger fra DB
+    // ---------------- Normalisering ----------------
     const parseArrayField = (value) => {
       if (!value) return [];
       if (Array.isArray(value)) return value;
@@ -2396,13 +2391,18 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       return [];
     };
 
-    // ---------- Hvis reisen er knyttet til en Grenseløs-episode ----------
+    let finalStops   = parseArrayField(stops);
+    let finalPacking = parseArrayField(packing_list);
+    let finalHotels  = parseArrayField(hotels);
+    let finalGallery = parseArrayField(gallery);   // 👈 Hent galleri fra klienten hvis det finnes
+    let sourceType   = null;
+
+    // ---------------- Episode-baserte reiser ----------------
     if (source_episode_id) {
       sourceType = "user_episode_trip";
 
-      // 1) Forsøk å arve fra GLOBAL system-trip i trips-tabellen
       const sysRes = await query(
-          `
+        `
           SELECT packing_list, hotels, gallery
           FROM trips
           WHERE source_type = 'grenselos_episode'
@@ -2412,34 +2412,40 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
         `,
         [source_episode_id]
       );
-          
+
       if (sysRes.rowCount > 0) {
         const sys = sysRes.rows[0];
 
-        if (!finalPacking.length) {
+        // Pakkeliste
+        if (finalPacking.length === 0) {
           finalPacking = parseArrayField(sys.packing_list);
         }
-        if (!finalHotels.length) {
+
+        // Hoteller
+        if (finalHotels.length === 0) {
           finalHotels = parseArrayField(sys.hotels);
         }
 
+        // GALLERI — alltid bruk systemets galleri for episode
         const g = parseArrayField(sys.gallery);
-        if (Array.isArray(g) && g.length) {
+        if (g.length > 0) {
           finalGallery = g;
         }
       }
+
     } else {
-      // Vanlige KI-/manuelle reiser (IKKE fra episode)
+      // ---------------- Vanlige KI / scratch-reiser ----------------
       sourceType = source_type || null;
 
-      // 🌍 NYTT: Gi “fra scratch”-reiser et generisk galleri,
-      // slik at de også får virtuell reise rett ut av boksen.
-      if (!finalGallery.length) {
-        finalGallery = getGenericVirtualTripGallery(3);
+      // Hvis KI har generert galleri → bruk det.
+      if (finalGallery.length === 0) {
+        // Ingen KI-galleri mottatt → lag et relevant galleri fra destinasjonen.
+        // Krever at du har implementert generateGalleryForTrip().
+        finalGallery = await generateGalleryForTrip(title, description, finalStops);
       }
     }
 
-    // ---------- Lagre reisen ----------
+    // ---------------- Lagre i database ----------------
     const insert = await query(
       `
       INSERT INTO trips (
@@ -2482,6 +2488,7 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
         gallery: finalGallery
       }
     });
+
   } catch (e) {
     console.error("/api/trips POST-feil:", e);
     res.status(500).json({ error: "Kunne ikke opprette reise." });
@@ -2904,6 +2911,53 @@ app.post(
     }
   }
 );
+
+app.post("/api/ai/generate-gallery", authMiddleware, async (req, res) => {
+  try {
+    const { title, description } = req.body;
+
+    const userDescription =
+      `Du skal hente bilder som passer til denne reisen. ` +
+      `Bruk KUN gratis og åpne bildekilder som Unsplash, Pexels eller Wikimedia Commons. ` +
+      `Velg bilder som faktisk matcher stedene, miljøene og stemningen i reisen. ` +
+      `IKKE finn opp steder – bruk kun bilder du vet er ekte. ` +
+      `Returner KUN gyldig JSON av formatet: { "gallery": ["url", "url", ...] }.\n\n` +
+      `Tittel: ${title}\n` +
+      `Beskrivelse: ${description}\n`;
+
+    const client = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+      project: process.env.OPENAI_PROJECT_ID
+    });
+
+    const completion = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "Du returnerer alltid gyldig JSON og aldri tekst utenfor JSON-format." },
+        { role: "user", content: userDescription }
+      ],
+      response_format: { type: "json_object" }
+    });
+
+    const content = completion.choices[0]?.message?.content || "{}";
+    let result = {};
+
+    try {
+      result = JSON.parse(content);
+    } catch (err) {
+      console.error("❌ JSON parse-feil i galleri:", err, content);
+      return res.status(500).json({ error: "KI returnerte ugyldig galleri-data." });
+    }
+
+    return res.json({
+      gallery: Array.isArray(result.gallery) ? result.gallery : []
+    });
+
+  } catch (err) {
+    console.error("❌ /api/ai/generate-gallery:", err);
+    return res.status(500).json({ error: "Kunne ikke generere galleri." });
+  }
+});
 
 // -------------------------------------------------------
 //  GLOBAL FEILHANDLER
