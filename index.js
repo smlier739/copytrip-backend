@@ -1430,27 +1430,27 @@ app.get(
 
       // 2) Hent eksisterende trips knyttet til disse episodene
       let tripsByEpisodeId = {};
-      if (episodeIds.length > 0) {
-        const tripsRes = await query(
-          `
-            SELECT id, source_episode_id, gallery, packing_list, hotels, created_at
-            FROM trips
-            WHERE source_type = 'grenselos_episode'   -- 👈 viktig filter
-              AND source_episode_id = ANY($1)
-              AND user_id = $2                        -- per-admin maler (kan droppes hvis global)
-            ORDER BY source_episode_id ASC, created_at ASC
-          `,
-          [episodeIds, req.user.id]
-        );
+        if (episodeIds.length > 0) {
+          const tripsRes = await query(
+            `
+              SELECT id, source_episode_id, gallery, packing_list, hotels, created_at
+              FROM trips
+              WHERE source_type = 'grenselos_episode'
+                AND source_episode_id = ANY($1)
+              ORDER BY source_episode_id ASC, created_at DESC
+            `,
+            [episodeIds]
+          );
 
-        tripsByEpisodeId = tripsRes.rows.reduce((acc, row) => {
-          if (!acc[row.source_episode_id]) {
-            acc[row.source_episode_id] = row; // bruk den eldste / første mal-trippen
-          }
-          return acc;
-        }, {});
-      }
-
+          // Bruk NYESTE system-trip per episode som "canonical"
+          tripsByEpisodeId = tripsRes.rows.reduce((acc, row) => {
+            if (!acc[row.source_episode_id]) {
+              acc[row.source_episode_id] = row;
+            }
+            return acc;
+          }, {});
+        }
+        
       // 3) Kombiner Spotify-episoder + eksisterende trips
       const data = episodes.map((ep) => {
         const trip = tripsByEpisodeId[ep.id] || null;
@@ -2219,33 +2219,37 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
     if (episodeIds.length > 0) {
       // 3) Hent canonical galleri / hoteller / pakkeliste fra SYSTEM-TRIPS
       const canonRes = await query(
-        `
+          `
           SELECT
             source_episode_id,
             gallery,
             hotels,
-            packing_list
+            packing_list,
+            created_at
           FROM trips
           WHERE source_type = 'grenselos_episode'
             AND source_episode_id = ANY($1)
-            AND user_id = $2
+          ORDER BY source_episode_id ASC, created_at DESC
         `,
-        [episodeIds, req.user.id]
+        [episodeIds]
       );
 
+      // Bruk NYESTE system-trip per episode som canonical kilde
       canonicalByEpisodeId = canonRes.rows.reduce((acc, row) => {
         const episodeId = row.source_episode_id;
         if (!episodeId) return acc;
 
-        acc[episodeId] = {
-          gallery: parseJsonArray(row.gallery),
-          hotels: parseJsonArray(row.hotels),
-          packing_list: row.packing_list  // pakkeliste normaliseres senere
-        };
+        if (!acc[episodeId]) {
+          acc[episodeId] = {
+            gallery: parseJsonArray(row.gallery),
+            hotels: parseJsonArray(row.hotels),
+            packing_list: row.packing_list  // pakkeliste normaliseres senere
+          };
+        }
         return acc;
       }, {});
     }
-
+      
     // 4) Normaliser alle brukerreiser + legg inn canonical fallback
     const trips = rows.map((row) => {
       let stops   = parseJsonArray(row.stops);
@@ -2396,20 +2400,19 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
     if (source_episode_id) {
       sourceType = "user_episode_trip";
 
-      // 1) Forsøk å arve fra system-trip i trips-tabellen
+      // 1) Forsøk å arve fra GLOBAL system-trip i trips-tabellen
       const sysRes = await query(
-        `
+          `
           SELECT packing_list, hotels, gallery
           FROM trips
-          WHERE user_id = $1
-            AND source_type = 'grenselos_episode'
-            AND source_episode_id = $2
-          ORDER BY created_at ASC
+          WHERE source_type = 'grenselos_episode'
+            AND source_episode_id = $1
+          ORDER BY created_at DESC
           LIMIT 1
         `,
-        [req.user.id, source_episode_id]
+        [source_episode_id]
       );
-
+          
       if (sysRes.rowCount > 0) {
         const sys = sysRes.rows[0];
 
