@@ -1097,7 +1097,7 @@ async function ensureTripForEpisode(episode, userId) {
 
 async function getUserTripStats(userId) {
   const userRes = await query(
-    `SELECT is_premium, free_trip_limit FROM users WHERE id=$1`,
+    `SELECT is_premium, free_trip_limit, is_admin FROM users WHERE id=$1`,
     [userId]
   );
 
@@ -1121,6 +1121,7 @@ async function getUserTripStats(userId) {
 
   return {
     isPremium: !!user.is_premium,
+    isAdmin:   !!user.is_admin,   // 👈 NYTT
     tripCount: count,
     freeLimit: limit
   };
@@ -2344,6 +2345,178 @@ function getGenericVirtualTripGallery(count = 3) {
   return shuffled.slice(0, Math.min(count, GENERIC_VIRTUAL_TRIP_IMAGES.length));
 }
 
+// 🌄 Automatisk galleri basert på reisens destinasjoner
+// Bruker Unsplash hvis UNSPLASH_ACCESS_KEY er satt, ellers faller vi tilbake
+// til de generiske bildene i getGenericVirtualTripGallery().
+
+async function generateGalleryForTrip(title, description, stops) {
+  const min = 5;
+  const max = 8;
+
+  try {
+    const accessKey = process.env.UNSPLASH_ACCESS_KEY;
+    if (!accessKey) {
+      console.warn(
+        "[generateGalleryForTrip] UNSPLASH_ACCESS_KEY mangler – bruker generiske bilder."
+      );
+      return getGenericVirtualTripGallery(min);
+    }
+
+    const queries = buildLocationQueriesFromStops(stops, title, description);
+
+    if (!queries.length) {
+      console.warn(
+        "[generateGalleryForTrip] Fant ingen gode søkeord – bruker generiske bilder."
+      );
+      return getGenericVirtualTripGallery(min);
+    }
+
+    const images = [];
+    const seenIds = new Set();
+
+    for (const q of queries) {
+      if (images.length >= max) break;
+
+      const url =
+        "https://api.unsplash.com/search/photos" +
+        `?query=${encodeURIComponent(q)}` +
+        `&per_page=${Math.min(max, 8)}` +
+        "&orientation=landscape";
+
+      const res = await fetch(url, {
+        headers: {
+          Authorization: `Client-ID ${accessKey}`,
+          "Accept-Version": "v1"
+        }
+      });
+
+      if (!res.ok) {
+        console.warn(
+          `[generateGalleryForTrip] Unsplash-søk feilet for "${q}":`,
+          res.status,
+          await res.text()
+        );
+        continue;
+      }
+
+      const data = await res.json();
+      const results = Array.isArray(data.results) ? data.results : [];
+
+      for (const photo of results) {
+        if (!photo || !photo.id || !photo.urls?.regular) continue;
+        if (seenIds.has(photo.id)) continue;
+        if (images.length >= max) break;
+
+        seenIds.add(photo.id);
+
+        images.push({
+          id: photo.id,
+          title:
+            photo.description ||
+            photo.alt_description ||
+            q ||
+            "Reisebilde",
+          query: q,
+          image_url: photo.urls.regular,
+          thumb_url: photo.urls.small || photo.urls.thumb,
+          source: "unsplash",
+          attribution: `${photo.user?.name || "Ukjent fotograf"} / Unsplash`,
+          source_url: photo.links?.html || null,
+          photographer: photo.user?.name || null,
+          location: photo.location?.name || null
+        });
+      }
+    }
+
+    if (images.length === 0) {
+      console.warn(
+        "[generateGalleryForTrip] Fikk ingen bilder fra Unsplash – bruker generiske bilder."
+      );
+      return getGenericVirtualTripGallery(min);
+    }
+
+    if (images.length < min) {
+      const filler = getGenericVirtualTripGallery(min - images.length);
+      return [...images, ...filler];
+    }
+
+    return images;
+  } catch (err) {
+    console.error("[generateGalleryForTrip] Uventet feil:", err);
+    return getGenericVirtualTripGallery(min);
+  }
+}
+
+// Hent gode søkeord fra stopp + tittel/beskrivelse
+function buildLocationQueriesFromStops(stops, tripTitle = "", tripDescription = "") {
+  const queries = [];
+  const seen = new Set();
+
+  const pushUnique = (q) => {
+    if (!q) return;
+    const trimmed = q.trim();
+    if (!trimmed) return;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    queries.push(trimmed);
+  };
+
+  const arrStops = Array.isArray(stops) ? stops : [];
+
+  // 1) Navn / city / country fra stopp
+  for (const s of arrStops) {
+    const name = s?.name;
+    const city = s?.city;
+    const country = s?.country;
+
+    if (city && country) {
+      pushUnique(`${city}, ${country}`);
+      pushUnique(`${city} ${country} travel`);
+    } else if (city) {
+      pushUnique(`${city} travel`);
+    } else if (name) {
+      const first = String(name).split(",")[0];
+      if (first.length > 2) {
+        pushUnique(first);
+        pushUnique(`${first} travel`);
+      }
+    }
+
+    if (queries.length >= 4) break;
+  }
+
+  // 2) Fyll på fra tittel/beskrivelse hvis få queries
+  if (queries.length < 3) {
+    const base = `${tripTitle} ${tripDescription}`.trim();
+    if (base) {
+      const words = base
+        .split(/[\s,–\-:]+/)
+        .map((w) => w.trim())
+        .filter((w) => w.length > 3);
+      for (const w of words) {
+        pushUnique(w);
+        if (queries.length >= 6) break;
+      }
+    }
+  }
+
+  // 3) Utvid med travel/landscape-varianter
+  const expanded = [];
+  const seen2 = new Set();
+  for (const q of queries) {
+    const variants = [q, `${q} travel`, `${q} landscape`];
+    for (const v of variants) {
+      const key = v.toLowerCase();
+      if (seen2.has(key)) continue;
+      seen2.add(key);
+      expanded.push(v);
+    }
+  }
+
+  return expanded.slice(0, 6);
+}
+
 app.post("/api/trips", authMiddleware, async (req, res) => {
   try {
     const {
@@ -2365,10 +2538,11 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
     }
 
     // ---------------- Kvote-sjekk ----------------
-    const { isPremium, tripCount, freeLimit } =
+    const { isPremium, isAdmin, tripCount, freeLimit } =
       await getUserTripStats(req.user.id);
 
-    if (!isPremium && tripCount >= freeLimit) {
+    // Admin-brukere skal ikke stoppes av gratisgrense
+    if (!isPremium && !isAdmin && tripCount >= freeLimit) {
       return res.status(402).json({
         error: "Gratisgrensen er nådd.",
         code: "FREE_LIMIT_REACHED",
