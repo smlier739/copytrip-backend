@@ -2391,6 +2391,7 @@ ${context}
       .map((item) => {
         if (!item) return null;
 
+        // Hvis KI bare gir en streng → tolk som URL
         if (typeof item === "string") {
           return {
             url: item,
@@ -2470,108 +2471,6 @@ function getGenericVirtualTripGallery(count = 3) {
   // Enkel shuffle + slice
   const shuffled = [...GENERIC_VIRTUAL_TRIP_IMAGES].sort(() => 0.5 - Math.random());
   return shuffled.slice(0, Math.min(count, GENERIC_VIRTUAL_TRIP_IMAGES.length));
-}
-
-// 🌄 Automatisk galleri basert på reisens destinasjoner
-// Bruker Unsplash hvis UNSPLASH_ACCESS_KEY er satt, ellers faller vi tilbake
-// til de generiske bildene i getGenericVirtualTripGallery().
-
-async function generateGalleryForTrip(title, description, stops) {
-  const min = 5;
-  const max = 8;
-
-  try {
-    const accessKey = process.env.UNSPLASH_ACCESS_KEY;
-    if (!accessKey) {
-      console.warn(
-        "[generateGalleryForTrip] UNSPLASH_ACCESS_KEY mangler – bruker generiske bilder."
-      );
-      return getGenericVirtualTripGallery(min);
-    }
-
-    const queries = buildLocationQueriesFromStops(stops, title, description);
-
-    if (!queries.length) {
-      console.warn(
-        "[generateGalleryForTrip] Fant ingen gode søkeord – bruker generiske bilder."
-      );
-      return getGenericVirtualTripGallery(min);
-    }
-
-    const images = [];
-    const seenIds = new Set();
-
-    for (const q of queries) {
-      if (images.length >= max) break;
-
-      const url =
-        "https://api.unsplash.com/search/photos" +
-        `?query=${encodeURIComponent(q)}` +
-        `&per_page=${Math.min(max, 8)}` +
-        "&orientation=landscape";
-
-      const res = await fetch(url, {
-        headers: {
-          Authorization: `Client-ID ${accessKey}`,
-          "Accept-Version": "v1"
-        }
-      });
-
-      if (!res.ok) {
-        console.warn(
-          `[generateGalleryForTrip] Unsplash-søk feilet for "${q}":`,
-          res.status,
-          await res.text()
-        );
-        continue;
-      }
-
-      const data = await res.json();
-      const results = Array.isArray(data.results) ? data.results : [];
-
-      for (const photo of results) {
-        if (!photo || !photo.id || !photo.urls?.regular) continue;
-        if (seenIds.has(photo.id)) continue;
-        if (images.length >= max) break;
-
-        seenIds.add(photo.id);
-
-        images.push({
-          id: photo.id,
-          title:
-            photo.description ||
-            photo.alt_description ||
-            q ||
-            "Reisebilde",
-          query: q,
-          image_url: photo.urls.regular,
-          thumb_url: photo.urls.small || photo.urls.thumb,
-          source: "unsplash",
-          attribution: `${photo.user?.name || "Ukjent fotograf"} / Unsplash`,
-          source_url: photo.links?.html || null,
-          photographer: photo.user?.name || null,
-          location: photo.location?.name || null
-        });
-      }
-    }
-
-    if (images.length === 0) {
-      console.warn(
-        "[generateGalleryForTrip] Fikk ingen bilder fra Unsplash – bruker generiske bilder."
-      );
-      return getGenericVirtualTripGallery(min);
-    }
-
-    if (images.length < min) {
-      const filler = getGenericVirtualTripGallery(min - images.length);
-      return [...images, ...filler];
-    }
-
-    return images;
-  } catch (err) {
-    console.error("[generateGalleryForTrip] Uventet feil:", err);
-    return getGenericVirtualTripGallery(min);
-  }
 }
 
 // Hent gode søkeord fra stopp + tittel/beskrivelse
