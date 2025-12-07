@@ -3129,6 +3129,178 @@ app.post("/api/ai/generate-gallery", authMiddleware, async (req, res) => {
   }
 });
 
+app.get("/api/community/posts", authMiddleware, async (req, res) => {
+  try {
+    const rows = await query(
+      `
+      SELECT *
+      FROM community_posts
+      ORDER BY created_at DESC
+      `
+    );
+    res.json({ posts: rows });
+  } catch (e) {
+    console.error("/api/community/posts GET", e);
+    res.status(500).json({ error: "Kunne ikke hente community-poster." });
+  }
+});
+
+app.post("/api/community/posts", authMiddleware, async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: "Tekst kan ikke være tom." });
+    }
+
+    const userId = req.user.id;
+
+    const userRes = await query(
+      `SELECT full_name FROM users WHERE id=$1`,
+      [userId]
+    );
+
+    const userName =
+      userRes.rows[0]?.full_name || "Ukjent bruker";
+
+    const insert = await query(
+      `
+      INSERT INTO community_posts (user_id, user_name, text)
+      VALUES ($1, $2, $3)
+      RETURNING *
+      `,
+      [userId, userName, text.trim()]
+    );
+
+    res.json({ post: insert.rows[0] });
+  } catch (e) {
+    console.error("/api/community/posts POST", e);
+    res.status(500).json({ error: "Kunne ikke lage community-post." });
+  }
+});
+
+app.post(
+  "/api/community/posts/:id/answer",
+  authMiddleware,
+  adminOnlyMiddleware,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { answer } = req.body;
+
+      if (!answer || !answer.trim()) {
+        return res.status(400).json({ error: "Svaret kan ikke være tomt." });
+      }
+
+      const update = await query(
+        `
+        UPDATE community_posts
+        SET answer=$1
+        WHERE id=$2
+        RETURNING *
+        `,
+        [answer.trim(), id]
+      );
+
+      if (update.rowCount === 0) {
+        return res.status(404).json({ error: "Post ikke funnet." });
+      }
+
+      res.json({ post: update.rows[0] });
+    } catch (e) {
+      console.error("/api/community/posts/:id/answer", e);
+      res.status(500).json({ error: "Kunne ikke lagre svar." });
+    }
+  }
+);
+
+app.post("/api/community/posts/:id/like", authMiddleware, async (req, res) => {
+  const postId = Number(req.params.id);
+  const userId = req.user.id;
+
+  // Har brukeren allerede liket?
+  const exists = await query(
+    `SELECT 1 FROM community_likes WHERE user_id=$1 AND post_id=$2`,
+    [userId, postId]
+  );
+
+  if (exists.rowCount > 0) {
+    // UNLIKE (fjern like)
+    await query(
+      `DELETE FROM community_likes WHERE user_id=$1 AND post_id=$2`,
+      [userId, postId]
+    );
+    await query(
+      `UPDATE community_posts SET likes = likes - 1 WHERE id=$1`,
+      [postId]
+    );
+    return res.json({ liked: false });
+  }
+
+  // LIKE
+  await query(
+    `INSERT INTO community_likes (user_id, post_id)
+     VALUES ($1,$2)`,
+    [userId, postId]
+  );
+  await query(
+    `UPDATE community_posts SET likes = likes + 1 WHERE id=$1`,
+    [postId]
+  );
+
+  res.json({ liked: true });
+});
+
+app.post("/api/community/upload-image", authMiddleware, async (req, res) => {
+  const { base64 } = req.body;
+  if (!base64) return res.status(400).json({ error: "Mangler bilde" });
+
+  const url = await uploadBase64ImageToStorage(base64); // du har denne funksjonen
+
+  res.json({ url });
+});
+
+app.post("/api/community/posts/:id/answer", authMiddleware, async (req, res) => {
+  const postId = Number(req.params.id);
+  const { answer } = req.body;
+
+  if (!req.user.is_admin) {
+    return res.status(403).json({ error: "Kun admin kan svare." });
+  }
+
+  const post = await query(
+    `SELECT user_id FROM community_posts WHERE id=$1`,
+    [postId]
+  );
+  if (post.rowCount === 0) return res.status(404).json({ error: "Ikke funnet" });
+
+  // Lagre svaret
+  await query(
+    `UPDATE community_posts
+     SET answer=$1, answer_by=$2, answered_at=NOW()
+     WHERE id=$3`,
+    [answer, req.user.name || "Johnny", postId]
+  );
+
+  // Hent device token for push
+  const user = await query(
+    `SELECT push_token FROM users WHERE id=$1`,
+    [post.rows[0].user_id]
+  );
+
+  const pushToken = user.rows[0]?.push_token;
+
+  // Send push via Expo
+  if (pushToken) {
+    await sendExpoPush(pushToken, {
+      title: "Johnny har svart!",
+      body: "Johnny har svart på spørsmålet ditt i Community.",
+      data: { postId }
+    });
+  }
+
+  res.json({ ok: true });
+});
+
 // -------------------------------------------------------
 //  GLOBAL FEILHANDLER
 // -------------------------------------------------------
