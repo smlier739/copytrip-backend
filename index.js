@@ -2306,6 +2306,133 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
 });
 
 // -------------------------------------------------------
+//  KI-basert galleri for "fra scratch"-reiser
+//  Forsøker å hente 5–8 bilder som matcher destinasjon/stemning
+// -------------------------------------------------------
+
+async function generateGalleryForTrip(title, description, stopsRaw) {
+  try {
+    // Bygg en kort tekst som beskriver reisen
+    const parts = [];
+    if (title) parts.push(String(title));
+    if (description) parts.push(String(description));
+
+    let stops = stopsRaw;
+    if (typeof stops === "string") {
+      try {
+        stops = JSON.parse(stops);
+      } catch {
+        stops = [];
+      }
+    }
+    if (Array.isArray(stops)) {
+      for (const s of stops) {
+        if (!s || typeof s !== "object") continue;
+        if (s.name) parts.push(String(s.name));
+        if (s.description) parts.push(String(s.description));
+      }
+    }
+
+    const context = parts.join("\n\n").trim() || "En reise et sted i verden";
+
+    const systemPrompt = `
+Du skal foreslå BARE bilde-URL-er til en reise-app.
+
+KRAV:
+- Bruk KUN gratis, åpne bildekilder som Unsplash, Pexels, Wikimedia Commons e.l.
+- Velg bilder som MATCHER stedene, naturen og stemningen i reisen.
+- Ikke finn opp nye steder.
+- Returner KUN gyldig JSON på formen:
+
+{
+  "gallery": [
+    {
+      "url": "https://…",
+      "title": "Kort tittel",
+      "caption": "Kort bildetekst"
+    }
+  ]
+}
+
+- Minst 5 og maks 8 elementer i "gallery".
+- "url" må være en direkte bilde-URL (jpg/png/webp osv.).
+- Svar ALDRI med tekst utenfor JSON.
+`.trim();
+
+    const userPrompt = `
+Reisebeskrivelse (tittel, tekst og stopp):
+${context}
+`.trim();
+
+    const completion = await openai.chat.completions.create({
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt }
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.6
+    });
+
+    const content = completion.choices?.[0]?.message?.content || "{}";
+
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch (err) {
+      console.error("❌ JSON parse-feil i generateGalleryForTrip:", err, content);
+      return getGenericVirtualTripGallery(3); // fallback
+    }
+
+    const rawGallery = Array.isArray(parsed.gallery) ? parsed.gallery : [];
+
+    // Normaliser til [{url, title, caption}]
+    const gallery = rawGallery
+      .map((item) => {
+        if (!item) return null;
+
+        if (typeof item === "string") {
+          return {
+            url: item,
+            title: title || "Reisebilde",
+            caption: null
+          };
+        }
+
+        if (typeof item === "object") {
+          const url = typeof item.url === "string" ? item.url : null;
+          if (!url) return null;
+
+          return {
+            url,
+            title:
+              (typeof item.title === "string" && item.title) ||
+              title ||
+              "Reisebilde",
+            caption:
+              (typeof item.caption === "string" && item.caption) ||
+              null
+          };
+        }
+
+        return null;
+      })
+      .filter(Boolean);
+
+    // Hvis KI ga oss noe tomt / rart → fallback
+    if (!gallery.length) {
+      return getGenericVirtualTripGallery(3);
+    }
+
+    // Begrens til maks 8 bilder
+    return gallery.slice(0, 8);
+  } catch (e) {
+    console.error("❌ generateGalleryForTrip-feil:", e);
+    return getGenericVirtualTripGallery(3); // trygg fallback
+  }
+}
+
+// -------------------------------------------------------
 //  GENERISKE BILDER FOR VIRTUELL REISE (IKKE-EPISODE-TRIPS)
 // -------------------------------------------------------
 
@@ -3088,45 +3215,15 @@ app.post(
 
 app.post("/api/ai/generate-gallery", authMiddleware, async (req, res) => {
   try {
-    const { title, description } = req.body;
+    const { title, description, stops } = req.body || {};
 
-    const userDescription =
-      `Du skal hente bilder som passer til denne reisen. ` +
-      `Bruk KUN gratis og åpne bildekilder som Unsplash, Pexels eller Wikimedia Commons. ` +
-      `Velg bilder som faktisk matcher stedene, miljøene og stemningen i reisen. ` +
-      `IKKE finn opp steder – bruk kun bilder du vet er ekte. ` +
-      `Returner KUN gyldig JSON av formatet: { "gallery": ["url", "url", ...] }.\n\n` +
-      `Tittel: ${title}\n` +
-      `Beskrivelse: ${description}\n`;
+    const gallery = await generateGalleryForTrip(
+      title || null,
+      description || null,
+      stops || []
+    );
 
-    const client = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-      project: process.env.OPENAI_PROJECT_ID
-    });
-
-    const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "Du returnerer alltid gyldig JSON og aldri tekst utenfor JSON-format." },
-        { role: "user", content: userDescription }
-      ],
-      response_format: { type: "json_object" }
-    });
-
-    const content = completion.choices[0]?.message?.content || "{}";
-    let result = {};
-
-    try {
-      result = JSON.parse(content);
-    } catch (err) {
-      console.error("❌ JSON parse-feil i galleri:", err, content);
-      return res.status(500).json({ error: "KI returnerte ugyldig galleri-data." });
-    }
-
-    return res.json({
-      gallery: Array.isArray(result.gallery) ? result.gallery : []
-    });
-
+    return res.json({ gallery });
   } catch (err) {
     console.error("❌ /api/ai/generate-gallery:", err);
     return res.status(500).json({ error: "Kunne ikke generere galleri." });
