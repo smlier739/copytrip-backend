@@ -1140,36 +1140,99 @@ app.get("/api/health", (req, res) => {
 // -------------------------------------------------------
 
 app.post("/api/auth/signup", async (req, res) => {
-  const { email, password, fullName } = req.body || {};
+  const {
+    email,
+    password,
+    fullName,
+    birthYear,
+    homeCity,
+    homeCountry,
+    travelStyle,
+    budgetPerDay,
+    experienceLevel
+  } = req.body || {};
 
-  if (!email || !password) {
-    return res.status(400).json({ error: "E-post og passord må fylles ut." });
+  if (!email || !password || !fullName) {
+    return res.status(400).json({
+      error: "Navn, e-post og passord må fylles ut."
+    });
   }
 
+  const normalizedEmail = email.trim().toLowerCase();
+  const normalizedName  = fullName.trim();
+
+  const birthYearValue =
+    birthYear === null || birthYear === "" || birthYear === undefined
+      ? null
+      : Number(birthYear);
+
+  const budgetPerDayValue =
+    budgetPerDay === null || budgetPerDay === "" || budgetPerDay === undefined
+      ? null
+      : Number(budgetPerDay);
+
   try {
-    const exists = await query("SELECT id FROM users WHERE email=$1", [
-      email.toLowerCase(),
-    ]);
+    // Sjekk om e-posten allerede finnes
+    const exists = await query(
+      "SELECT id FROM users WHERE email=$1",
+      [normalizedEmail]
+    );
 
     if (exists.rowCount > 0) {
-      return res.status(400).json({ error: "E-posten er allerede i bruk." });
+      return res
+        .status(400)
+        .json({ error: "E-posten er allerede i bruk." });
     }
 
     const hash = await bcrypt.hash(password, 10);
 
+    // Lagre med alle profilfeltene
     const insert = await query(
       `
-      INSERT INTO users (email, password_hash, full_name)
-      VALUES ($1,$2,$3)
-      RETURNING id,email,full_name,created_at
+      INSERT INTO users (
+        email,
+        password_hash,
+        full_name,
+        birth_year,
+        home_city,
+        home_country,
+        travel_style,
+        budget_per_day,
+        experience_level
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      RETURNING
+        id,
+        email,
+        full_name,
+        birth_year,
+        home_city,
+        home_country,
+        travel_style,
+        budget_per_day,
+        experience_level,
+        is_admin,
+        is_premium,
+        free_trip_limit,
+        created_at
       `,
-      [email.toLowerCase(), hash, fullName || null]
+      [
+        normalizedEmail,
+        hash,
+        normalizedName,
+        birthYearValue,
+        homeCity || null,
+        homeCountry || null,
+        travelStyle || null,
+        budgetPerDayValue,
+        experienceLevel || null
+      ]
     );
 
     const user = insert.rows[0];
 
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, {
-      expiresIn: "30d",
+      expiresIn: "30d"
     });
 
     res.json({ token, user });
@@ -1256,6 +1319,56 @@ app.post("/api/auth/login", async (req, res) => {
     res.status(500).json({ error: "Kunne ikke logge inn." });
   }
 });
+
+app.post("/api/auth/forgot-password", async (req, res) => {
+  const { email } = req.body || {};
+
+  if (!email) {
+    return res.status(400).json({ error: "E-post må fylles inn." });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+
+  try {
+    const result = await query(
+      "SELECT id FROM users WHERE email=$1",
+      [normalizedEmail]
+    );
+
+    if (result.rowCount > 0) {
+      const userId = result.rows[0].id;
+
+      // Enkelt reset-token (brukes evt. senere)
+      const resetToken = jwt.sign(
+        { userId, type: "password_reset" },
+        JWT_SECRET,
+        { expiresIn: "1h" }
+      );
+
+      // Her ville du egentlig sendt e-post.
+      // Nå: vi logger bare i konsollen for testing.
+      console.log(
+        "🔐 Password reset token for",
+        normalizedEmail,
+        "=>",
+        resetToken
+      );
+    }
+
+    // Alltid samme svar, uansett om e-post finnes eller ikke (sikkerhet)
+    return res.json({
+      ok: true,
+      message:
+        "Hvis vi finner e-posten i systemet vårt, sender vi instruksjoner for å nullstille passordet."
+    });
+  } catch (e) {
+    console.error("/api/auth/forgot-password-feil:", e);
+    return res
+      .status(500)
+      .json({ error: "Kunne ikke håndtere glemt passord akkurat nå." });
+  }
+});
+
 
 // -------------------------------------------------------
 //  PROFIL
@@ -2864,7 +2977,7 @@ app.get("/api/templates", authMiddleware, async (req, res) => {
     const result = await query(
       `
       SELECT * FROM trips
-      WHERE user_id=$1 AND source='template'
+      WHERE user_id=$1 AND source_type='template'
       ORDER BY created_at DESC
       `,
       [req.user.id]
