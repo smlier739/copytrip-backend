@@ -3284,39 +3284,29 @@ function parseJsonArray(value) {
 // LISTE: brukes typisk av Community-feed
 app.get("/api/community/posts", authMiddleware, async (req, res) => {
   try {
-    const userId = req.user?.id || null;
-
     const result = await query(
       `
       SELECT
-        p.id,
-        p.title,
-        p.content,
-        p.images,
-        p.answer,
-        p.answered_at,
-        p.created_at,
-        u.full_name AS author_name,
-        COALESCE(lc.likes, 0) AS likes,
+        p.*,
         EXISTS (
-          SELECT 1 FROM community_likes cl
-          WHERE cl.post_id = p.id AND cl.user_id = $1
-        ) AS "likedByMe"
+          SELECT 1
+          FROM community_likes cl
+          WHERE cl.post_id = p.id
+            AND cl.user_id = $1
+        ) AS liked_by_me
       FROM community_posts p
-      LEFT JOIN users u ON u.id = p.user_id
-      LEFT JOIN (
-        SELECT post_id, COUNT(*)::int AS likes
-        FROM community_likes
-        GROUP BY post_id
-      ) lc ON lc.post_id = p.id
       ORDER BY p.created_at DESC
       `,
-      [userId]
+      [req.user.id]
     );
 
-    const posts = result.rows.map((row) => ({
-      ...row,
-      images: parseJsonArray(row.images)
+    const posts = result.rows.map((p) => ({
+      ...p,
+      images:
+        typeof p.images === "string"
+          ? (JSON.parse(p.images || "[]") || [])
+          : (p.images || []),
+      likedByMe: !!p.liked_by_me
     }));
 
     res.json({ posts });
@@ -3380,58 +3370,50 @@ app.get("/api/community/posts/:id", authMiddleware, async (req, res) => {
 // OPPRETT POST: frontend bør sende { title, content, images }
 app.post("/api/community/posts", authMiddleware, async (req, res) => {
   try {
-    const userId = req.user.id;
-
-    const { title, content, images } = req.body || {};
+    const { title, content, category, images } = req.body || {};
 
     const safeTitle = typeof title === "string" ? title.trim() : "";
     const safeContent = typeof content === "string" ? content.trim() : "";
-    const safeImages = Array.isArray(images) ? images.filter(Boolean) : [];
+    const safeCategory = typeof category === "string" ? category.trim() : null;
 
-    if (!safeTitle || !safeContent) {
-      return res.status(400).json({
-        error: "Tittel og innhold må ha tekst."
-      });
+    let safeImages = [];
+    if (Array.isArray(images)) {
+      safeImages = images
+        .filter((x) => typeof x === "string" && x.trim())
+        .map((x) => x.trim());
     }
+
+    if (!safeContent) {
+      return res.status(400).json({ error: "Innhold kan ikke være tomt." });
+    }
+
+    const userId = req.user.id;
+
+    const userRes = await query(
+      `SELECT full_name FROM users WHERE id=$1`,
+      [userId]
+    );
+    const authorName = userRes.rows[0]?.full_name || "Ukjent bruker";
 
     const insert = await query(
       `
-      INSERT INTO community_posts (user_id, title, content, images)
-      VALUES ($1, $2, $3, $4)
-      RETURNING id
+      INSERT INTO community_posts (user_id, author_name, title, content, category, images)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING *
       `,
-      [userId, safeTitle, safeContent, JSON.stringify(safeImages)]
+      [
+        userId,
+        authorName,
+        safeTitle || null,
+        safeContent,
+        safeCategory,
+        JSON.stringify(safeImages)
+      ]
     );
 
-    // returner ferdig post-shape som klienten liker
-    const newId = insert.rows[0].id;
-
-    const detail = await query(
-      `
-      SELECT
-        p.id,
-        p.title,
-        p.content,
-        p.images,
-        p.answer,
-        p.answered_at,
-        p.created_at,
-        u.full_name AS author_name,
-        0::int AS likes,
-        false AS "likedByMe"
-      FROM community_posts p
-      LEFT JOIN users u ON u.id = p.user_id
-      WHERE p.id = $1
-      `,
-      [newId]
-    );
-
-    const post = detail.rows[0];
-    post.images = parseJsonArray(post.images);
-
-    res.json({ post });
+    res.json({ post: insert.rows[0] });
   } catch (e) {
-    console.error("/api/community/posts POST-feil:", e);
+    console.error("/api/community/posts POST", e);
     res.status(500).json({ error: "Kunne ikke lage community-post." });
   }
 });
