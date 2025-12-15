@@ -1154,6 +1154,59 @@ app.get("/api/health", (req, res) => {
 });
 
 // -------------------------------------------------------
+//  DEBUG: DB-INFO (hvilken database er Render egentlig koblet til?)
+// -------------------------------------------------------
+app.get("/api/debug/db-info", async (req, res) => {
+  try {
+    const r = await query(
+      `
+      SELECT
+        current_database() AS db,
+        current_user AS "user",
+        inet_server_addr() AS server_addr,
+        inet_server_port() AS server_port,
+        current_schema() AS schema,
+        current_setting('search_path') AS search_path
+      `
+    );
+
+    // Ikke logg passord, men greit å se host fra DATABASE_URL hvis du vil
+    const dbUrl = process.env.DATABASE_URL || "";
+    const safeDbUrl = dbUrl ? dbUrl.replace(/:(.*?)@/, ":***@") : null;
+
+    res.json({
+      ok: true,
+      env: {
+        hasDatabaseUrl: !!process.env.DATABASE_URL,
+        databaseUrlHostHint: safeDbUrl
+      },
+      db: r.rows[0]
+    });
+  } catch (e) {
+    console.error("/api/debug/db-info error:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/api/debug/db-tables", async (req, res) => {
+  try {
+    const r = await query(
+      `
+      SELECT table_schema, table_name
+      FROM information_schema.tables
+      WHERE table_type='BASE TABLE'
+        AND table_schema NOT IN ('pg_catalog','information_schema')
+      ORDER BY table_schema, table_name
+      `
+    );
+    res.json({ ok: true, tables: r.rows });
+  } catch (e) {
+    console.error("/api/debug/db-tables error:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// -------------------------------------------------------
 //  AUTH
 // -------------------------------------------------------
 
