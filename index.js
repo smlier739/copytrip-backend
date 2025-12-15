@@ -581,21 +581,22 @@ async function authMiddleware(req, res, next) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
 
-    // Hent bruker for å få is_admin + navn
-    const userRes = await query(
-      `SELECT id, is_admin, full_name, email FROM users WHERE id=$1`,
+    // Hent bruker fra DB slik at vi alltid har is_admin + navn tilgjengelig
+    const u = await query(
+      `SELECT id, email, full_name, is_admin FROM users WHERE id=$1`,
       [decoded.userId]
     );
 
-    if (userRes.rowCount === 0) {
-      return res.status(401).json({ error: "Bruker finnes ikke." });
+    if (u.rowCount === 0) {
+      return res.status(401).json({ error: "Bruker ikke funnet." });
     }
 
-    const u = userRes.rows[0];
+    const user = u.rows[0];
     req.user = {
-      id: u.id,
-      is_admin: !!u.is_admin,
-      name: u.full_name || u.email || "Bruker"
+      id: user.id,
+      email: user.email,
+      full_name: user.full_name,
+      is_admin: !!user.is_admin
     };
 
     next();
@@ -3260,54 +3261,79 @@ app.post("/api/ai/generate-gallery", authMiddleware, async (req, res) => {
 });
 
 // -------------------------------------------------------
-//  COMMUNITY (NY / KONSISTENT MED APPEN)
-//  Forventer tabeller:
-//    community_posts(id, user_id, title, content, images, answer, answered_at, created_at)
-//    community_likes(user_id, post_id) med UNIQUE(user_id, post_id)
+//  COMMUNITY (KONSISTENT API)
 // -------------------------------------------------------
 
-function parseJsonArray(value) {
-  if (!value) return [];
-  if (Array.isArray(value)) return value;
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }
-  // hvis value er JSONB objekt/array fra pg kan det allerede være array
-  return [];
+// Helper: map DB-row -> frontend-format
+function mapCommunityPostRow(row, { likedByMe = false } = {}) {
+  const text = row.text || "";
+  const title =
+    (row.title && String(row.title).trim()) ||
+    text.split("\n")[0]?.trim()?.slice(0, 80) ||
+    "Innlegg";
+
+  const content =
+    text.trim() ||
+    row.content || // fallback hvis du senere migrerer
+    "";
+
+  return {
+    id: row.id,
+    title,
+    content,
+    author_name: row.user_name || "Ukjent bruker",
+    user_id: row.user_id || null,
+
+    category_id: row.category_id || null,
+    images: Array.isArray(row.images) ? row.images : [],
+
+    likes: Number(row.likes || 0),
+    likedByMe: !!likedByMe,
+
+    answer: row.answer || null,
+    answer_by: row.answer_by || null,
+    answered_at: row.answered_at || null,
+
+    created_at: row.created_at || null
+  };
 }
 
-// LISTE: brukes typisk av Community-feed
+// GET categories
+app.get("/api/community/categories", authMiddleware, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT id, name FROM community_categories ORDER BY name ASC`
+    );
+    res.json({ categories: r.rows });
+  } catch (e) {
+    console.error("/api/community/categories GET", e);
+    res.status(500).json({ error: "Kunne ikke hente kategorier." });
+  }
+});
+
+// GET posts (liste) inkl likedByMe for innlogget bruker
 app.get("/api/community/posts", authMiddleware, async (req, res) => {
   try {
-    const result = await query(
+    const userId = req.user.id;
+
+    const r = await query(
       `
       SELECT
         p.*,
         EXISTS (
           SELECT 1
           FROM community_likes cl
-          WHERE cl.post_id = p.id
-            AND cl.user_id = $1
+          WHERE cl.post_id = p.id AND cl.user_id = $1
         ) AS liked_by_me
       FROM community_posts p
       ORDER BY p.created_at DESC
       `,
-      [req.user.id]
+      [userId]
     );
 
-    const posts = result.rows.map((p) => ({
-      ...p,
-      images:
-        typeof p.images === "string"
-          ? (JSON.parse(p.images || "[]") || [])
-          : (p.images || []),
-      likedByMe: !!p.liked_by_me
-    }));
+    const posts = r.rows.map((row) =>
+      mapCommunityPostRow(row, { likedByMe: row.liked_by_me })
+    );
 
     res.json({ posts });
   } catch (e) {
@@ -3316,150 +3342,145 @@ app.get("/api/community/posts", authMiddleware, async (req, res) => {
   }
 });
 
-// DETAIL: matcher CommunityPostDetailScreen (GET /api/community/posts/:id)
+// GET single post (detail) inkl likedByMe
 app.get("/api/community/posts/:id", authMiddleware, async (req, res) => {
   try {
+    const userId = req.user.id;
     const postId = Number(req.params.id);
-    if (!postId) return res.status(400).json({ error: "Ugyldig postId" });
 
-    const userId = req.user?.id || null;
-
-    const result = await query(
-      `
-      SELECT
-        p.id,
-        p.title,
-        p.content,
-        p.images,
-        p.answer,
-        p.answered_at,
-        p.created_at,
-        u.full_name AS author_name,
-        COALESCE(lc.likes, 0) AS likes,
-        EXISTS (
-          SELECT 1 FROM community_likes cl
-          WHERE cl.post_id = p.id AND cl.user_id = $2
-        ) AS "likedByMe"
-      FROM community_posts p
-      LEFT JOIN users u ON u.id = p.user_id
-      LEFT JOIN (
-        SELECT post_id, COUNT(*)::int AS likes
-        FROM community_likes
-        GROUP BY post_id
-      ) lc ON lc.post_id = p.id
-      WHERE p.id = $1
-      LIMIT 1
-      `,
-      [postId, userId]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: "Innlegg ikke funnet." });
+    if (!Number.isFinite(postId)) {
+      return res.status(400).json({ error: "Ugyldig post-id." });
     }
 
-    const post = result.rows[0];
-    post.images = parseJsonArray(post.images);
+    const r = await query(
+      `
+      SELECT
+        p.*,
+        EXISTS (
+          SELECT 1
+          FROM community_likes cl
+          WHERE cl.post_id = p.id AND cl.user_id = $1
+        ) AS liked_by_me
+      FROM community_posts p
+      WHERE p.id = $2
+      LIMIT 1
+      `,
+      [userId, postId]
+    );
 
+    if (r.rowCount === 0) {
+      return res.status(404).json({ error: "Fant ikke innlegget." });
+    }
+
+    const post = mapCommunityPostRow(r.rows[0], { likedByMe: r.rows[0].liked_by_me });
     res.json({ post });
   } catch (e) {
-    console.error("/api/community/posts/:id GET-feil:", e);
+    console.error("/api/community/posts/:id GET", e);
     res.status(500).json({ error: "Kunne ikke hente innlegget." });
   }
 });
 
-// OPPRETT POST: frontend bør sende { title, content, images }
+// POST create post
+// Frontend kan sende { content, title?, category_id?, images? }
+// Backend lagrer i DB-feltet "text" (NOT NULL)
 app.post("/api/community/posts", authMiddleware, async (req, res) => {
   try {
-    const { title, content, category, images } = req.body || {};
-
-    const safeTitle = typeof title === "string" ? title.trim() : "";
-    const safeContent = typeof content === "string" ? content.trim() : "";
-    const safeCategory = typeof category === "string" ? category.trim() : null;
-
-    let safeImages = [];
-    if (Array.isArray(images)) {
-      safeImages = images
-        .filter((x) => typeof x === "string" && x.trim())
-        .map((x) => x.trim());
-    }
-
-    if (!safeContent) {
-      return res.status(400).json({ error: "Innhold kan ikke være tomt." });
-    }
-
     const userId = req.user.id;
+    const userName = req.user.full_name || "Ukjent bruker";
 
-    const userRes = await query(
-      `SELECT full_name FROM users WHERE id=$1`,
-      [userId]
-    );
-    const authorName = userRes.rows[0]?.full_name || "Ukjent bruker";
+    const {
+      content,         // frontend-friendly
+      text,            // backward-compatible (om noen bruker den)
+      category_id,
+      categoryId,
+      images
+    } = req.body || {};
 
-    const insert = await query(
+    const rawText = (typeof content === "string" ? content : (typeof text === "string" ? text : "")).trim();
+
+    if (!rawText) {
+      return res.status(400).json({ error: "Tekst kan ikke være tom." });
+    }
+
+    const cat =
+      category_id != null ? Number(category_id) :
+      categoryId != null ? Number(categoryId) :
+      null;
+
+    const imgs = Array.isArray(images)
+      ? images.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim())
+      : [];
+
+    const ins = await query(
       `
-      INSERT INTO community_posts (user_id, author_name, title, content, category, images)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      INSERT INTO community_posts (user_id, user_name, text, category_id, images)
+      VALUES ($1, $2, $3, $4, $5)
       RETURNING *
       `,
-      [
-        userId,
-        authorName,
-        safeTitle || null,
-        safeContent,
-        safeCategory,
-        JSON.stringify(safeImages)
-      ]
+      [userId, userName, rawText, Number.isFinite(cat) ? cat : null, imgs]
     );
 
-    res.json({ post: insert.rows[0] });
+    const post = mapCommunityPostRow(ins.rows[0], { likedByMe: false });
+    res.json({ post });
   } catch (e) {
     console.error("/api/community/posts POST", e);
     res.status(500).json({ error: "Kunne ikke lage community-post." });
   }
 });
 
-// LIKE/UNLIKE: toggle + returner ny likes-count (frontend kan bruke hvis du vil)
+// POST toggle like (atomisk + trygt)
 app.post("/api/community/posts/:id/like", authMiddleware, async (req, res) => {
   const postId = Number(req.params.id);
   const userId = req.user.id;
 
-  if (!postId) return res.status(400).json({ error: "Ugyldig postId" });
+  if (!Number.isFinite(postId)) {
+    return res.status(400).json({ error: "Ugyldig post-id." });
+  }
 
+  const client = await pool.connect();
   try {
-    // prøv å LIKE (insert). Hvis den allerede finnes → rowCount 0 → da UNLIKE vi
-    const ins = await query(
-      `
-      INSERT INTO community_likes (user_id, post_id)
-      VALUES ($1, $2)
-      ON CONFLICT (user_id, post_id) DO NOTHING
-      `,
+    await client.query("BEGIN");
+
+    const exists = await client.query(
+      `SELECT 1 FROM community_likes WHERE user_id=$1 AND post_id=$2`,
       [userId, postId]
     );
 
-    let liked;
-    if (ins.rowCount === 1) {
-      liked = true;
-    } else {
-      await query(
+    if (exists.rowCount > 0) {
+      await client.query(
         `DELETE FROM community_likes WHERE user_id=$1 AND post_id=$2`,
         [userId, postId]
       );
-      liked = false;
+      await client.query(
+        `UPDATE community_posts SET likes = GREATEST(likes - 1, 0) WHERE id=$1`,
+        [postId]
+      );
+
+      await client.query("COMMIT");
+      return res.json({ liked: false });
     }
 
-    const countRes = await query(
-      `SELECT COUNT(*)::int AS likes FROM community_likes WHERE post_id=$1`,
+    await client.query(
+      `INSERT INTO community_likes (user_id, post_id) VALUES ($1,$2)`,
+      [userId, postId]
+    );
+    await client.query(
+      `UPDATE community_posts SET likes = likes + 1 WHERE id=$1`,
       [postId]
     );
 
-    res.json({ liked, likes: countRes.rows[0].likes });
+    await client.query("COMMIT");
+    res.json({ liked: true });
   } catch (e) {
-    console.error("/api/community/posts/:id/like-feil:", e);
-    res.status(500).json({ error: "Kunne ikke oppdatere like." });
+    await client.query("ROLLBACK");
+    console.error("/api/community/posts/:id/like", e);
+    res.status(500).json({ error: "Kunne ikke like innlegget." });
+  } finally {
+    client.release();
   }
 });
 
-// SVAR FRA JOHNNY (ADMIN): matcher appen (answer + answered_at)
+// POST admin answer (EN route, ingen duplikat)
 app.post(
   "/api/community/posts/:id/answer",
   authMiddleware,
@@ -3469,64 +3490,35 @@ app.post(
       const postId = Number(req.params.id);
       const { answer } = req.body || {};
 
-      if (!postId) return res.status(400).json({ error: "Ugyldig postId" });
-
-      const safeAnswer = typeof answer === "string" ? answer.trim() : "";
-      if (!safeAnswer) {
-        return res.status(400).json({ error: "Svaret må inneholde tekst." });
+      if (!Number.isFinite(postId)) {
+        return res.status(400).json({ error: "Ugyldig post-id." });
       }
 
-      const update = await query(
+      if (!answer || !String(answer).trim()) {
+        return res.status(400).json({ error: "Svaret kan ikke være tomt." });
+      }
+
+      const upd = await query(
         `
         UPDATE community_posts
-        SET answer = $1,
-            answered_at = NOW()
-        WHERE id = $2
-        RETURNING id
+        SET
+          answer = $1,
+          answer_by = $2,
+          answered_at = NOW()
+        WHERE id = $3
+        RETURNING *
         `,
-        [safeAnswer, postId]
+        [String(answer).trim(), req.user.full_name || "Admin", postId]
       );
 
-      if (update.rowCount === 0) {
+      if (upd.rowCount === 0) {
         return res.status(404).json({ error: "Post ikke funnet." });
       }
 
-      // returner oppdatert detalj (samme format som detail-endpoint)
-      const detail = await query(
-        `
-        SELECT
-          p.id,
-          p.title,
-          p.content,
-          p.images,
-          p.answer,
-          p.answered_at,
-          p.created_at,
-          u.full_name AS author_name,
-          COALESCE(lc.likes, 0) AS likes,
-          EXISTS (
-            SELECT 1 FROM community_likes cl
-            WHERE cl.post_id = p.id AND cl.user_id = $2
-          ) AS "likedByMe"
-        FROM community_posts p
-        LEFT JOIN users u ON u.id = p.user_id
-        LEFT JOIN (
-          SELECT post_id, COUNT(*)::int AS likes
-          FROM community_likes
-          GROUP BY post_id
-        ) lc ON lc.post_id = p.id
-        WHERE p.id = $1
-        LIMIT 1
-        `,
-        [postId, req.user.id]
-      );
-
-      const post = detail.rows[0];
-      post.images = parseJsonArray(post.images);
-
+      const post = mapCommunityPostRow(upd.rows[0], { likedByMe: false });
       res.json({ post });
     } catch (e) {
-      console.error("/api/community/posts/:id/answer-feil:", e);
+      console.error("/api/community/posts/:id/answer", e);
       res.status(500).json({ error: "Kunne ikke lagre svar." });
     }
   }
