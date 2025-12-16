@@ -3609,6 +3609,32 @@ app.post(
   }
 );
 
+// -------------------------------------------------------
+//  COMMUNITY: BILDEOPPLASTING (for innlegg)
+// -------------------------------------------------------
+
+app.post(
+  "/api/community/uploads",
+  authMiddleware,
+  upload.array("images", 10),
+  async (req, res) => {
+    try {
+      const files = req.files || [];
+
+      if (!files.length) {
+        return res.status(400).json({ error: "Ingen bildefiler ble lastet opp." });
+      }
+
+      // Returner relative URL-er som funker mot samme backend-baseURL
+      const urls = files.map((f) => `/uploads/${f.filename}`);
+
+      res.json({ ok: true, urls });
+    } catch (e) {
+      console.error("/api/community/uploads-feil:", e);
+      res.status(500).json({ error: "Kunne ikke laste opp bilder." });
+    }
+  }
+);
 
 // -------------------------------------------------------
 //  GLOBAL FEILHANDLER
