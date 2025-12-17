@@ -44,9 +44,10 @@ app.use(express.urlencoded({ extended: true }));
 // Lokal dev: fallback til ./uploads (samme som før)
 const uploadDir = process.env.UPLOAD_DIR
   ? process.env.UPLOAD_DIR
-  : path.join(__dirname, "uploads");
+  : "/var/data/uploads";
 
 fs.mkdirSync(uploadDir, { recursive: true });
+app.use("/uploads", express.static(uploadDir));
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadDir),
@@ -1152,6 +1153,15 @@ app.get("/api/health", (req, res) => {
 // -------------------------------------------------------
 //  DEBUG: DB-INFO (hvilken database er Render egentlig koblet til?)
 // -------------------------------------------------------
+app.get("/debug/uploads", (req, res) => {
+  try {
+    const files = fs.readdirSync(uploadDir);
+    res.json({ uploadDir, count: files.length, files });
+  } catch (e) {
+    res.status(500).json({ uploadDir, error: e.message });
+  }
+});
+
 app.get("/api/debug/db-info", async (req, res) => {
   try {
     const r = await query(
