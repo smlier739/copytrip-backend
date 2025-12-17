@@ -3645,8 +3645,6 @@ app.use((err, req, res, next) => {
 //  SERVER START
 // -------------------------------------------------------
 
-const PORT = process.env.PORT || 4000;
-
 app.listen(PORT, () => {
   console.log(`🚀 Grenseløs Reise backend kjører på port ${PORT}`);
 });
