@@ -38,40 +38,34 @@ app.use(express.urlencoded({ extended: true }));
 
 // ---------- Filopplasting for galleri / virtuell reise ----------
 
-// Sørg for at uploads-mappen finnes
-const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
+// Render Persistent Disk: sett f.eks. UPLOAD_DIR=/var/data/uploads
+// Lokal dev: fallback til ./uploads (samme som før)
+const uploadDir = process.env.UPLOAD_DIR
+  ? process.env.UPLOAD_DIR
+  : path.join(__dirname, "uploads");
 
-// Konfigurer multer til å lagre bilder lokalt
+fs.mkdirSync(uploadDir, { recursive: true });
+
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadDir);
-  },
+  destination: (req, file, cb) => cb(null, uploadDir),
   filename: (req, file, cb) => {
-    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    const safeOriginalName = file.originalname.replace(/\s+/g, "_");
-    cb(null, `${unique}-${safeOriginalName}`);
+    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+    const original = (file.originalname || "image")
+      .normalize("NFKD")
+      .replace(/[^\w.\-]+/g, "_");
+    cb(null, `${unique}-${original}`);
   }
 });
 
 const upload = multer({
   storage,
-  // enkel filtrering: bare bilder
   fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith("image/")) {
-      cb(null, true);
-    } else {
-      cb(new Error("Kun bildefiler er tillatt."), false);
-    }
+    if ((file.mimetype || "").startsWith("image/")) return cb(null, true);
+    return cb(new Error("Kun bildefiler er tillatt."), false);
   }
 });
 
-// Gjør /uploads tilgjengelig som statiske filer
 app.use("/uploads", express.static(uploadDir));
-
-const PORT = process.env.PORT || 4000;
 
 // Bruk DATABASE_URL hvis den finnes (Render), ellers klassisk lokalt oppsett
 let pool;
