@@ -455,8 +455,6 @@ function normalizeTripStructure(parsed) {
       (Array.isArray(parsed.stops) ? parsed.stops.map(s => `${s?.name || ""} ${s?.description || ""}`).join("\n") : "");
 
     const packing_list = normalizePackingToFourCategoriesSmart(rawPacking, contextText);
-    
-    let packing_list = [];
 
     if (Array.isArray(rawPacking)) {
       packing_list = rawPacking.map((group) => {
