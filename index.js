@@ -42,9 +42,8 @@ app.use(express.urlencoded({ extended: true }));
 
 // Render Persistent Disk: sett f.eks. UPLOAD_DIR=/var/data/uploads
 // Lokal dev: fallback til ./uploads (samme som før)
-const uploadDir = process.env.UPLOAD_DIR
-  ? process.env.UPLOAD_DIR
-  : "/var/data/uploads";
+const uploadDir =
+  process.env.UPLOAD_DIR || path.join(__dirname, "uploads");
 
 fs.mkdirSync(uploadDir, { recursive: true });
 app.use("/uploads", express.static(uploadDir));
@@ -62,13 +61,12 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB
   fileFilter: (req, file, cb) => {
     if ((file.mimetype || "").startsWith("image/")) return cb(null, true);
     return cb(new Error("Kun bildefiler er tillatt."), false);
   }
 });
-
-app.use("/uploads", express.static(uploadDir));
 
 // Bruk DATABASE_URL hvis den finnes (Render), ellers klassisk lokalt oppsett
 let pool;
@@ -456,93 +454,7 @@ function normalizeTripStructure(parsed) {
 
     const packing_list = normalizePackingToFourCategoriesSmart(rawPacking, contextText);
 
-    if (Array.isArray(rawPacking)) {
-      packing_list = rawPacking.map((group) => {
-        // Hvis KI har sendt en ren streng, gjør den om til et "group"-objekt
-        if (typeof group === "string") {
-          return {
-            category: "Annet",
-            items: group
-              .split(/[\n,]/)
-              .map((s) => s.trim())
-              .filter(Boolean)
-          };
-        }
-
-        const category =
-          typeof group.category === "string" && group.category.trim()
-            ? group.category.trim()
-            : "Generelt";
-
-        let items = group.items;
-
-        if (!Array.isArray(items)) {
-          // Hvis KI sender én streng, splitt på komma / linjeskift
-          if (typeof items === "string") {
-            items = items
-              .split(/[\n,]/)
-              .map((s) => s.trim())
-              .filter(Boolean);
-          } else {
-            items = [];
-          }
-        }
-
-        return {
-          category,
-          items
-        };
-      });
-    }
-
-    // 🔒 Tving til nøyaktig 4 kategorier hver gang
-    const defaultCategories = ["Klær", "Toalettsaker", "Elektronikk", "Annet"];
-
-    // Flat ut alle items som finnes
-    const allItems = [];
-    for (const group of packing_list) {
-      if (Array.isArray(group.items)) {
-        for (const item of group.items) {
-          if (typeof item === "string" && item.trim()) {
-            allItems.push(item.trim());
-          }
-        }
-      }
-    }
-
-    // Hvis KI ikke ga oss noe fornuftig → lag en enkel standardliste
-    const fallbackItems =
-      allItems.length === 0
-        ? [
-            "Undertøy",
-            "Sokker",
-            "T-skjorter",
-            "Bukse/shorts",
-            "Toalettsaker",
-            "Lader til mobil",
-            "Powerbank",
-            "Pass/ID-kort",
-            "Reiseforsikring",
-            "Solbriller",
-            "Regnjakke",
-            "Behagelige sko"
-          ]
-        : allItems;
-
-    // Fordel items jevnt over 4 kategorier
-    const distributed = defaultCategories.map((cat, catIndex) => {
-      const itemsForCat = [];
-      for (let i = catIndex; i < fallbackItems.length; i += defaultCategories.length) {
-        itemsForCat.push(fallbackItems[i]);
-      }
-      return {
-        category: cat,
-        items: itemsForCat
-      };
-    });
-
-    packing_list = distributed;
-  // ---- HOTELLER / OVERNATTING ----
+      // ---- HOTELLER / OVERNATTING ----
   const rawHotels =
     parsed.hotels ||
     parsed.accommodations ||
@@ -996,7 +908,7 @@ ${profileText}
     max_output_tokens: 1200
   });
 
-  const raw = response.output?.[0]?.content?.[0]?.text || "{}";
+  const raw = response.output_text || "{}";
   console.log("🧾 Rått KI-svar (før parsing):", raw);
 
   let jsonText = raw.trim();
@@ -1529,9 +1441,9 @@ app.get(
         `
         SELECT id, title, description, stops
         FROM trips
-        WHERE id = $1
+        WHERE id = $1 AND user_id = $2
         `,
-        [tripId]
+        [tripId, req.user.id]
       );
 
       if (tripRes.rows.length === 0) {
