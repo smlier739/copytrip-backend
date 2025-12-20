@@ -2566,7 +2566,6 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
 
         gallery = parseJsonArray(canon.gallery);
         hotels  = parseJsonArray(canon.hotels);
-        packing = canon.packing_list;
       } else {
         // 🧳 Vanlige KI-/manuelle reiser ("fra scratch"):
         // hvis galleriet fortsatt er tomt → gi generiske bilder
