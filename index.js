@@ -878,6 +878,11 @@ async function generateTripFromAI({ sourceUrl, userDescription, userProfile }) {
   - "currency" skal normalt være "NOK" for norske brukere, ellers relevant lokal valuta.
   - Forslagene skal så langt som mulig ligge INNENFOR brukerens dagsbudsjett, basert på "budget_per_day" i profilen.
   - Hvis budsjettet er lavt, prioriter rimelige og enkle alternativer (hostel, budsjett-hotell, enklere gjestehus).
+  - Hvert hotell SKAL ha "url".
+  - "url" må være en direkte lenke til hotellets offisielle nettside
+    ELLER en direkte hotellsidelenke hos en seriøs booking-side.
+  - IKKE bruk Google-søk/Google Maps-søk-URL.
+  - Hvis du ikke finner en trygg, konkret URL: sett "url": null.
 
   KRAV FOR PACKING_LIST:
   - "trip.packing_list" SKAL være en liste (array) med minst 8–12 elementer.
@@ -2484,16 +2489,23 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
     };
 
     // Hjelper: sørg for at hotell alltid har en .url som frontend kan klikke på
+    
+    const isHttpUrl = (s) => {
+      if (typeof s !== "string") return false;
+      const t = s.trim();
+      return /^https?:\/\/\S+/i.test(t);
+    };
+      
     const makeHotelUrl = (h) => {
-      const raw =
-        (typeof h.url === "string" && h.url.trim()) ||
-        (typeof h.booking_url === "string" && h.booking_url.trim()) ||
-        (typeof h.link === "string" && h.link.trim()) ||
-        (typeof h.external_url === "string" && h.external_url.trim()) ||
-        null;
+    const raw =
+      (typeof h.url === "string" && h.url.trim()) ||
+      (typeof h.booking_url === "string" && h.booking_url.trim()) ||
+      (typeof h.link === "string" && h.link.trim()) ||
+      (typeof h.external_url === "string" && h.external_url.trim()) ||
+    null;
 
       if (raw) {
-        return raw;
+        return isHttpUrl(raw) ? raw.trim() : null;
       }
 
       // Fallback: generer en Google Maps-søke-URL basert på navn + sted
