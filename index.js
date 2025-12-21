@@ -42,11 +42,15 @@ app.use(express.urlencoded({ extended: true }));
 
 // Render Persistent Disk: sett f.eks. UPLOAD_DIR=/var/data/uploads
 // Lokal dev: fallback til ./uploads (samme som før)
+// Render Persistent Disk: /var/data/uploads
 const uploadDir =
-  process.env.UPLOAD_DIR || path.join(__dirname, "uploads");
+  process.env.UPLOAD_DIR ||
+  (process.env.RENDER ? "/var/data/uploads" : path.join(__dirname, "uploads"));
 
 fs.mkdirSync(uploadDir, { recursive: true });
 app.use("/uploads", express.static(uploadDir));
+
+console.log("📦 uploadDir =", uploadDir);
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadDir),
