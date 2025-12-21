@@ -3601,19 +3601,19 @@ app.post("/api/community/posts", authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const { title, body, text, category_id, images } = req.body || {};
+    const { title, body, text, content, message, category_id, images } = req.body || {};
+    console.log("POST /api/community/posts req.body =", req.body);
 
-    const finalTitle = typeof title === "string" ? title.trim() : "";
-    // støtt både body og text (for bakoverkomp)
-    const finalBody =
-      typeof body === "string" ? body.trim() :
-      typeof text === "string" ? text.trim() :
-      "";
+    const pickText = (...vals) =>
+      vals.find(v => typeof v === "string" && v.trim())?.trim() || "";
+
+    const finalTitle = pickText(title);
+    const finalBody  = pickText(body, text, content, message);
 
     if (!finalBody) {
       return res.status(400).json({ error: "Tekst kan ikke være tom." });
     }
-
+      
     const userRes = await query(
       `SELECT full_name FROM users WHERE id=$1`,
       [userId]
@@ -3778,6 +3778,38 @@ app.post(
     }
   }
 );
+
+app.delete("/api/community/posts/:id", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const postId = Number(req.params.id);
+
+    if (!postId) return res.status(400).json({ error: "Ugyldig post-id." });
+
+    // 1) Sjekk rolle på brukeren (tilpass hvis du allerede har role/is_admin i req.user)
+    const u = await query(`SELECT role, is_admin FROM users WHERE id=$1`, [userId]);
+    const isAdmin = u.rows[0]?.is_admin === true || u.rows[0]?.role === "admin";
+
+    // 2) Finn innlegget
+    const p = await query(`SELECT id, user_id FROM community_posts WHERE id=$1`, [postId]);
+    const post = p.rows[0];
+    if (!post) return res.status(404).json({ error: "Innlegg finnes ikke." });
+
+    // 3) Tillat admin, evt. eier
+    const isOwner = post.user_id === userId;
+    if (!isAdmin && !isOwner) {
+      return res.status(403).json({ error: "Ikke tilgang til å slette dette innlegget." });
+    }
+
+    // 4) Slett
+    await query(`DELETE FROM community_posts WHERE id=$1`, [postId]);
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("/api/community/posts/:id DELETE error:", e);
+    res.status(500).json({ error: "Kunne ikke slette innlegg." });
+  }
+});
 
 // Multer / upload-feil → 400 (ikke 500)
 app.use((err, req, res, next) => {
