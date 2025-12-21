@@ -40,36 +40,48 @@ app.use(express.urlencoded({ extended: true }));
 
 // ---------- Filopplasting for galleri / virtuell reise ----------
 
-// Render Persistent Disk: sett f.eks. UPLOAD_DIR=/var/data/uploads
-// Lokal dev: fallback til ./uploads (samme som før)
-// Render Persistent Disk: /var/data/uploads
-const uploadDir =
-  process.env.UPLOAD_DIR ||
-  (process.env.RENDER ? "/var/data/uploads" : path.join(__dirname, "uploads"));
+const uploadDir = "/var/data/uploads";
 
-fs.mkdirSync(uploadDir, { recursive: true });
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+
 app.use("/uploads", express.static(uploadDir));
 
-console.log("📦 uploadDir =", uploadDir);
-
+// 🧱 Storage
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
+  destination: (req, file, cb) => {
+    cb(null, uploadDir);
+  },
   filename: (req, file, cb) => {
-    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    const original = (file.originalname || "image")
-      .normalize("NFKD")
-      .replace(/[^\w.\-]+/g, "_");
-    cb(null, `${unique}-${original}`);
+    const unique = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    const safeName = file.originalname
+      .replace(/\s+/g, "_")
+      .replace(/[^a-zA-Z0-9._-]/g, "");
+
+    cb(null, `${unique}-${safeName}`);
   }
 });
 
+// ✅ Tillatte typer (HEIC BLOKKERT)
+const ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"];
+const ALLOWED_EXTS = [".jpg", ".jpeg", ".png", ".webp"];
+
+const fileFilter = (req, file, cb) => {
+  const ext = path.extname(file.originalname || "").toLowerCase();
+  const mimeOk = ALLOWED_MIME_TYPES.includes(file.mimetype);
+  const extOk = ALLOWED_EXTS.includes(ext);
+
+  if (mimeOk && extOk) return cb(null, true);
+
+  console.warn("❌ Avvist bildefil:", file.originalname, file.mimetype);
+  cb(new Error("Kun JPG, PNG og WEBP er tillatt. HEIC/HEIF støttes ikke."));
+};
+
 const upload = multer({
   storage,
-  limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB
-  fileFilter: (req, file, cb) => {
-    if ((file.mimetype || "").startsWith("image/")) return cb(null, true);
-    return cb(new Error("Kun bildefiler er tillatt."), false);
-  }
+  fileFilter,
+  limits: { fileSize: 12 * 1024 * 1024 }
 });
 
 // Bruk DATABASE_URL hvis den finnes (Render), ellers klassisk lokalt oppsett
@@ -3766,6 +3778,14 @@ app.post(
     }
   }
 );
+
+// Multer / upload-feil → 400 (ikke 500)
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError || err?.message?.includes("tillatt")) {
+    return res.status(400).json({ error: err.message });
+  }
+  next(err);
+});
 
 // -------------------------------------------------------
 //  GLOBAL FEILHANDLER
