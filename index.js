@@ -3784,25 +3784,41 @@ app.delete("/api/community/posts/:id", authMiddleware, async (req, res) => {
     const userId = req.user.id;
     const postId = Number(req.params.id);
 
-    if (!postId) return res.status(400).json({ error: "Ugyldig post-id." });
+    if (!postId) {
+      return res.status(400).json({ error: "Ugyldig post-id." });
+    }
 
-    // 1) Sjekk rolle på brukeren (tilpass hvis du allerede har role/is_admin i req.user)
-    const u = await query(`SELECT role, is_admin FROM users WHERE id=$1`, [userId]);
-    const isAdmin = u.rows[0]?.is_admin === true || u.rows[0]?.role === "admin";
+    // 🔐 Hent kun is_admin (IKKE role)
+    const u = await query(
+      `SELECT is_admin FROM users WHERE id=$1`,
+      [userId]
+    );
 
-    // 2) Finn innlegget
-    const p = await query(`SELECT id, user_id FROM community_posts WHERE id=$1`, [postId]);
+    const isAdmin = u.rows[0]?.is_admin === true;
+
+    // 📄 Finn innlegget
+    const p = await query(
+      `SELECT id, user_id FROM community_posts WHERE id=$1`,
+      [postId]
+    );
+
     const post = p.rows[0];
-    if (!post) return res.status(404).json({ error: "Innlegg finnes ikke." });
+    if (!post) {
+      return res.status(404).json({ error: "Innlegg finnes ikke." });
+    }
 
-    // 3) Tillat admin, evt. eier
+    // 🔒 Tillat kun admin (eller eier hvis du vil)
     const isOwner = post.user_id === userId;
+
     if (!isAdmin && !isOwner) {
       return res.status(403).json({ error: "Ikke tilgang til å slette dette innlegget." });
     }
 
-    // 4) Slett
-    await query(`DELETE FROM community_posts WHERE id=$1`, [postId]);
+    // 🗑️ Slett
+    await query(
+      `DELETE FROM community_posts WHERE id=$1`,
+      [postId]
+    );
 
     return res.json({ ok: true });
   } catch (e) {
