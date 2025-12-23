@@ -1501,9 +1501,12 @@ app.get(
 app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
 
+  const normalizedEmail = (email || "").trim().toLowerCase();
+  const normalizedPassword = (password || "");
+
   try {
     const result = await query("SELECT * FROM users WHERE email=$1", [
-      email.toLowerCase(),
+      normalizedEmail,
     ]);
 
     if (result.rowCount === 0) {
@@ -1511,16 +1514,13 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     const row = result.rows[0];
-    const valid = await bcrypt.compare(password, row.password_hash);
+    const valid = await bcrypt.compare(normalizedPassword, row.password_hash);
 
     if (!valid) {
       return res.status(401).json({ error: "Feil e-post eller passord." });
     }
 
-    const token = jwt.sign({ userId: row.id }, JWT_SECRET, {
-      expiresIn: "30d",
-    });
-
+    const token = jwt.sign({ userId: row.id }, JWT_SECRET, { expiresIn: "30d" });
     res.json({ token, user: sanitizeUser(row) });
   } catch (e) {
     console.error("Login-feil:", e);
@@ -1577,6 +1577,42 @@ app.post("/api/auth/forgot-password", async (req, res) => {
   }
 });
 
+app.post("/api/auth/reset-password", async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {};
+
+    if (!token || !newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: "Mangler token eller passord (min 6 tegn)." });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (e) {
+      return res.status(401).json({ error: "Ugyldig eller utløpt reset-token." });
+    }
+
+    if (!decoded?.userId || decoded?.type !== "password_reset") {
+      return res.status(401).json({ error: "Ugyldig reset-token." });
+    }
+
+    const hash = await bcrypt.hash(newPassword, 10);
+
+    const r = await query(
+      `UPDATE users SET password_hash=$1 WHERE id=$2 RETURNING id,email,full_name`,
+      [hash, decoded.userId]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({ error: "Bruker ikke funnet." });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("/api/auth/reset-password-feil:", e);
+    return res.status(500).json({ error: "Kunne ikke resette passord." });
+  }
+});
 
 // -------------------------------------------------------
 //  PROFIL
