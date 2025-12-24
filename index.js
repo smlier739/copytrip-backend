@@ -3656,15 +3656,33 @@ app.post("/api/community/posts", authMiddleware, async (req, res) => {
     );
     const userName = userRes.rows[0]?.full_name || "Ukjent bruker";
 
-    const categoryIdValue =
-      category_id === null || category_id === undefined || category_id === ""
-        ? null
-        : Number(category_id);
+    const parsedCategoryId =
+      typeof category_id === "number"
+        ? category_id
+        : typeof category_id === "string" && /^\d+$/.test(category_id)
+          ? Number(category_id)
+          : null;
+      
+    let imagesValue = [];
 
-    const imagesValue = Array.isArray(images)
-      ? images.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim())
-      : [];
-
+    if (Array.isArray(images)) {
+      imagesValue = images.filter(
+        (x) => typeof x === "string" && x.trim()
+      );
+    } else if (typeof images === "string") {
+      imagesValue = [images.trim()];
+    } else if (images && Array.isArray(images.urls)) {
+      imagesValue = images.urls.filter(Boolean);
+    }
+    
+    console.log("DEBUG community insert:", {
+      userId,
+      finalTitle,
+      finalBody,
+      categoryIdValue,
+      imagesValue
+    });
+      
     const insert = await query(
       `
       INSERT INTO community_posts (user_id, user_name, title, text, category_id, images)
@@ -3681,6 +3699,8 @@ app.post("/api/community/posts", authMiddleware, async (req, res) => {
       ]
     );
 
+    console.log("DEBUG community insert OK");
+      
     const row = insert.rows[0];
 
     res.json({
