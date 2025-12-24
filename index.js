@@ -3641,48 +3641,53 @@ app.post("/api/community/posts", authMiddleware, async (req, res) => {
     console.log("POST /api/community/posts req.body =", req.body);
 
     const pickText = (...vals) =>
-      vals.find(v => typeof v === "string" && v.trim())?.trim() || "";
+      vals.find((v) => typeof v === "string" && v.trim())?.trim() || "";
 
     const finalTitle = pickText(title);
-    const finalBody  = pickText(body, text, content, message);
+    const finalBody = pickText(body, text, content, message);
 
     if (!finalBody) {
       return res.status(400).json({ error: "Tekst kan ikke være tom." });
     }
-      
+
+    // Hent visningsnavn
     const userRes = await query(
       `SELECT full_name FROM users WHERE id=$1`,
       [userId]
     );
     const userName = userRes.rows[0]?.full_name || "Ukjent bruker";
 
-    const parsedCategoryId =
+    // ✅ category_id → number | null (robust)
+    const categoryIdValue =
       typeof category_id === "number"
         ? category_id
         : typeof category_id === "string" && /^\d+$/.test(category_id)
           ? Number(category_id)
           : null;
-      
+
+    // ✅ images → string[]
     let imagesValue = [];
 
     if (Array.isArray(images)) {
-      imagesValue = images.filter(
-        (x) => typeof x === "string" && x.trim()
-      );
-    } else if (typeof images === "string") {
+      imagesValue = images
+        .filter((x) => typeof x === "string" && x.trim())
+        .map((x) => x.trim());
+    } else if (typeof images === "string" && images.trim()) {
       imagesValue = [images.trim()];
     } else if (images && Array.isArray(images.urls)) {
-      imagesValue = images.urls.filter(Boolean);
+      imagesValue = images.urls
+        .filter((x) => typeof x === "string" && x.trim())
+        .map((x) => x.trim());
     }
-    
+
     console.log("DEBUG community insert:", {
       userId,
       finalTitle,
       finalBody,
       categoryIdValue,
-      imagesValue
+      imagesCount: imagesValue.length
     });
-      
+
     const insert = await query(
       `
       INSERT INTO community_posts (user_id, user_name, title, text, category_id, images)
@@ -3694,13 +3699,13 @@ app.post("/api/community/posts", authMiddleware, async (req, res) => {
         userName,
         finalTitle || null,
         finalBody,
-        isNaN(categoryIdValue) ? null : categoryIdValue,
+        categoryIdValue,  // ✅ riktig variabel
         imagesValue
       ]
     );
 
     console.log("DEBUG community insert OK");
-      
+
     const row = insert.rows[0];
 
     res.json({
