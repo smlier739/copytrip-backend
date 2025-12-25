@@ -3644,17 +3644,14 @@ app.post("/api/community/posts", authMiddleware, async (req, res) => {
       vals.find((v) => typeof v === "string" && v.trim())?.trim() || "";
 
     const finalTitle = pickText(title);
-    const finalBody = pickText(body, text, content, message);
+    const finalBody  = pickText(body, text, content, message);
 
     if (!finalBody) {
       return res.status(400).json({ error: "Tekst kan ikke være tom." });
     }
 
     // Hent visningsnavn
-    const userRes = await query(
-      `SELECT full_name FROM users WHERE id=$1`,
-      [userId]
-    );
+    const userRes = await query(`SELECT full_name FROM users WHERE id=$1`, [userId]);
     const userName = userRes.rows[0]?.full_name || "Ukjent bruker";
 
     // ✅ category_id → number | null (robust)
@@ -3665,19 +3662,28 @@ app.post("/api/community/posts", authMiddleware, async (req, res) => {
           ? Number(category_id)
           : null;
 
-    // ✅ images → string[]
+    // ✅ images → string[] (robust)
+    const normalizeUrl = (u) => {
+      if (typeof u !== "string") return null;
+      const s = u.trim();
+      if (!s) return null;
+
+      // Tillat både relative (/uploads/..) og full URL
+      if (s.startsWith("/uploads/")) return s;
+      if (/^https?:\/\/\S+$/i.test(s)) return s;
+
+      return null;
+    };
+
     let imagesValue = [];
 
     if (Array.isArray(images)) {
-      imagesValue = images
-        .filter((x) => typeof x === "string" && x.trim())
-        .map((x) => x.trim());
-    } else if (typeof images === "string" && images.trim()) {
-      imagesValue = [images.trim()];
+      imagesValue = images.map(normalizeUrl).filter(Boolean);
+    } else if (typeof images === "string") {
+      const one = normalizeUrl(images);
+      if (one) imagesValue = [one];
     } else if (images && Array.isArray(images.urls)) {
-      imagesValue = images.urls
-        .filter((x) => typeof x === "string" && x.trim())
-        .map((x) => x.trim());
+      imagesValue = images.urls.map(normalizeUrl).filter(Boolean);
     }
 
     console.log("DEBUG community insert:", {
@@ -3685,7 +3691,8 @@ app.post("/api/community/posts", authMiddleware, async (req, res) => {
       finalTitle,
       finalBody,
       categoryIdValue,
-      imagesCount: imagesValue.length
+      imagesCount: imagesValue.length,
+      imagesSample: imagesValue.slice(0, 2)
     });
 
     const insert = await query(
@@ -3699,16 +3706,14 @@ app.post("/api/community/posts", authMiddleware, async (req, res) => {
         userName,
         finalTitle || null,
         finalBody,
-        categoryIdValue,  // ✅ riktig variabel
+        categoryIdValue,
         imagesValue
       ]
     );
 
-    console.log("DEBUG community insert OK");
-
     const row = insert.rows[0];
 
-    res.json({
+    return res.json({
       post: {
         id: row.id,
         user_id: row.user_id,
@@ -3726,7 +3731,7 @@ app.post("/api/community/posts", authMiddleware, async (req, res) => {
     });
   } catch (e) {
     console.error("/api/community/posts POST error:", e);
-    res.status(500).json({ error: "Kunne ikke lage community-post." });
+    return res.status(500).json({ error: "Kunne ikke lage community-post." });
   }
 });
 
