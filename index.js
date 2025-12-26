@@ -844,79 +844,79 @@ async function generateTripFromAI({ sourceUrl, userDescription, userProfile }) {
 `
     : "Ingen personlig profil tilgjengelig.";
 
-    const sysPrompt = `
-  Du er en reiseplanlegger for appen "Grenseløs Reise".
+  const budgetPerDay =
+    userProfile?.budget_per_day != null && !isNaN(Number(userProfile.budget_per_day))
+      ? Number(userProfile.budget_per_day)
+      : null;
 
-  DU MÅ ALLTID svare med REN JSON (ingen forklaringstekst utenfor JSON).
+  // En enkel “pris”-heuristikk (du kan justere)
+  const defaultHotelPrice = budgetPerDay
+    ? Math.max(500, Math.round(budgetPerDay * 0.7))
+    : 1200;
 
-  Struktur:
+  const sysPrompt = `
+Du er en reiseplanlegger for appen "Grenseløs Reise".
 
-  {
-    "trip": {
-      "title": "Kort tittel på reisen",
-      "description": "Kort introduksjon til reisen (2–5 linjer)",
-      "stops": [
-        {
-          "day": 1,
-          "name": "Navn på stopp eller dag",
-          "description": "Kort beskrivelse av hva man gjør / opplever på dette stoppet",
-          "lat": null,
-          "lng": null,
-          "hotels": [
-            {
-              "name": "Navn på hotell eller overnatting",
-              "approx_price_per_night": 1200,
-              "currency": "NOK",
-              "notes": "Kort begrunnelse (f.eks. nær sentrum, frokost inkludert)"
-            }
-          ]
-        }
-      ],
-      "packing_list": [
-        "En konkret ting å pakke",
-        "En annen konkret ting"
-      ]
-    }
+DU MÅ ALLTID svare med REN JSON (ingen forklaringstekst utenfor JSON).
+
+Struktur:
+
+{
+  "trip": {
+    "title": "Kort tittel på reisen",
+    "description": "Kort intro (2–5 linjer)",
+    "stops": [
+      {
+        "day": 1,
+        "name": "Navn på stopp",
+        "description": "Kort beskrivelse",
+        "lat": null,
+        "lng": null,
+        "hotels": [
+          {
+            "name": "Navn på hotell/overnatting",
+            "approx_price_per_night": 1200,
+            "currency": "NOK",
+            "notes": "Kort begrunnelse",
+            "url": null
+          }
+        ]
+      }
+    ],
+    "packing_list": ["..."]
   }
+}
 
-  KRAV FOR STOPS:
-  - "trip.stops" SKAL være en liste (array).
-  - "trip.stops" SKAL inneholde minst 3, gjerne flere, stopp hvis det er mulig ut fra beskrivelsen.
-  - Hvert stopp SKAL ha "name" og "description".
-  - "day" skal være et positivt heltall som angir rekkefølgen (1, 2, 3 ...).
-  - Hvis du ikke har sikre koordinater, sett "lat" og "lng" til null.
+KRAV FOR STOPS:
+- trip.stops SKAL være array med minst 3 stopp hvis mulig.
+- Hvert stopp SKAL ha day, name, description.
+- lat/lng: bruk null hvis usikker.
 
-  KRAV FOR HOTELS:
-  - Hvert stopp KAN ha en "hotels"-liste.
-  - "hotels" SKAL være en liste (array) med 1–3 forslag per stopp.
-  - Hvert hotell SKAL ha "name".
-  - "approx_price_per_night" skal være et tall (omtrentlig pris per natt).
-  - "currency" skal normalt være "NOK" for norske brukere, ellers relevant lokal valuta.
-  - Forslagene skal så langt som mulig ligge INNENFOR brukerens dagsbudsjett, basert på "budget_per_day" i profilen.
-  - Hvis budsjettet er lavt, prioriter rimelige og enkle alternativer (hostel, budsjett-hotell, enklere gjestehus).
-  - Hvert hotell SKAL ha "url".
-  - "url" må være en direkte lenke til hotellets offisielle nettside
-    ELLER en direkte hotellsidelenke hos en seriøs booking-side.
-  - IKKE bruk Google-søk/Google Maps-søk-URL.
-  - Hvis du ikke finner en trygg, konkret URL: sett "url": null.
+KRAV FOR HOTELS:
+- Hvert stopp SKAL ha hotels som array.
+- hotels SKAL ha 1–3 forslag per stopp (ikke tom).
+- name SKAL alltid finnes.
+- approx_price_per_night SKAL være et tall.
+- currency: bruk "NOK" for norske brukere ellers relevant valuta.
+- notes: kort begrunnelse.
+- url er VALGFRI: bruk en konkret URL hvis du er sikker, ellers null.
+- Ikke bruk Google-søk/Google Maps-søk-URL.
 
-  KRAV FOR PACKING_LIST:
-  - "trip.packing_list" SKAL være en liste (array) med minst 8–12 elementer.
-  - Hvert element SKAL være én konkret gjenstand eller type utstyr som kan pakkes i en sekk eller koffert.
-  - Ikke skriv generelle kategorier som "annet", "diverse", "osv." eller lignende.
-  - Unngå duplisering.
-  - Tilpass pakkelista til typen reise (klima, aktivitet, varighet).
-  `;
+KRAV FOR PACKING_LIST:
+- packing_list SKAL være array med minst 8–12 konkrete ting.
+- Ingen "diverse", "annet", osv.
+`;
+
   const userPrompt = `
-Lag et konkret reiseforslag basert på denne informasjonen.
+Lag et konkret reiseforslag basert på dette:
 
-Brukerens forespørsel / episodebeskrivelse:
+Brukerens forespørsel:
 ${userDescription}
 
 Kilde-URL (kan være null):
 ${sourceUrl || "ingen"}
 
-Brukerprofil (kan være begrenset):
+Brukerprofil:
 ${profileText}
 `;
 
@@ -924,9 +924,9 @@ ${profileText}
     model: "gpt-4.1-mini",
     input: [
       { role: "system", content: sysPrompt },
-      { role: "user", content: userPrompt },
+      { role: "user", content: userPrompt }
     ],
-    max_output_tokens: 1200
+    max_output_tokens: 1600 // litt mer rom => mindre “drop” av hotels
   });
 
   const raw = response.output_text || "{}";
@@ -934,21 +934,16 @@ ${profileText}
 
   let jsonText = raw.trim();
 
-  // 1) Stripp ev. ```json```-blokker
+  // Stripp ```json``` blokker
   if (jsonText.startsWith("```")) {
-    // fjern første linje (``` eller ```json) og siste ```-linje hvis den finnes
     const lines = jsonText.split("\n");
-    // dropp første linje
     lines.shift();
-    // hvis siste linje starter med ``` – dropp den
-    if (lines.length && lines[lines.length - 1].trim().startsWith("```")) {
-      lines.pop();
-    }
+    if (lines.length && lines[lines.length - 1].trim().startsWith("```")) lines.pop();
     jsonText = lines.join("\n").trim();
   }
 
-  // 2) Hvis det fortsatt er tekst rundt, ta ut substring mellom første { og siste }
-  if (!(jsonText.trim().startsWith("{") && jsonText.trim().endsWith("}"))) {
+  // Ta ut substring mellom første { og siste }
+  if (!(jsonText.startsWith("{") && jsonText.endsWith("}"))) {
     const firstBrace = jsonText.indexOf("{");
     const lastBrace = jsonText.lastIndexOf("}");
     if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
@@ -962,34 +957,60 @@ ${profileText}
   } catch (e) {
     console.error("❌ Klarte ikke å parse KI-svar som JSON:", e);
     console.error("📄 Innhold som feilet parsing:", jsonText);
-    // I stedet for å krasje hele endepunktet, returner en tom, men gyldig struktur:
     return {
-      trip: {
-        title: "Reiseforslag",
-        description: null,
-        stops: [],
-        packing_list: []
-      }
+      trip: { title: "Reiseforslag", description: null, stops: [], packing_list: [] }
     };
   }
 
   // Defensiv normalisering
-  if (!parsed.trip || typeof parsed.trip !== "object") {
-    parsed.trip = {};
-  }
-  if (!Array.isArray(parsed.trip.stops)) {
-    parsed.trip.stops = [];
-  }
-  if (!Array.isArray(parsed.trip.packing_list)) {
-    parsed.trip.packing_list = [];
-  }
+  if (!parsed.trip || typeof parsed.trip !== "object") parsed.trip = {};
+  if (!Array.isArray(parsed.trip.stops)) parsed.trip.stops = [];
+  if (!Array.isArray(parsed.trip.packing_list)) parsed.trip.packing_list = [];
 
-    // Sørg for at hver stopp har en hotels-liste (selv om tom)
-    parsed.trip.stops = parsed.trip.stops.map((stop) => ({
-      ...stop,
-      hotels: Array.isArray(stop.hotels) ? stop.hotels : []
-    }));
-    
+  // ✅ Sikre hotels per stop + fallback hvis tomt
+  parsed.trip.stops = parsed.trip.stops.map((stop, idx) => {
+    const s = stop && typeof stop === "object" ? stop : {};
+    let hotels = Array.isArray(s.hotels) ? s.hotels : [];
+
+    // Rens hotellobjekter
+    hotels = hotels
+      .filter((h) => h && typeof h === "object")
+      .map((h) => ({
+        name: typeof h.name === "string" ? h.name.trim() : "",
+        approx_price_per_night:
+          typeof h.approx_price_per_night === "number"
+            ? h.approx_price_per_night
+            : Number(h.approx_price_per_night) || defaultHotelPrice,
+        currency: typeof h.currency === "string" ? h.currency.trim() : "NOK",
+        notes: typeof h.notes === "string" ? h.notes.trim() : "",
+        url: typeof h.url === "string" && h.url.trim() ? h.url.trim() : null
+      }))
+      .filter((h) => h.name); // må ha navn
+
+    // Hvis modellen fortsatt ga 0 hoteller -> legg inn fallback-forslag
+    if (hotels.length === 0) {
+      const place = (typeof s.name === "string" && s.name.trim()) ? s.name.trim() : `Stopp ${idx + 1}`;
+      hotels = [
+        {
+          name: `Budsjett-hotell i ${place}`,
+          approx_price_per_night: defaultHotelPrice,
+          currency: "NOK",
+          notes: "Forslag generert uten sikker lenke – velg etter beliggenhet og omtaler.",
+          url: null
+        },
+        {
+          name: `Sentral overnatting i ${place}`,
+          approx_price_per_night: Math.round(defaultHotelPrice * 1.2),
+          currency: "NOK",
+          notes: "Et alternativ nær sentrum/transport – sjekk tilgjengelighet i app/booking.",
+          url: null
+        }
+      ];
+    }
+
+    return { ...s, hotels };
+  });
+
   return parsed;
 }
 
