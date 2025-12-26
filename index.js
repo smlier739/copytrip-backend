@@ -1550,8 +1550,6 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 import crypto from "crypto";
-import bcrypt from "bcryptjs"; // eller bcrypt
-// import jwt from "jsonwebtoken"; // ikke nødvendig for reset i denne varianten
 
 // POST /api/auth/forgot-password
 app.post("/api/auth/forgot-password", async (req, res) => {
