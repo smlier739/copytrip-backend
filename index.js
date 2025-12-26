@@ -1549,42 +1549,56 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
+import crypto from "crypto";
+import bcrypt from "bcryptjs"; // eller bcrypt
+// import jwt from "jsonwebtoken"; // ikke nødvendig for reset i denne varianten
+
+// POST /api/auth/forgot-password
 app.post("/api/auth/forgot-password", async (req, res) => {
   const { email } = req.body || {};
-
   if (!email) {
     return res.status(400).json({ error: "E-post må fylles inn." });
   }
 
-  const normalizedEmail = email.trim().toLowerCase();
+  const normalizedEmail = String(email).trim().toLowerCase();
 
   try {
     const result = await query(
-      "SELECT id FROM users WHERE email=$1",
+      "SELECT id FROM users WHERE lower(trim(email)) = $1",
       [normalizedEmail]
     );
 
     if (result.rowCount > 0) {
       const userId = result.rows[0].id;
 
-      // Enkelt reset-token (brukes evt. senere)
-      const resetToken = jwt.sign(
-        { userId, type: "password_reset" },
-        JWT_SECRET,
-        { expiresIn: "1h" }
+      // 1) Lag en "plain" token som sendes til bruker
+      const plainToken = crypto.randomBytes(32).toString("hex");
+
+      // 2) Hash token før lagring (så DB-lekkasje ikke gir reset-token)
+      const tokenHash = crypto
+        .createHash("sha256")
+        .update(plainToken)
+        .digest("hex");
+
+      // 3) Sett utløp (1 time)
+      const expires = new Date(Date.now() + 60 * 60 * 1000);
+
+      await query(
+        `
+        UPDATE users
+        SET reset_token_hash = $1,
+            reset_token_expires = $2
+        WHERE id = $3
+        `,
+        [tokenHash, expires.toISOString(), userId]
       );
 
-      // Her ville du egentlig sendt e-post.
-      // Nå: vi logger bare i konsollen for testing.
-      console.log(
-        "🔐 Password reset token for",
-        normalizedEmail,
-        "=>",
-        resetToken
-      );
+      // TODO: send e-post i produksjon.
+      // For testing logger vi token (DENNE er hemmelig – ikke logg i prod)
+      console.log("🔐 Password reset token for", normalizedEmail, "=>", plainToken);
     }
 
-    // Alltid samme svar, uansett om e-post finnes eller ikke (sikkerhet)
+    // Alltid samme svar
     return res.json({
       ok: true,
       message:
@@ -1592,41 +1606,58 @@ app.post("/api/auth/forgot-password", async (req, res) => {
     });
   } catch (e) {
     console.error("/api/auth/forgot-password-feil:", e);
-    return res
-      .status(500)
-      .json({ error: "Kunne ikke håndtere glemt passord akkurat nå." });
+    return res.status(500).json({ error: "Kunne ikke håndtere glemt passord akkurat nå." });
   }
 });
 
+
+// POST /api/auth/reset-password
 app.post("/api/auth/reset-password", async (req, res) => {
   try {
     const { token, newPassword } = req.body || {};
 
-    if (!token || !newPassword || newPassword.length < 6) {
+    if (!token || !newPassword || String(newPassword).length < 6) {
       return res.status(400).json({ error: "Mangler token eller passord (min 6 tegn)." });
     }
 
-    let decoded;
-    try {
-      decoded = jwt.verify(token, JWT_SECRET);
-    } catch (e) {
-      return res.status(401).json({ error: "Ugyldig eller utløpt reset-token." });
-    }
+    const plainToken = String(token).trim();
 
-    if (!decoded?.userId || decoded?.type !== "password_reset") {
-      return res.status(401).json({ error: "Ugyldig reset-token." });
-    }
+    const tokenHash = crypto
+      .createHash("sha256")
+      .update(plainToken)
+      .digest("hex");
 
-    const hash = await bcrypt.hash(newPassword, 10);
-
+    // Finn bruker med matchende token + ikke utløpt
     const r = await query(
-      `UPDATE users SET password_hash=$1 WHERE id=$2 RETURNING id,email,full_name`,
-      [hash, decoded.userId]
+      `
+      SELECT id, email
+      FROM users
+      WHERE reset_token_hash = $1
+        AND reset_token_expires IS NOT NULL
+        AND reset_token_expires > NOW()
+      `,
+      [tokenHash]
     );
 
     if (r.rowCount === 0) {
-      return res.status(404).json({ error: "Bruker ikke funnet." });
+      return res.status(401).json({ error: "Ugyldig eller utløpt reset-token." });
     }
+
+    const userId = r.rows[0].id;
+
+    const hash = await bcrypt.hash(String(newPassword), 10);
+
+    // Sett nytt passord og nullstill reset-token (single-use)
+    await query(
+      `
+      UPDATE users
+      SET password_hash = $1,
+          reset_token_hash = NULL,
+          reset_token_expires = NULL
+      WHERE id = $2
+      `,
+      [hash, userId]
+    );
 
     return res.json({ ok: true });
   } catch (e) {
