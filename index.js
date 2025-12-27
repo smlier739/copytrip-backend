@@ -13,7 +13,6 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { Resend } from "resend";
-import jwt from "jsonwebtoken";
 
 dotenv.config({ override: true });
 
