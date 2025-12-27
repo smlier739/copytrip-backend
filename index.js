@@ -12,12 +12,21 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
+import { Resend } from "resend";
+import jwt from "jsonwebtoken";
 
 dotenv.config({ override: true });
 
 // ESM-vennlig __dirname / __filename
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const JWT_SECRET = process.env.JWT_SECRET;
+const APP_BASE_URL = (process.env.APP_BASE_URL || "").replace(/\/+$/, "");
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const RESEND_FROM = process.env.RESEND_FROM;
+
+// Init Resend
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
 // Debug API-nøkkel (kun prefix)
 console.log(
@@ -148,6 +157,38 @@ async function getSpotifyAccessToken() {
 // -------------------------------------------------------
 //  DATABASE HELPERS
 // -------------------------------------------------------
+
+function assertEnvOrThrow() {
+  const missing = [];
+  if (!JWT_SECRET) missing.push("JWT_SECRET");
+  if (!APP_BASE_URL) missing.push("APP_BASE_URL");
+  if (!RESEND_API_KEY) missing.push("RESEND_API_KEY");
+  if (!RESEND_FROM) missing.push("RESEND_FROM");
+  if (missing.length) {
+    const msg = `Mangler miljøvariabler: ${missing.join(", ")}`;
+    console.error("❌", msg);
+    throw new Error(msg);
+  }
+}
+
+// Enkel HTML-mail
+function resetEmailHtml({ resetUrl }) {
+  return `
+  <div style="font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; line-height:1.4;">
+    <h2>Nullstill passord</h2>
+    <p>Trykk på knappen under for å velge nytt passord. Lenken varer i 1 time.</p>
+    <p style="margin:24px 0;">
+      <a href="${resetUrl}"
+         style="background:#16a34a;color:#fff;padding:12px 16px;border-radius:10px;text-decoration:none;display:inline-block;">
+        Nullstill passord
+      </a>
+    </p>
+    <p>Hvis du ikke ba om dette, kan du ignorere e-posten.</p>
+    <hr/>
+    <p style="color:#6b7280;font-size:12px;">Grenseløs Reise</p>
+  </div>
+  `;
+}
 
 async function query(text, params) {
   const client = await pool.connect();
@@ -1551,57 +1592,59 @@ app.post("/api/auth/login", async (req, res) => {
 
 import crypto from "crypto";
 
-// POST /api/auth/forgot-password
+// ============ FORGOT PASSWORD ============
 app.post("/api/auth/forgot-password", async (req, res) => {
   const { email } = req.body || {};
-  if (!email) {
-    return res.status(400).json({ error: "E-post må fylles inn." });
-  }
+  if (!email) return res.status(400).json({ error: "E-post må fylles inn." });
 
   const normalizedEmail = String(email).trim().toLowerCase();
 
   try {
+    assertEnvOrThrow();
+
     const result = await query(
-      "SELECT id FROM users WHERE lower(trim(email)) = $1",
+      "SELECT id, email FROM users WHERE email=$1",
       [normalizedEmail]
     );
 
-    if (result.rowCount > 0) {
-      const userId = result.rows[0].id;
-
-      // 1) Lag en "plain" token som sendes til bruker
-      const plainToken = crypto.randomBytes(32).toString("hex");
-
-      // 2) Hash token før lagring (så DB-lekkasje ikke gir reset-token)
-      const tokenHash = crypto
-        .createHash("sha256")
-        .update(plainToken)
-        .digest("hex");
-
-      // 3) Sett utløp (1 time)
-      const expires = new Date(Date.now() + 60 * 60 * 1000);
-
-      await query(
-        `
-        UPDATE users
-        SET reset_token_hash = $1,
-            reset_token_expires = $2
-        WHERE id = $3
-        `,
-        [tokenHash, expires.toISOString(), userId]
-      );
-
-      // TODO: send e-post i produksjon.
-      // For testing logger vi token (DENNE er hemmelig – ikke logg i prod)
-      console.log("🔐 Password reset token for", normalizedEmail, "=>", plainToken);
-    }
-
-    // Alltid samme svar
-    return res.json({
+    // Alltid samme svar (ikke lekke om e-post finnes)
+    const okResponse = {
       ok: true,
       message:
         "Hvis vi finner e-posten i systemet vårt, sender vi instruksjoner for å nullstille passordet."
+    };
+
+    if (result.rowCount === 0) {
+      return res.json(okResponse);
+    }
+
+    const userId = result.rows[0].id;
+
+    // Token kun for reset
+    const resetToken = jwt.sign(
+      { userId, type: "password_reset" },
+      JWT_SECRET,
+      { expiresIn: "1h" }
+    );
+
+    // Link til frontend-side som tar token
+    // Eksempel: https://grenselosreise.no/reset-password?token=...
+    const resetUrl = `${APP_BASE_URL}/reset-password?token=${encodeURIComponent(resetToken)}`;
+
+    // Send e-post via Resend
+    const sendRes = await resend.emails.send({
+      from: RESEND_FROM,
+      to: normalizedEmail,
+      subject: "Nullstill passord – Grenseløs Reise",
+      html: resetEmailHtml({ resetUrl })
     });
+
+    console.log("✅ Resend forgot-password sendt:", {
+      to: normalizedEmail,
+      id: sendRes?.data?.id || sendRes?.id
+    });
+
+    return res.json(okResponse);
   } catch (e) {
     console.error("/api/auth/forgot-password-feil:", e);
     return res.status(500).json({ error: "Kunne ikke håndtere glemt passord akkurat nå." });
@@ -1609,7 +1652,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 });
 
 
-// POST /api/auth/reset-password
+// ============ RESET PASSWORD ============
 app.post("/api/auth/reset-password", async (req, res) => {
   try {
     const { token, newPassword } = req.body || {};
@@ -1618,49 +1661,59 @@ app.post("/api/auth/reset-password", async (req, res) => {
       return res.status(400).json({ error: "Mangler token eller passord (min 6 tegn)." });
     }
 
-    const plainToken = String(token).trim();
+    if (!JWT_SECRET) {
+      console.error("❌ JWT_SECRET mangler");
+      return res.status(500).json({ error: "Server-konfigurasjon mangler." });
+    }
 
-    const tokenHash = crypto
-      .createHash("sha256")
-      .update(plainToken)
-      .digest("hex");
-
-    // Finn bruker med matchende token + ikke utløpt
-    const r = await query(
-      `
-      SELECT id, email
-      FROM users
-      WHERE reset_token_hash = $1
-        AND reset_token_expires IS NOT NULL
-        AND reset_token_expires > NOW()
-      `,
-      [tokenHash]
-    );
-
-    if (r.rowCount === 0) {
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch {
       return res.status(401).json({ error: "Ugyldig eller utløpt reset-token." });
     }
 
-    const userId = r.rows[0].id;
+    if (!decoded?.userId || decoded?.type !== "password_reset") {
+      return res.status(401).json({ error: "Ugyldig reset-token." });
+    }
 
     const hash = await bcrypt.hash(String(newPassword), 10);
 
-    // Sett nytt passord og nullstill reset-token (single-use)
-    await query(
-      `
-      UPDATE users
-      SET password_hash = $1,
-          reset_token_hash = NULL,
-          reset_token_expires = NULL
-      WHERE id = $2
-      `,
-      [hash, userId]
+    const r = await query(
+      `UPDATE users SET password_hash=$1 WHERE id=$2 RETURNING id,email,full_name`,
+      [hash, decoded.userId]
     );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({ error: "Bruker ikke funnet." });
+    }
 
     return res.json({ ok: true });
   } catch (e) {
     console.error("/api/auth/reset-password-feil:", e);
     return res.status(500).json({ error: "Kunne ikke resette passord." });
+  }
+});
+
+app.post("/api/dev/test-email", async (req, res) => {
+  try {
+    const { to } = req.body || {};
+    if (!to) return res.status(400).json({ error: "Mangler 'to'." });
+
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    const from = process.env.RESEND_FROM;
+
+    const out = await resend.emails.send({
+      from,
+      to,
+      subject: "Test fra Grenseløs Reise",
+      html: "<p>Dette er en test. Hvis du ser denne er Resend OK ✅</p>"
+    });
+
+    res.json({ ok: true, out });
+  } catch (e) {
+    console.error("test-email feilet:", e);
+    res.status(500).json({ error: e?.message || "test-email feilet" });
   }
 });
 
