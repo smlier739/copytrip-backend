@@ -1597,20 +1597,33 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
   const normalizedEmail = String(email).trim().toLowerCase();
 
+  // Alltid samme svar (ikke lekke om e-post finnes)
+  const okResponse = {
+    ok: true,
+    message:
+      "Hvis vi finner e-posten i systemet vårt, sender vi instruksjoner for å nullstille passordet."
+  };
+
   try {
-    assertEnvOrThrow();
+    // 1) Env-sjekk – gjør den eksplisitt her så du ser hva som mangler
+    const missing = [];
+    if (!process.env.JWT_SECRET) missing.push("JWT_SECRET");
+    if (!process.env.RESEND_API_KEY) missing.push("RESEND_API_KEY");
+    if (!process.env.RESEND_FROM) missing.push("RESEND_FROM");
+    if (!process.env.FRONTEND_BASE_URL) missing.push("FRONTEND_BASE_URL");
+    if (missing.length) {
+      console.error("❌ Mangler miljøvariabler:", missing.join(", "));
+      return res.status(500).json({ error: `Mangler miljøvariabler: ${missing.join(", ")}` });
+    }
+
+    const JWT_SECRET = process.env.JWT_SECRET;
+    const RESEND_FROM = process.env.RESEND_FROM;
+    const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL;
 
     const result = await query(
       "SELECT id, email FROM users WHERE email=$1",
       [normalizedEmail]
     );
-
-    // Alltid samme svar (ikke lekke om e-post finnes)
-    const okResponse = {
-      ok: true,
-      message:
-        "Hvis vi finner e-posten i systemet vårt, sender vi instruksjoner for å nullstille passordet."
-    };
 
     if (result.rowCount === 0) {
       return res.json(okResponse);
@@ -1618,18 +1631,19 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
     const userId = result.rows[0].id;
 
-    // Token kun for reset
+    // 2) Token
     const resetToken = jwt.sign(
       { userId, type: "password_reset" },
       JWT_SECRET,
       { expiresIn: "1h" }
     );
 
-    // Link til frontend-side som tar token
-    // Eksempel: https://grenselosreise.no/reset-password?token=...
-    const resetUrl = `${APP_BASE_URL}/reset-password?token=${encodeURIComponent(resetToken)}`;
+    // 3) Reset-lenke til FRONTEND
+    const resetUrl =
+      `${FRONTEND_BASE_URL.replace(/\/+$/, "")}` +
+      `/reset-password?token=${encodeURIComponent(resetToken)}`;
 
-    // Send e-post via Resend
+    // 4) Send e-post via Resend
     const sendRes = await resend.emails.send({
       from: RESEND_FROM,
       to: normalizedEmail,
@@ -1637,15 +1651,29 @@ app.post("/api/auth/forgot-password", async (req, res) => {
       html: resetEmailHtml({ resetUrl })
     });
 
+    // 5) Robust logging
+    if (sendRes?.error) {
+      console.error("❌ Resend send-feil:", {
+        to: normalizedEmail,
+        error: sendRes.error
+      });
+      // Returner fortsatt okResponse for å ikke lekke info,
+      // men du får feilen i logs
+      return res.json(okResponse);
+    }
+
     console.log("✅ Resend forgot-password sendt:", {
       to: normalizedEmail,
-      id: sendRes?.data?.id || sendRes?.id
+      id: sendRes?.data?.id || sendRes?.id,
+      from: RESEND_FROM
     });
 
     return res.json(okResponse);
   } catch (e) {
     console.error("/api/auth/forgot-password-feil:", e);
-    return res.status(500).json({ error: "Kunne ikke håndtere glemt passord akkurat nå." });
+    // Fortsett å returnere okResponse for sikkerhet (valgfritt),
+    // men du kan også returnere 500 hvis du vil.
+    return res.json(okResponse);
   }
 });
 
