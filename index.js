@@ -2800,126 +2800,185 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
 //  Forsøker å hente 5–8 bilder som matcher destinasjon/stemning
 // -------------------------------------------------------
 
+async function unsplashSearchOne(queryText, { orientation = "landscape" } = {}) {
+  const key = process.env.UNSPLASH_ACCESS_KEY;
+  if (!key) throw new Error("Mangler UNSPLASH_ACCESS_KEY");
+
+  const q = String(queryText || "").trim();
+  if (!q) return null;
+
+  const url =
+    "https://api.unsplash.com/search/photos?" +
+    new URLSearchParams({
+      query: q,
+      per_page: "1",
+      orientation
+    }).toString();
+
+  const r = await fetch(url, {
+    headers: { Authorization: `Client-ID ${key}` }
+  });
+
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    console.warn("Unsplash search feilet:", r.status, txt.slice(0, 200));
+    return null;
+  }
+
+  const data = await r.json();
+  const photo = data?.results?.[0];
+  if (!photo?.urls?.raw) return null;
+
+  // Stabil bilde-URL (raw + params)
+  const imageUrl =
+    photo.urls.raw +
+    (photo.urls.raw.includes("?") ? "&" : "?") +
+    "auto=format&fit=crop&w=1600&q=80";
+
+  return {
+    url: imageUrl,
+    source: "unsplash",
+    unsplash: {
+      id: photo.id,
+      photographer: photo.user?.name || null,
+      photographerUrl: photo.user?.links?.html || null,
+      photoUrl: photo.links?.html || null
+    }
+  };
+}
+
+function buildStopContext(stopsRaw) {
+  let stops = stopsRaw;
+
+  if (typeof stops === "string") {
+    try { stops = JSON.parse(stops); } catch { stops = []; }
+  }
+
+  if (!Array.isArray(stops)) stops = [];
+
+  return stops
+    .map((s) => {
+      const name = s?.name ? String(s.name).trim() : "";
+      const desc = s?.description ? String(s.description).trim() : "";
+      return { name, desc };
+    })
+    .filter((x) => x.name);
+}
+
 async function generateGalleryForTrip(title, description, stopsRaw) {
   try {
-    // Bygg en kort tekst som beskriver reisen
-    const parts = [];
-    if (title) parts.push(String(title));
-    if (description) parts.push(String(description));
+    const stops = buildStopContext(stopsRaw);
 
-    let stops = stopsRaw;
-    if (typeof stops === "string") {
-      try {
-        stops = JSON.parse(stops);
-      } catch {
-        stops = [];
-      }
-    }
-    if (Array.isArray(stops)) {
-      for (const s of stops) {
-        if (!s || typeof s !== "object") continue;
-        if (s.name) parts.push(String(s.name));
-        if (s.description) parts.push(String(s.description));
-      }
-    }
-
-    const context = parts.join("\n\n").trim() || "En reise et sted i verden";
-
+    // 1) KI lager "query" per bilde, ikke URL
     const systemPrompt = `
-Du skal foreslå BARE bilde-URL-er til en reise-app.
+Du lager søkestrenger (queries) for å finne gode reisebilder.
+Du MÅ svare med REN JSON.
 
-KRAV:
-- Bruk KUN gratis, åpne bildekilder som Unsplash, Pexels, Wikimedia Commons e.l.
-- Velg bilder som MATCHER stedene, naturen og stemningen i reisen.
-- Ikke finn opp nye steder.
-- Returner KUN gyldig JSON på formen:
-
+Format:
 {
   "gallery": [
     {
-      "url": "https://…",
+      "query": "sted + land/region + motiv (f.eks. beach/old town/mountain)",
       "title": "Kort tittel",
-      "caption": "Kort bildetekst"
+      "caption": "Kort bildetekst",
+      "stopIndex": 0
     }
   ]
 }
 
-- Minst 5 og maks 8 elementer i "gallery".
-- "url" må være en direkte bilde-URL (jpg/png/webp osv.).
-- Svar ALDRI med tekst utenfor JSON.
+KRAV:
+- 1 element per stopp (stopIndex refererer til rekkefølgen i stopp-lista).
+- query må være konkret og inneholde sted + land/region + motiv.
+- Maks 8 elementer.
+- Ingen URLer, kun query.
 `.trim();
 
-    const userPrompt = `
-Reisebeskrivelse (tittel, tekst og stopp):
-${context}
+    const context = `
+Tittel: ${title || ""}
+Beskrivelse: ${description || ""}
+
+Stopp:
+${stops.map((s, i) => `#${i} ${s.name}\n${s.desc || ""}`).join("\n\n")}
 `.trim();
 
     const completion = await openai.chat.completions.create({
       model: process.env.OPENAI_MODEL || "gpt-4o-mini",
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt }
+        { role: "user", content: context }
       ],
       response_format: { type: "json_object" },
-      temperature: 0.6
+      temperature: 0.4
     });
 
     const content = completion.choices?.[0]?.message?.content || "{}";
-
     let parsed;
     try {
       parsed = JSON.parse(content);
-    } catch (err) {
-      console.error("❌ JSON parse-feil i generateGalleryForTrip:", err, content);
-      return getGenericVirtualTripGallery(3); // fallback
-    }
-
-    const rawGallery = Array.isArray(parsed.gallery) ? parsed.gallery : [];
-
-    // Normaliser til [{url, title, caption}]
-    const gallery = rawGallery
-      .map((item) => {
-        if (!item) return null;
-
-        // Hvis KI bare gir en streng → tolk som URL
-        if (typeof item === "string") {
-          return {
-            url: item,
-            title: title || "Reisebilde",
-            caption: null
-          };
-        }
-
-        if (typeof item === "object") {
-          const url = typeof item.url === "string" ? item.url : null;
-          if (!url) return null;
-
-          return {
-            url,
-            title:
-              (typeof item.title === "string" && item.title) ||
-              title ||
-              "Reisebilde",
-            caption:
-              (typeof item.caption === "string" && item.caption) ||
-              null
-          };
-        }
-
-        return null;
-      })
-      .filter(Boolean);
-
-    // Hvis KI ga oss noe tomt / rart → fallback
-    if (!gallery.length) {
+    } catch (e) {
+      console.error("❌ JSON parse-feil i generateGalleryForTrip:", e, content);
       return getGenericVirtualTripGallery(3);
     }
 
-    // Begrens til maks 8 bilder
-    return gallery.slice(0, 8);
+    const raw = Array.isArray(parsed.gallery) ? parsed.gallery : [];
+    const wanted = raw
+      .map((x) => {
+        const query = typeof x?.query === "string" ? x.query.trim() : "";
+        const stopIndex = Number.isInteger(x?.stopIndex) ? x.stopIndex : null;
+        if (!query || stopIndex === null) return null;
+
+        return {
+          query,
+          title: (typeof x?.title === "string" && x.title.trim()) || null,
+          caption: (typeof x?.caption === "string" && x.caption.trim()) || null,
+          stopIndex
+        };
+      })
+      .filter(Boolean)
+      .slice(0, 8);
+
+    if (!wanted.length) return getGenericVirtualTripGallery(3);
+
+    // 2) Backend henter ekte bilder fra Unsplash (1 per query)
+    const out = [];
+    for (const item of wanted) {
+      const stop = stops[item.stopIndex];
+      const fallbackQuery = stop?.name
+        ? `${stop.name} ${title || ""} travel photo`
+        : `${title || "travel"} travel photo`;
+
+      const q = item.query || fallbackQuery;
+
+      const hit = await unsplashSearchOne(q);
+      if (!hit) continue;
+
+      out.push({
+        url: hit.url,
+        title: item.title || stop?.name || title || "Reisebilde",
+        caption: item.caption || stop?.desc || null,
+
+        // valgfritt metadata
+        source: hit.source,
+        attribution: hit.unsplash
+          ? {
+              provider: "Unsplash",
+              photographer: hit.unsplash.photographer,
+              photographerUrl: hit.unsplash.photographerUrl,
+              photoUrl: hit.unsplash.photoUrl
+            }
+          : null,
+
+        stopIndex: item.stopIndex
+      });
+    }
+
+    // Hvis Unsplash ikke ga noe (key mangler eller tomt)
+    if (!out.length) return getGenericVirtualTripGallery(3);
+
+    return out;
   } catch (e) {
     console.error("❌ generateGalleryForTrip-feil:", e);
-    return getGenericVirtualTripGallery(3); // trygg fallback
+    return getGenericVirtualTripGallery(3);
   }
 }
 
@@ -2952,15 +3011,32 @@ const GENERIC_VIRTUAL_TRIP_IMAGES = [
   }
 ];
 
-// Hent et lite sett (f.eks. 3) tilfeldige generiske bilder
+// -------------------------------------------------------
+//  GENERISK FALLBACK-GALLERI (TRYGG BACKUP)
+// -------------------------------------------------------
 function getGenericVirtualTripGallery(count = 3) {
-  if (!Array.isArray(GENERIC_VIRTUAL_TRIP_IMAGES) || GENERIC_VIRTUAL_TRIP_IMAGES.length === 0) {
+  if (
+    !Array.isArray(GENERIC_VIRTUAL_TRIP_IMAGES) ||
+    GENERIC_VIRTUAL_TRIP_IMAGES.length === 0
+  ) {
     return [];
   }
 
-  // Enkel shuffle + slice
-  const shuffled = [...GENERIC_VIRTUAL_TRIP_IMAGES].sort(() => 0.5 - Math.random());
-  return shuffled.slice(0, Math.min(count, GENERIC_VIRTUAL_TRIP_IMAGES.length));
+  // Shuffle uten å mutere originalen
+  const shuffled = [...GENERIC_VIRTUAL_TRIP_IMAGES].sort(
+    () => Math.random() - 0.5
+  );
+
+  return shuffled
+    .slice(0, Math.min(count, GENERIC_VIRTUAL_TRIP_IMAGES.length))
+    .map((item, idx) => ({
+      url: item.url,
+      title: item.title || "Reisebilde",
+      caption: item.caption || "Illustrasjonsfoto",
+      source: "fallback",        // 👈 viktig
+      stopIndex: idx,             // 👈 stabil rekkefølge
+      attribution: null
+    }));
 }
 
 // Hent gode søkeord fra stopp + tittel/beskrivelse
