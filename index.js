@@ -1639,10 +1639,8 @@ app.post("/api/auth/forgot-password", async (req, res) => {
     );
 
     // 3) Reset-lenke til FRONTEND
-    const resetUrl =
-      `${FRONTEND_BASE_URL.replace(/\/+$/, "")}` +
-      `/reset-password?token=${encodeURIComponent(resetToken)}`;
-
+    const resetUrl = `https://www.podtech.no/endre-passord/?token=${encodeURIComponent(resetToken)}`;
+      
     // 4) Send e-post via Resend
     const sendRes = await resend.emails.send({
       from: RESEND_FROM,
