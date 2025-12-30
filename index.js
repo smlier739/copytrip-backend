@@ -2784,10 +2784,12 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
         stops,
         gallery,
         hotels,
-        packing_list: normalizedPacking
+        packing_list: normalizedPacking,
+        _debug: {
+          source_type: row.source_type,
+          source_episode_id: row.source_episode_id
+        }
       };
-    });
-
     res.json({ trips });
   } catch (err) {
     console.error("/api/trips GET-feil:", err);
@@ -3585,6 +3587,15 @@ app.post(
           .json({ error: "Mangler navn eller beskrivelse." });
       }
 
+      console.log("🔥 ANALYZE HIT", {
+        episodeId: req.params.id,
+        userId: req.user?.id,
+        hasName: !!req.body?.name,
+        hasDesc: !!req.body?.description,
+        prefsLen: (req.body?.userPreferences || "").length,
+        useProfile: !!req.body?.useProfile
+      });
+        
       // 1) Hent evt. profil til prompten
       let profile = null;
       if (useProfile && req.user && req.user.id) {
@@ -3665,6 +3676,13 @@ app.post(
         packing_list: clientPacking
       };
 
+      console.log("✅ ANALYZE OK", {
+        episodeId,
+        tripId: row.id,
+        stops: (trip.stops || []).length,
+        source_type: row.source_type
+      });
+        
       // 5) Returnér både lagret trip og rå KI-tekst (for debug om du vil)
       res.json({
         ok: true,
