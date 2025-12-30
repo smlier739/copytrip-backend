@@ -2632,9 +2632,9 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       FROM trips
       WHERE user_id = $1
         AND (
-          source_type IS NULL                -- vanlige KI-/manuelle reiser
-          OR source_type = 'template'        -- maler
-          OR source_type = 'user_episode_trip' -- reiser laget fra episode
+          source_type IS NULL
+          OR source_type = 'template'
+          OR source_type = 'user_episode_trip'
         )
       ORDER BY created_at DESC
       `,
@@ -2667,43 +2667,32 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       return [];
     };
 
-    // Hjelper: sørg for at hotell alltid har en .url som frontend kan klikke på
-    
+    // Hjelper: sjekk URL
     const isHttpUrl = (s) => {
       if (typeof s !== "string") return false;
       const t = s.trim();
       return /^https?:\/\/\S+/i.test(t);
     };
-      
-    const makeHotelUrl = (h) => {
-    const raw =
-      (typeof h.url === "string" && h.url.trim()) ||
-      (typeof h.booking_url === "string" && h.booking_url.trim()) ||
-      (typeof h.link === "string" && h.link.trim()) ||
-      (typeof h.external_url === "string" && h.external_url.trim()) ||
-    null;
 
-      if (raw) {
-        return isHttpUrl(raw) ? raw.trim() : null;
-      }
+    // Hjelper: sørg for at hotell alltid har en .url som frontend kan klikke på
+    const makeHotelUrl = (h) => {
+      const raw =
+        (typeof h?.url === "string" && h.url.trim()) ||
+        (typeof h?.booking_url === "string" && h.booking_url.trim()) ||
+        (typeof h?.link === "string" && h.link.trim()) ||
+        (typeof h?.external_url === "string" && h.external_url.trim()) ||
+        null;
+
+      if (raw) return isHttpUrl(raw) ? raw.trim() : null;
 
       // Fallback: generer en Google Maps-søke-URL basert på navn + sted
-      const name = (h.name || h.title || "").toString().trim();
-      const location = (
-        h.location ||
-        h.city ||
-        h.area ||
-        ""
-      ).toString().trim();
+      const name = (h?.name || h?.title || "").toString().trim();
+      const location = (h?.location || h?.city || h?.area || "").toString().trim();
 
-      if (!name) {
-        return null; // har verken URL eller navn – da lar vi den være tom
-      }
+      if (!name) return null;
 
-      const query = encodeURIComponent(
-        location ? `${name} ${location}` : name
-      );
-      return `https://www.google.com/maps/search/?api=1&query=${query}`;
+      const q = encodeURIComponent(location ? `${name} ${location}` : name);
+      return `https://www.google.com/maps/search/?api=1&query=${q}`;
     };
 
     let canonicalByEpisodeId = {};
@@ -2711,23 +2700,23 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
     if (episodeIds.length > 0) {
       // 3) Hent canonical galleri / hoteller / pakkeliste fra SYSTEM-TRIPS
       const canonRes = await query(
-          `
-          SELECT
-            source_episode_id,
-            gallery,
-            hotels,
-            packing_list,
-            created_at
-          FROM trips
-          WHERE source_type = 'grenselos_episode'
-            AND source_episode_id = ANY($1)
-          ORDER BY source_episode_id ASC, created_at DESC
+        `
+        SELECT
+          source_episode_id,
+          gallery,
+          hotels,
+          packing_list,
+          created_at
+        FROM trips
+        WHERE source_type = 'grenselos_episode'
+          AND source_episode_id = ANY($1)
+        ORDER BY source_episode_id ASC, created_at DESC
         `,
         [episodeIds]
       );
 
       // Bruk NYESTE system-trip per episode som canonical kilde
-      canonicalByEpisodeId = canonRes.rows.reduce((acc, row) => {
+      canonicalByEpisodeId = (canonRes.rows || []).reduce((acc, row) => {
         const episodeId = row.source_episode_id;
         if (!episodeId) return acc;
 
@@ -2735,32 +2724,30 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
           acc[episodeId] = {
             gallery: parseJsonArray(row.gallery),
             hotels: parseJsonArray(row.hotels),
-            packing_list: row.packing_list  // pakkeliste normaliseres senere
+            packing_list: row.packing_list
           };
         }
         return acc;
       }, {});
     }
-      
+
     // 4) Normaliser alle brukerreiser + legg inn canonical fallback
     const trips = rows.map((row) => {
-      let stops   = parseJsonArray(row.stops);
+      let stops = parseJsonArray(row.stops);
       let gallery = parseJsonArray(row.gallery);
-      let hotels  = parseJsonArray(row.hotels);
-      let packing = row.packing_list;
+      let hotels = parseJsonArray(row.hotels);
+      const packing = row.packing_list;
 
       const episodeId = row.source_episode_id;
 
       if (episodeId && canonicalByEpisodeId[episodeId]) {
         // 🎧 Reise basert på Grenseløs-episode → bruk canonical data
         const canon = canonicalByEpisodeId[episodeId];
-
         gallery = parseJsonArray(canon.gallery);
-        hotels  = parseJsonArray(canon.hotels);
+        hotels = parseJsonArray(canon.hotels);
       } else {
         // 🧳 Vanlige KI-/manuelle reiser ("fra scratch"):
-        // hvis galleriet fortsatt er tomt → gi generiske bilder
-        if (!gallery || !Array.isArray(gallery) || gallery.length === 0) {
+        if (!Array.isArray(gallery) || gallery.length === 0) {
           gallery = getGenericVirtualTripGallery(3);
         }
       }
@@ -2768,13 +2755,10 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       // 🏨 NORMALISER HOTELLER: sørg for at alle har .url frontend kan bruke
       hotels = (hotels || [])
         .filter((h) => h && typeof h === "object")
-        .map((h) => {
-          const url = makeHotelUrl(h);
-          return {
-            ...h,
-            url
-          };
-        });
+        .map((h) => ({
+          ...h,
+          url: makeHotelUrl(h)
+        }));
 
       // 🌟 Normaliser pakkelista til formatet appen forventer
       const normalizedPacking = normalizePackingForClient(packing);
@@ -2790,6 +2774,9 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
           source_episode_id: row.source_episode_id
         }
       };
+    });
+
+    // ✅ Riktig plassering: svar etter map()
     res.json({ trips });
   } catch (err) {
     console.error("/api/trips GET-feil:", err);
