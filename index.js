@@ -1639,7 +1639,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
     );
 
     // 3) Reset-lenke til FRONTEND
-    const resetUrl = `https://www.podtech.no/?page_id=50/?token=${encodeURIComponent(resetToken)}`;
+    const resetUrl = `https://www.podtech.no/endre-passord-i-grenselos-reise-appen/?token=${encodeURIComponent(resetToken)}`;
       
     // 4) Send e-post via Resend
     const sendRes = await resend.emails.send({
