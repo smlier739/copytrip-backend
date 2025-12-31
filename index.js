@@ -2627,13 +2627,13 @@ function normalizePackingForClient(rawPacking) {
 
 // ----------------------------------------------------------------------
 // 📌 API: Hent alle brukerens reiser
-//   - canonical galleri/hoteller/pakkeliste fra system-trips for episoder
-//   - generisk galleri for "fra scratch"
-//   - klikkbare hoteller + opplevelser (experiences)
+//  - Canonical galleri/hoteller/pakkeliste/opplevelser for episode-reiser
+//  - Generisk galleri for "fra scratch"-reiser
+//  - Klikkbare hoteller og opplevelser (url)
 // ----------------------------------------------------------------------
 app.get("/api/trips", authMiddleware, async (req, res) => {
   try {
-    // 1) Hent brukerens trips
+    // 1) Hent brukerens reiser (ikke system-trips)
     const baseRes = await query(
       `
       SELECT *
@@ -2651,7 +2651,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
 
     const rows = baseRes.rows || [];
 
-    // 2) Finn episodeIds det pekes på
+    // 2) Finn episode-IDs som brukerturene peker på
     const episodeIds = [
       ...new Set(
         rows
@@ -2660,10 +2660,12 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       )
     ];
 
-    // --- helpers ---
+    // ---------------- Helpers ----------------
+
     const parseJsonArray = (value) => {
       if (!value) return [];
       if (Array.isArray(value)) return value;
+
       if (typeof value === "string") {
         try {
           const parsed = JSON.parse(value);
@@ -2672,7 +2674,8 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
           return [];
         }
       }
-      // postgres jsonb kan komme som objekt/array avhengig av driver; vi støtter kun array her
+
+      // JSON/JSONB kan komme som object (sjeldent), men hvis det ikke er array -> []
       return [];
     };
 
@@ -2682,48 +2685,51 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       return /^https?:\/\/\S+/i.test(t);
     };
 
-    // 🏨 Hotell-url normalisering
+    // Hoteller: alltid gi .url
     const makeHotelUrl = (h) => {
       const raw =
-        (typeof h.url === "string" && h.url.trim()) ||
-        (typeof h.booking_url === "string" && h.booking_url.trim()) ||
-        (typeof h.link === "string" && h.link.trim()) ||
-        (typeof h.external_url === "string" && h.external_url.trim()) ||
+        (typeof h?.url === "string" && h.url.trim()) ||
+        (typeof h?.booking_url === "string" && h.booking_url.trim()) ||
+        (typeof h?.link === "string" && h.link.trim()) ||
+        (typeof h?.external_url === "string" && h.external_url.trim()) ||
         null;
 
       if (raw) return isHttpUrl(raw) ? raw.trim() : null;
 
-      const name = (h.name || h.title || "").toString().trim();
-      const location = (h.location || h.city || h.area || "").toString().trim();
+      const name = (h?.name || h?.title || "").toString().trim();
+      const location = (h?.location || h?.city || h?.area || "").toString().trim();
       if (!name) return null;
 
       const q = encodeURIComponent(location ? `${name} ${location}` : name);
       return `https://www.google.com/maps/search/?api=1&query=${q}`;
     };
 
-    // 🎟️ Opplevelser-url normalisering
+    // Opplevelser: alltid gi .url (billett/booking)
     const makeExperienceUrl = (x) => {
       const raw =
-        (typeof x.url === "string" && x.url.trim()) ||
-        (typeof x.booking_url === "string" && x.booking_url.trim()) ||
-        (typeof x.link === "string" && x.link.trim()) ||
-        (typeof x.external_url === "string" && x.external_url.trim()) ||
+        (typeof x?.url === "string" && x.url.trim()) ||
+        (typeof x?.booking_url === "string" && x.booking_url.trim()) ||
+        (typeof x?.ticket_url === "string" && x.ticket_url.trim()) ||
+        (typeof x?.link === "string" && x.link.trim()) ||
+        (typeof x?.external_url === "string" && x.external_url.trim()) ||
         null;
 
       if (raw) return isHttpUrl(raw) ? raw.trim() : null;
 
-      const title = (x.title || x.name || "").toString().trim();
-      const location = (x.location || x.city || x.area || "").toString().trim();
-      if (!title) return null;
+      // Fallback: Google-søk (ofte bedre for billetter enn maps)
+      const name = (x?.name || x?.title || "").toString().trim();
+      const location = (x?.location || x?.city || x?.area || "").toString().trim();
 
-      const q = encodeURIComponent(location ? `${title} ${location}` : title);
-      return `https://www.google.com/maps/search/?api=1&query=${q}`;
+      if (!name) return null;
+
+      const q = encodeURIComponent(location ? `${name} ${location} billetter` : `${name} billetter`);
+      return `https://www.google.com/search?q=${q}`;
     };
 
+    // 3) Hent canonical data fra SYSTEM-trips for relevante episoder
+    //    (nyeste per episode)
     let canonicalByEpisodeId = {};
-
     if (episodeIds.length > 0) {
-      // 3) Hent canonical fra system-trips (nyeste per episode)
       const canonRes = await query(
         `
         SELECT
@@ -2731,6 +2737,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
           gallery,
           hotels,
           packing_list,
+          experiences,
           created_at
         FROM trips
         WHERE source_type = 'grenselos_episode'
@@ -2741,51 +2748,65 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       );
 
       canonicalByEpisodeId = canonRes.rows.reduce((acc, row) => {
-        const episodeId = row.source_episode_id;
-        if (!episodeId) return acc;
+        const epId = row.source_episode_id;
+        if (!epId) return acc;
 
-        if (!acc[episodeId]) {
-          acc[episodeId] = {
+        // tar første (pga ORDER BY created_at DESC)
+        if (!acc[epId]) {
+          acc[epId] = {
             gallery: parseJsonArray(row.gallery),
             hotels: parseJsonArray(row.hotels),
-            packing_list: row.packing_list
+            packing_list: row.packing_list,
+            experiences: parseJsonArray(row.experiences)
           };
         }
         return acc;
       }, {});
     }
 
-    // 4) Normaliser + canonical fallback
+    // 4) Normaliser alle brukerreiser + canonical fallback
     const trips = rows.map((row) => {
-      let stops = parseJsonArray(row.stops);
+      const stops = parseJsonArray(row.stops);
+
       let gallery = parseJsonArray(row.gallery);
       let hotels = parseJsonArray(row.hotels);
+      let packing = row.packing_list;
       let experiences = parseJsonArray(row.experiences);
-      const packing = row.packing_list;
 
       const episodeId = row.source_episode_id;
 
       if (episodeId && canonicalByEpisodeId[episodeId]) {
         const canon = canonicalByEpisodeId[episodeId];
+
+        // 🎧 episode-reise: bruk canonical gallery/hotels/packing/experiences
         gallery = parseJsonArray(canon.gallery);
         hotels = parseJsonArray(canon.hotels);
+        packing = canon.packing_list;
+        experiences = parseJsonArray(canon.experiences);
       } else {
+        // 🧳 scratch/vanlig: hvis tomt galleri -> generisk
         if (!Array.isArray(gallery) || gallery.length === 0) {
           gallery = getGenericVirtualTripGallery(3);
         }
       }
 
-      // 🏨 hoteller klikkbare
+      // 🏨 Normaliser hoteller til alltid å ha .url
       hotels = (hotels || [])
         .filter((h) => h && typeof h === "object")
-        .map((h) => ({ ...h, url: makeHotelUrl(h) }));
+        .map((h) => ({
+          ...h,
+          url: makeHotelUrl(h)
+        }));
 
-      // 🎟️ opplevelser klikkbare
+      // 🎟️ Normaliser experiences til alltid å ha .url
       experiences = (experiences || [])
         .filter((x) => x && typeof x === "object")
-        .map((x) => ({ ...x, url: makeExperienceUrl(x) }));
+        .map((x) => ({
+          ...x,
+          url: makeExperienceUrl(x)
+        }));
 
-      // pakkeliste normaliseres med din eksisterende helper
+      // 🌟 Normaliser pakkeliste til format appen forventer
       const normalizedPacking = normalizePackingForClient(packing);
 
       return {
@@ -3127,32 +3148,12 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       stops,
       packing_list,
       hotels,
-      gallery,                // 👈 Hentet fra klient hvis KI genererer galleri
+      gallery,
       source_type,
-      source_episode_id,      // 👈 ID fra Spotify-episoden
-      episode_url             // optional
+      source_episode_id,
+      episode_url,
+      experiences
     } = req.body ?? {};
-
-    if (!title || !Array.isArray(stops)) {
-      return res.status(400).json({
-        error: "Mangler title eller stops (array) i request body."
-      });
-    }
-
-    const experiences = Array.isArray(req.body.experiences) ? req.body.experiences : [];
-      
-    // ---------------- Kvote-sjekk ----------------
-    const { isPremium, isAdmin, tripCount, freeLimit } =
-      await getUserTripStats(req.user.id);
-
-    // Admin-brukere skal ikke stoppes av gratisgrense
-    if (!isPremium && !isAdmin && tripCount >= freeLimit) {
-      return res.status(402).json({
-        error: "Gratisgrensen er nådd.",
-        code: "FREE_LIMIT_REACHED",
-        details: { tripCount, freeLimit }
-      });
-    }
 
     // ---------------- Normalisering ----------------
     const parseArrayField = (value) => {
@@ -3169,19 +3170,39 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       return [];
     };
 
-    let finalStops   = parseArrayField(stops);
+    const finalStops = parseArrayField(stops);
+    if (!title || !finalStops.length) {
+      return res.status(400).json({
+        error: "Mangler title eller stops (array) i request body."
+      });
+    }
+
     let finalPacking = parseArrayField(packing_list);
     let finalHotels  = parseArrayField(hotels);
-    let finalGallery = parseArrayField(gallery);   // 👈 Hent galleri fra klienten hvis det finnes
-    let sourceType   = null;
+    let finalGallery = parseArrayField(gallery);
+    let finalExperiences = parseArrayField(experiences); // ✅
+
+    // ---------------- Kvote-sjekk ----------------
+    const { isPremium, isAdmin, tripCount, freeLimit } =
+      await getUserTripStats(req.user.id);
+
+    if (!isPremium && !isAdmin && tripCount >= freeLimit) {
+      return res.status(402).json({
+        error: "Gratisgrensen er nådd.",
+        code: "FREE_LIMIT_REACHED",
+        details: { tripCount, freeLimit }
+      });
+    }
 
     // ---------------- Episode-baserte reiser ----------------
+    let sourceType = null;
+
     if (source_episode_id) {
       sourceType = "user_episode_trip";
 
       const sysRes = await query(
         `
-          SELECT packing_list, hotels, gallery
+          SELECT packing_list, hotels, gallery, experiences
           FROM trips
           WHERE source_type = 'grenselos_episode'
             AND source_episode_id = $1
@@ -3194,31 +3215,24 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       if (sysRes.rowCount > 0) {
         const sys = sysRes.rows[0];
 
-        // Pakkeliste
-        if (finalPacking.length === 0) {
-          finalPacking = parseArrayField(sys.packing_list);
-        }
+        if (finalPacking.length === 0) finalPacking = parseArrayField(sys.packing_list);
+        if (finalHotels.length === 0) finalHotels = parseArrayField(sys.hotels);
 
-        // Hoteller
-        if (finalHotels.length === 0) {
-          finalHotels = parseArrayField(sys.hotels);
-        }
-
-        // GALLERI — alltid bruk systemets galleri for episode
+        // Galleri: alltid bruk systemets galleri hvis det finnes
         const g = parseArrayField(sys.gallery);
-        if (g.length > 0) {
-          finalGallery = g;
+        if (g.length > 0) finalGallery = g;
+
+        // Experiences: bruk systemets hvis klienten ikke har sendt
+        if (finalExperiences.length === 0) {
+          finalExperiences = parseArrayField(sys.experiences);
         }
       }
-
     } else {
       // ---------------- Vanlige KI / scratch-reiser ----------------
       sourceType = source_type || null;
 
-      // Hvis KI har generert galleri → bruk det.
       if (finalGallery.length === 0) {
-        // Ingen KI-galleri mottatt → lag et relevant galleri fra destinasjonen.
-        // Krever at du har implementert generateGalleryForTrip().
+        // Forutsetter at du har denne implementert
         finalGallery = await generateGalleryForTrip(title, description, finalStops);
       }
     }
@@ -3243,32 +3257,33 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       RETURNING *
       `,
       [
-        req.user.id,
-        title,
-        description || null,
-        JSON.stringify(finalStops),
-        JSON.stringify(finalPacking),
-        JSON.stringify(finalHotels),
-        sourceType,
-        source_episode_id || null,
-        JSON.stringify(finalGallery),
-        episode_url || null.
-        JSON.stringify(experiences)
+        req.user.id,                         // $1
+        title,                               // $2
+        description || null,                 // $3
+        JSON.stringify(finalStops),          // $4
+        JSON.stringify(finalPacking),        // $5
+        JSON.stringify(finalHotels),         // $6
+        sourceType,                          // $7
+        source_episode_id || null,           // $8
+        JSON.stringify(finalGallery),        // $9
+        episode_url || null,                 // $10 ✅ (uten punktum)
+        JSON.stringify(finalExperiences)     // $11 ✅
       ]
     );
 
     const row = insert.rows[0];
 
     res.status(201).json({
+      ok: true,
       trip: {
         ...row,
         stops: finalStops,
         packing_list: finalPacking,
         hotels: finalHotels,
-        gallery: finalGallery
+        gallery: finalGallery,
+        experiences: finalExperiences
       }
     });
-
   } catch (e) {
     console.error("/api/trips POST-feil:", e);
     res.status(500).json({ error: "Kunne ikke opprette reise." });
