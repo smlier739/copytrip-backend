@@ -506,7 +506,8 @@ function normalizeTripStructure(parsed) {
   // -------------------------
   // Helpers
   // -------------------------
-  const safeStr = (v) => (typeof v === "string" ? v.trim() : v == null ? "" : String(v).trim());
+  const safeStr = (v) =>
+    typeof v === "string" ? v.trim() : v == null ? "" : String(v).trim();
 
   const toNumOrNull = (v) => {
     if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -528,8 +529,8 @@ function normalizeTripStructure(parsed) {
     if (Array.isArray(value)) return value;
     if (typeof value === "string") {
       try {
-        const parsed = JSON.parse(value);
-        return Array.isArray(parsed) ? parsed : [];
+        const p = JSON.parse(value);
+        return Array.isArray(p) ? p : [];
       } catch {
         return [];
       }
@@ -554,7 +555,7 @@ function normalizeTripStructure(parsed) {
       title: "Reiseforslag fra KI",
       description: null,
       stops: [],
-      packing_list: [],
+      packing_list: normalizePackingToFourCategoriesSmart([], ""),
       hotels: [],
       experiences: []
     };
@@ -570,6 +571,7 @@ function normalizeTripStructure(parsed) {
   // STOPS
   // -------------------------
   const rawStops = parseArrayField(parsed.stops);
+
   const stops = rawStops
     .filter((s) => s && typeof s === "object")
     .map((s, idx) => {
@@ -583,10 +585,9 @@ function normalizeTripStructure(parsed) {
       day = typeof day === "number" ? day : toNumOrNull(day);
       if (day == null) day = idx + 1;
 
-      // Noen modeller kan legge "location" / "address"
       const location = safeStr(s.location || s.address || s.subtitle) || null;
 
-      // Hvis AI-plassering: hotels pr stop (valgfritt)
+      // Hotels pr stop (valgfritt)
       const stopHotels = parseArrayField(s.hotels)
         .filter((h) => h && typeof h === "object")
         .map((h, hi) => {
@@ -597,11 +598,13 @@ function normalizeTripStructure(parsed) {
             typeof h.price_per_night === "number"
               ? h.price_per_night
               : toNumOrNull(h.price_per_night ?? h.approx_price_per_night);
+
           const rawUrl = safeStr(h.url || h.booking_url || h.link || h.external_url) || null;
           const url = rawUrl && isHttpUrl(rawUrl) ? rawUrl : null;
 
           return { name: hn, location: hl, description: hd, price_per_night: price, url };
-        });
+        })
+        .filter((h) => safeStr(h.name));
 
       return {
         id: s.id ?? `s-${idx}`,
@@ -611,63 +614,46 @@ function normalizeTripStructure(parsed) {
         location,
         lat,
         lng,
-        // behold hvis finnes (kan senere “flate” til trip.hotels hvis du vil)
         hotels: stopHotels
       };
     })
     .filter((s) => safeStr(s.name));
 
   // -------------------------
-  // PACKING LIST (behold format som KI prompt gir)
+  // PACKING LIST -> NØYAKTIG 4 kategorier (smart)
   // -------------------------
-  let packing_list = parseArrayField(parsed.packing_list);
+  const rawPacking =
+    parsed.packing_list ||
+    parsed.packingList ||
+    parsed.packing ||
+    [];
 
-  // Hvis modellen sender string[] -> putt i "Annet"
-  if (packing_list.length && typeof packing_list[0] === "string") {
-    const items = packing_list.map((x) => safeStr(x)).filter(Boolean);
-    packing_list = items.length ? [{ category: "Annet", items }] : [];
-  }
+  const contextText =
+    `${title}\n${description || ""}\n` +
+    stops.map((s) => `${safeStr(s.name)} ${safeStr(s.description)}`).join("\n");
 
-  // Hvis modellen sender objekt {Klær:[...], ...}
-  if (!Array.isArray(parsed.packing_list) && parsed.packing_list && typeof parsed.packing_list === "object") {
-    const groups = [];
-    for (const [k, v] of Object.entries(parsed.packing_list)) {
-      const category = safeStr(k) || "Annet";
-      const items = parseArrayField(v).map((x) => safeStr(x)).filter(Boolean);
-      if (items.length) groups.push({ category, items });
-    }
-    packing_list = groups;
-  }
-
-  // Rens grupper
-  packing_list = (Array.isArray(packing_list) ? packing_list : [])
-    .filter((g) => g && typeof g === "object")
-    .map((g) => {
-      const category = safeStr(g.category) || "Annet";
-      const items = parseArrayField(g.items).map((x) => safeStr(x)).filter(Boolean);
-      return { category, items };
-    })
-    .filter((g) => g.items.length > 0);
+  const packing_list = normalizePackingToFourCategoriesSmart(rawPacking, contextText);
 
   // -------------------------
   // HOTELS (flat) + inkluder evt. hotels fra stops
   // -------------------------
-  const rawHotels = [
-    ...parseArrayField(parsed.hotels),
-    // flatten hotels from stops if any
+  const rawHotelsCombined = [
+    ...(Array.isArray(parsed.hotels) ? parsed.hotels : parseArrayField(parsed.hotels)),
     ...stops.flatMap((s) => (Array.isArray(s.hotels) ? s.hotels : []))
   ];
 
-  const hotels = rawHotels
+  const hotels = rawHotelsCombined
     .filter((h) => h && typeof h === "object")
     .map((h, idx) => {
       const name = safeStr(h.name || h.title) || `Hotell ${idx + 1}`;
       const location = safeStr(h.location || h.area || h.city) || null;
       const descriptionH = safeStr(h.description || h.notes) || "";
+
       const price =
         typeof h.price_per_night === "number"
           ? h.price_per_night
           : toNumOrNull(h.price_per_night ?? h.approx_price_per_night);
+
       const rawUrl = safeStr(h.url || h.booking_url || h.link || h.external_url) || null;
       const url = rawUrl && isHttpUrl(rawUrl) ? rawUrl : null;
 
@@ -676,7 +662,7 @@ function normalizeTripStructure(parsed) {
         name,
         location,
         description: descriptionH,
-        price_per_night: price,
+        price_per_night: price ?? null,
         url
       };
     })
@@ -685,30 +671,28 @@ function normalizeTripStructure(parsed) {
   // -------------------------
   // EXPERIENCES (ny!)
   // -------------------------
-  const rawExperiences = parseArrayField(parsed.experiences);
+  const rawExperiences =
+    parseArrayField(parsed.experiences).length
+      ? parseArrayField(parsed.experiences)
+      : parseArrayField(parsed.activities || parsed.tickets || parsed.bookings);
 
   const experiences = rawExperiences
     .filter((x) => x && typeof x === "object")
     .map((x, idx) => {
-      const name =
-        safeStr(x.title || x.name || x.activity) || `Opplevelse ${idx + 1}`;
-
-      const location =
-        safeStr(x.location || x.city || x.area) || null;
-
+      const name = safeStr(x.title || x.name || x.activity) || `Opplevelse ${idx + 1}`;
+      const location = safeStr(x.location || x.city || x.area) || null;
       const descriptionX = safeStr(x.description) || "";
 
-      const rawUrl =
-        safeStr(x.booking_url || x.url || x.ticket_url || x.link || x.external_url) || null;
+      const rawUrl = safeStr(
+        x.booking_url || x.url || x.ticket_url || x.link || x.external_url
+      ) || null;
 
       const url = rawUrl
         ? (isHttpUrl(rawUrl) ? rawUrl : null)
         : makeTicketSearchUrl(name, location);
 
       const day =
-        typeof x.day === "number"
-          ? x.day
-          : toNumOrNull(x.day);
+        typeof x.day === "number" ? x.day : toNumOrNull(x.day);
 
       const price_per_person =
         typeof x.price_per_person === "number"
@@ -738,63 +722,6 @@ function normalizeTripStructure(parsed) {
     hotels,
     experiences
   };
-}
-
-    // ---- PACKING LIST ----
-    const rawPacking =
-      parsed.packing_list ||
-      parsed.packingList ||
-      parsed.packing ||
-      [];
-
-    const contextText = `${parsed.title || ""}\n${parsed.description || ""}\n` +
-      (Array.isArray(parsed.stops) ? parsed.stops.map(s => `${s?.name || ""} ${s?.description || ""}`).join("\n") : "");
-
-    const packing_list = normalizePackingToFourCategoriesSmart(rawPacking, contextText);
-
-      // ---- HOTELLER / OVERNATTING ----
-  const rawHotels =
-    parsed.hotels ||
-    parsed.accommodations ||
-    parsed.accommodation_suggestions ||
-    [];
-
-  const hotels = Array.isArray(rawHotels)
-    ? rawHotels.map((h) => {
-        const name =
-          (h && (h.name || h.title)) ||
-          "Hotell/overnatting";
-
-        const location =
-          (h && (h.location || h.city || h.area)) ||
-          null;
-
-        const description =
-          h && typeof h.description === "string"
-            ? h.description
-            : null;
-
-        let price = h && (h.price_per_night ?? h.approximate_price_per_night ?? null);
-        if (typeof price === "string" && price.trim() !== "") {
-          const n = Number(price.replace(",", "."));
-          price = isNaN(n) ? null : n;
-        }
-
-        const url =
-          (h && (h.url || h.link || h.booking_url)) ||
-          null;
-
-        return {
-          name,
-          location,
-          description,
-          price_per_night: typeof price === "number" ? price : null,
-          url
-        };
-      })
-    : [];
-
-  return { title, description, stops, packing_list, hotels };
 }
 
 // Bruk KI til å gjette hovedland for en reise ut fra tittel/beskrivelse/stopp
