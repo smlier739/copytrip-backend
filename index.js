@@ -432,70 +432,313 @@ function normalizePackingToFourCategoriesSmart(rawPacking, tripContextText = "")
   ];
 }
 
+// ---------- helpers: JSON + URL ----------
+const parseJsonArray = (value) => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  // pg JSONB kan komme som object i enkelte tilfeller – bare avvis alt som ikke er array
+  return [];
+};
+
+const isHttpUrl = (s) => {
+  if (typeof s !== "string") return false;
+  const t = s.trim();
+  return /^https?:\/\/\S+/i.test(t);
+};
+
+const makeFallbackPlaceUrl = (name, location) => {
+  const n = (name || "").toString().trim();
+  const loc = (location || "").toString().trim();
+  if (!n) return null;
+  const q = encodeURIComponent(loc ? `${n} ${loc}` : n);
+  return `https://www.google.com/maps/search/?api=1&query=${q}`;
+};
+
+// Normaliser experiences til { name, description, location, url, day, price }
+const normalizeExperiences = (raw) => {
+  const arr = parseJsonArray(raw);
+
+  return arr
+    .filter((x) => x && typeof x === "object")
+    .map((x, i) => {
+      const name =
+        (x.name || x.title || x.activity || "").toString().trim() ||
+        `Opplevelse ${i + 1}`;
+
+      const description = (x.description || "").toString().trim();
+      const location = (x.location || x.city || x.area || "").toString().trim();
+
+      const rawUrl =
+        (typeof x.url === "string" && x.url.trim()) ||
+        (typeof x.booking_url === "string" && x.booking_url.trim()) ||
+        (typeof x.ticket_url === "string" && x.ticket_url.trim()) ||
+        (typeof x.link === "string" && x.link.trim()) ||
+        (typeof x.external_url === "string" && x.external_url.trim()) ||
+        null;
+
+      const url = rawUrl ? (isHttpUrl(rawUrl) ? rawUrl.trim() : null) : makeFallbackPlaceUrl(name, location);
+
+      const day = typeof x.day === "number" ? x.day : null;
+      const price = typeof x.price === "number" ? x.price : null;
+
+      return {
+        id: x.id ?? `exp-${i}`,
+        name,
+        description,
+        location,
+        url,
+        day,
+        price
+      };
+    })
+    .filter((e) => e.name);
+};
+
 function normalizeTripStructure(parsed) {
+  // -------------------------
+  // Helpers
+  // -------------------------
+  const safeStr = (v) => (typeof v === "string" ? v.trim() : v == null ? "" : String(v).trim());
+
+  const toNumOrNull = (v) => {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string" && v.trim()) {
+      const n = Number(v.replace(",", "."));
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  };
+
+  const isHttpUrl = (s) => {
+    if (typeof s !== "string") return false;
+    const t = s.trim();
+    return /^https?:\/\/\S+/i.test(t);
+  };
+
+  const parseArrayField = (value) => {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    if (typeof value === "string") {
+      try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    return [];
+  };
+
+  // Booking/ticket fallback (IKKE maps)
+  const makeTicketSearchUrl = (title, location) => {
+    const t = safeStr(title);
+    const loc = safeStr(location);
+    if (!t) return null;
+    const q = encodeURIComponent(loc ? `${t} ${loc} billetter` : `${t} billetter`);
+    return `https://www.google.com/search?q=${q}`;
+  };
+
+  // -------------------------
+  // Guard
+  // -------------------------
   if (!parsed || typeof parsed !== "object") {
     return {
       title: "Reiseforslag fra KI",
       description: null,
       stops: [],
       packing_list: [],
-      hotels: []
+      hotels: [],
+      experiences: []
     };
   }
 
-  const title =
-    typeof parsed.title === "string" && parsed.title.trim()
-      ? parsed.title.trim()
-      : "Reiseforslag fra KI";
+  // -------------------------
+  // Title / description
+  // -------------------------
+  const title = safeStr(parsed.title) || "Reiseforslag fra KI";
+  const description = safeStr(parsed.description) || null;
 
-  const description =
-    typeof parsed.description === "string" && parsed.description.trim()
-      ? parsed.description.trim()
-      : null;
+  // -------------------------
+  // STOPS
+  // -------------------------
+  const rawStops = parseArrayField(parsed.stops);
+  const stops = rawStops
+    .filter((s) => s && typeof s === "object")
+    .map((s, idx) => {
+      const name = safeStr(s.name || s.title) || `Stopp ${idx + 1}`;
+      const desc = safeStr(s.description) || "";
 
-  // ---- STOPS ----
-  const rawStops = Array.isArray(parsed.stops) ? parsed.stops : [];
-  const stops = rawStops.map((s, idx) => {
-    const name =
-      (s && (s.name || s.title)) ||
-      `Stopp ${idx + 1}`;
+      const lat = toNumOrNull(s.lat ?? s.latitude);
+      const lng = toNumOrNull(s.lng ?? s.longitude);
 
-    const desc =
-      s && typeof s.description === "string"
-        ? s.description
-        : "";
+      let day = s.day ?? null;
+      day = typeof day === "number" ? day : toNumOrNull(day);
+      if (day == null) day = idx + 1;
 
-    let lat = s && (s.lat ?? s.latitude ?? null);
-    let lng = s && (s.lng ?? s.longitude ?? null);
-    let day = s && (s.day ?? null);
+      // Noen modeller kan legge "location" / "address"
+      const location = safeStr(s.location || s.address || s.subtitle) || null;
 
-    // Streng → tall (lat/lng)
-    if (typeof lat === "string" && lat.trim() !== "") {
-      const n = Number(lat.replace(",", "."));
-      lat = isNaN(n) ? null : n;
+      // Hvis AI-plassering: hotels pr stop (valgfritt)
+      const stopHotels = parseArrayField(s.hotels)
+        .filter((h) => h && typeof h === "object")
+        .map((h, hi) => {
+          const hn = safeStr(h.name || h.title) || `Hotell ${hi + 1}`;
+          const hl = safeStr(h.location || h.area || h.city) || null;
+          const hd = safeStr(h.description || h.notes) || "";
+          const price =
+            typeof h.price_per_night === "number"
+              ? h.price_per_night
+              : toNumOrNull(h.price_per_night ?? h.approx_price_per_night);
+          const rawUrl = safeStr(h.url || h.booking_url || h.link || h.external_url) || null;
+          const url = rawUrl && isHttpUrl(rawUrl) ? rawUrl : null;
+
+          return { name: hn, location: hl, description: hd, price_per_night: price, url };
+        });
+
+      return {
+        id: s.id ?? `s-${idx}`,
+        day,
+        name,
+        description: desc,
+        location,
+        lat,
+        lng,
+        // behold hvis finnes (kan senere “flate” til trip.hotels hvis du vil)
+        hotels: stopHotels
+      };
+    })
+    .filter((s) => safeStr(s.name));
+
+  // -------------------------
+  // PACKING LIST (behold format som KI prompt gir)
+  // -------------------------
+  let packing_list = parseArrayField(parsed.packing_list);
+
+  // Hvis modellen sender string[] -> putt i "Annet"
+  if (packing_list.length && typeof packing_list[0] === "string") {
+    const items = packing_list.map((x) => safeStr(x)).filter(Boolean);
+    packing_list = items.length ? [{ category: "Annet", items }] : [];
+  }
+
+  // Hvis modellen sender objekt {Klær:[...], ...}
+  if (!Array.isArray(parsed.packing_list) && parsed.packing_list && typeof parsed.packing_list === "object") {
+    const groups = [];
+    for (const [k, v] of Object.entries(parsed.packing_list)) {
+      const category = safeStr(k) || "Annet";
+      const items = parseArrayField(v).map((x) => safeStr(x)).filter(Boolean);
+      if (items.length) groups.push({ category, items });
     }
-    if (typeof lng === "string" && lng.trim() !== "") {
-      const n = Number(lng.replace(",", "."));
-      lng = isNaN(n) ? null : n;
-    }
+    packing_list = groups;
+  }
 
-    // Streng → tall (day)
-    if (typeof day === "string" && day.trim() !== "") {
-      const n = Number(day);
-      day = isNaN(n) ? null : n;
-    }
-    if (day == null) {
-      day = idx + 1;
-    }
+  // Rens grupper
+  packing_list = (Array.isArray(packing_list) ? packing_list : [])
+    .filter((g) => g && typeof g === "object")
+    .map((g) => {
+      const category = safeStr(g.category) || "Annet";
+      const items = parseArrayField(g.items).map((x) => safeStr(x)).filter(Boolean);
+      return { category, items };
+    })
+    .filter((g) => g.items.length > 0);
 
-    return {
-      name,
-      description: desc,
-      lat: typeof lat === "number" ? lat : null,
-      lng: typeof lng === "number" ? lng : null,
-      day
-    };
-  });
+  // -------------------------
+  // HOTELS (flat) + inkluder evt. hotels fra stops
+  // -------------------------
+  const rawHotels = [
+    ...parseArrayField(parsed.hotels),
+    // flatten hotels from stops if any
+    ...stops.flatMap((s) => (Array.isArray(s.hotels) ? s.hotels : []))
+  ];
+
+  const hotels = rawHotels
+    .filter((h) => h && typeof h === "object")
+    .map((h, idx) => {
+      const name = safeStr(h.name || h.title) || `Hotell ${idx + 1}`;
+      const location = safeStr(h.location || h.area || h.city) || null;
+      const descriptionH = safeStr(h.description || h.notes) || "";
+      const price =
+        typeof h.price_per_night === "number"
+          ? h.price_per_night
+          : toNumOrNull(h.price_per_night ?? h.approx_price_per_night);
+      const rawUrl = safeStr(h.url || h.booking_url || h.link || h.external_url) || null;
+      const url = rawUrl && isHttpUrl(rawUrl) ? rawUrl : null;
+
+      return {
+        id: h.id ?? `h-${idx}`,
+        name,
+        location,
+        description: descriptionH,
+        price_per_night: price,
+        url
+      };
+    })
+    .filter((h) => safeStr(h.name));
+
+  // -------------------------
+  // EXPERIENCES (ny!)
+  // -------------------------
+  const rawExperiences = parseArrayField(parsed.experiences);
+
+  const experiences = rawExperiences
+    .filter((x) => x && typeof x === "object")
+    .map((x, idx) => {
+      const name =
+        safeStr(x.title || x.name || x.activity) || `Opplevelse ${idx + 1}`;
+
+      const location =
+        safeStr(x.location || x.city || x.area) || null;
+
+      const descriptionX = safeStr(x.description) || "";
+
+      const rawUrl =
+        safeStr(x.booking_url || x.url || x.ticket_url || x.link || x.external_url) || null;
+
+      const url = rawUrl
+        ? (isHttpUrl(rawUrl) ? rawUrl : null)
+        : makeTicketSearchUrl(name, location);
+
+      const day =
+        typeof x.day === "number"
+          ? x.day
+          : toNumOrNull(x.day);
+
+      const price_per_person =
+        typeof x.price_per_person === "number"
+          ? x.price_per_person
+          : toNumOrNull(x.price_per_person);
+
+      const currency = safeStr(x.currency) || "NOK";
+
+      return {
+        id: x.id ?? `exp-${idx}`,
+        name,
+        location,
+        description: descriptionX,
+        url,
+        day: day ?? null,
+        price_per_person: price_per_person ?? null,
+        currency
+      };
+    })
+    .filter((e) => safeStr(e.name));
+
+  return {
+    title,
+    description,
+    stops,
+    packing_list,
+    hotels,
+    experiences
+  };
+}
 
     // ---- PACKING LIST ----
     const rawPacking =
@@ -888,11 +1131,89 @@ async function generateTripFromAI({ sourceUrl, userDescription, userProfile }) {
       ? Number(userProfile.budget_per_day)
       : null;
 
-  // En enkel “pris”-heuristikk (du kan justere)
+  // En enkel “pris”-heuristikk
   const defaultHotelPrice = budgetPerDay
     ? Math.max(500, Math.round(budgetPerDay * 0.7))
     : 1200;
 
+  // -------------------------
+  // Helpers
+  // -------------------------
+  const isHttpUrl = (s) => {
+    if (typeof s !== "string") return false;
+    const t = s.trim();
+    return /^https?:\/\/\S+/i.test(t);
+  };
+
+  // Ticket/booking fallback (IKKE Google Maps, men søk)
+  const makeTicketSearchUrl = (name, location) => {
+    const n = (name || "").toString().trim();
+    const loc = (location || "").toString().trim();
+    if (!n) return null;
+    const q = encodeURIComponent(loc ? `${n} ${loc} billetter` : `${n} billetter`);
+    return `https://www.google.com/search?q=${q}`;
+  };
+
+  const normalizeExperiencesArray = (raw, fallbackLocation = "") => {
+    if (!Array.isArray(raw)) return [];
+
+    return raw
+      .filter((x) => x && typeof x === "object")
+      .map((x, i) => {
+        const name =
+          (typeof x.name === "string" && x.name.trim()) ? x.name.trim()
+          : (typeof x.title === "string" && x.title.trim()) ? x.title.trim()
+          : (typeof x.activity === "string" && x.activity.trim()) ? x.activity.trim()
+          : `Opplevelse ${i + 1}`;
+
+        const description = typeof x.description === "string" ? x.description.trim() : "";
+        const location =
+          (typeof x.location === "string" && x.location.trim()) ? x.location.trim()
+          : (typeof x.city === "string" && x.city.trim()) ? x.city.trim()
+          : (typeof x.area === "string" && x.area.trim()) ? x.area.trim()
+          : (fallbackLocation || "");
+
+        const rawUrl =
+          (typeof x.url === "string" && x.url.trim()) ||
+          (typeof x.ticket_url === "string" && x.ticket_url.trim()) ||
+          (typeof x.booking_url === "string" && x.booking_url.trim()) ||
+          (typeof x.link === "string" && x.link.trim()) ||
+          (typeof x.external_url === "string" && x.external_url.trim()) ||
+          null;
+
+        const url = rawUrl
+          ? (isHttpUrl(rawUrl) ? rawUrl.trim() : null)
+          : makeTicketSearchUrl(name, location);
+
+        const day = typeof x.day === "number" ? x.day : null;
+
+        const price_per_person =
+          typeof x.price_per_person === "number"
+            ? x.price_per_person
+            : (x.price_per_person != null && !isNaN(Number(x.price_per_person)) ? Number(x.price_per_person) : null);
+
+        const currency =
+          typeof x.currency === "string" && x.currency.trim()
+            ? x.currency.trim()
+            : "NOK";
+
+        return {
+          id: x.id ?? `exp-${i}`,
+          name,
+          description,
+          location,
+          url,
+          day,
+          price_per_person,
+          currency
+        };
+      })
+      .filter((e) => e.name);
+  };
+
+  // -------------------------
+  // Prompt
+  // -------------------------
   const sysPrompt = `
 Du er en reiseplanlegger for appen "Grenseløs Reise".
 
@@ -919,7 +1240,29 @@ Struktur:
             "notes": "Kort begrunnelse",
             "url": null
           }
+        ],
+        "experiences": [
+          {
+            "name": "Opplevelse/attraksjon",
+            "description": "Kort hva/hvorfor",
+            "location": "Sted/by/område",
+            "day": 1,
+            "url": null,
+            "price_per_person": null,
+            "currency": "NOK"
+          }
         ]
+      }
+    ],
+    "experiences": [
+      {
+        "name": "Opplevelse/attraksjon",
+        "description": "Kort hva/hvorfor",
+        "location": "Sted/by/område",
+        "day": 1,
+        "url": null,
+        "price_per_person": null,
+        "currency": "NOK"
       }
     ],
     "packing_list": ["..."]
@@ -940,6 +1283,12 @@ KRAV FOR HOTELS:
 - notes: kort begrunnelse.
 - url er VALGFRI: bruk en konkret URL hvis du er sikker, ellers null.
 - Ikke bruk Google-søk/Google Maps-søk-URL.
+
+KRAV FOR EXPERIENCES:
+- trip.experiences SKAL være en array med 4–10 opplevelser totalt.
+- I tillegg KAN du legge 0–3 experiences per stopp (stop.experiences) hvis relevant.
+- url: bruk offisiell billett/booking-side hvis du er sikker, ellers null.
+- IKKE bruk Google-søk/Google Maps-søk-URL.
 
 KRAV FOR PACKING_LIST:
 - packing_list SKAL være array med minst 8–12 konkrete ting.
@@ -965,7 +1314,7 @@ ${profileText}
       { role: "system", content: sysPrompt },
       { role: "user", content: userPrompt }
     ],
-    max_output_tokens: 1600 // litt mer rom => mindre “drop” av hotels
+    max_output_tokens: 1800
   });
 
   const raw = response.output_text || "{}";
@@ -997,21 +1346,23 @@ ${profileText}
     console.error("❌ Klarte ikke å parse KI-svar som JSON:", e);
     console.error("📄 Innhold som feilet parsing:", jsonText);
     return {
-      trip: { title: "Reiseforslag", description: null, stops: [], packing_list: [] }
+      trip: { title: "Reiseforslag", description: null, stops: [], packing_list: [], experiences: [] }
     };
   }
 
+  // -------------------------
   // Defensiv normalisering
+  // -------------------------
   if (!parsed.trip || typeof parsed.trip !== "object") parsed.trip = {};
   if (!Array.isArray(parsed.trip.stops)) parsed.trip.stops = [];
   if (!Array.isArray(parsed.trip.packing_list)) parsed.trip.packing_list = [];
+  if (!Array.isArray(parsed.trip.experiences)) parsed.trip.experiences = [];
 
-  // ✅ Sikre hotels per stop + fallback hvis tomt
+  // ✅ Normaliser stops + sørg for hotels per stop
   parsed.trip.stops = parsed.trip.stops.map((stop, idx) => {
     const s = stop && typeof stop === "object" ? stop : {};
     let hotels = Array.isArray(s.hotels) ? s.hotels : [];
 
-    // Rens hotellobjekter
     hotels = hotels
       .filter((h) => h && typeof h === "object")
       .map((h) => ({
@@ -1024,11 +1375,11 @@ ${profileText}
         notes: typeof h.notes === "string" ? h.notes.trim() : "",
         url: typeof h.url === "string" && h.url.trim() ? h.url.trim() : null
       }))
-      .filter((h) => h.name); // må ha navn
+      .filter((h) => h.name);
 
-    // Hvis modellen fortsatt ga 0 hoteller -> legg inn fallback-forslag
     if (hotels.length === 0) {
-      const place = (typeof s.name === "string" && s.name.trim()) ? s.name.trim() : `Stopp ${idx + 1}`;
+      const place =
+        (typeof s.name === "string" && s.name.trim()) ? s.name.trim() : `Stopp ${idx + 1}`;
       hotels = [
         {
           name: `Budsjett-hotell i ${place}`,
@@ -1047,8 +1398,56 @@ ${profileText}
       ];
     }
 
-    return { ...s, hotels };
+    // ✅ Normaliser stop.experiences (valgfritt felt)
+    const stopLocation =
+      (typeof s.name === "string" && s.name.trim()) ? s.name.trim() : "";
+    const stopExperiences = normalizeExperiencesArray(s.experiences, stopLocation);
+
+    return { ...s, hotels, experiences: stopExperiences };
   });
+
+  // ✅ Normaliser trip.experiences
+  let tripExperiences = normalizeExperiencesArray(parsed.trip.experiences, "");
+
+  // ✅ Hvis modellen la experiences på stopp men ikke på trip → løft opp til trip
+  if (tripExperiences.length === 0) {
+    const lifted = [];
+    for (const s of parsed.trip.stops) {
+      if (Array.isArray(s.experiences)) {
+        for (const e of s.experiences) lifted.push(e);
+      }
+    }
+    tripExperiences = lifted.slice(0, 12);
+  }
+
+  // ✅ Hvis fortsatt tomt: legg inn en liten fallback-liste basert på stoppnavn
+  if (tripExperiences.length === 0 && parsed.trip.stops.length > 0) {
+    const firstStopName = (parsed.trip.stops[0]?.name || "").toString().trim();
+    tripExperiences = [
+      {
+        id: "exp-fallback-1",
+        name: "Guidet opplevelse / byvandring",
+        description: "Sjekk tilgjengelige turer og billetter i området.",
+        location: firstStopName || "",
+        url: makeTicketSearchUrl("Guidet tur", firstStopName || ""),
+        day: 1,
+        price_per_person: null,
+        currency: "NOK"
+      },
+      {
+        id: "exp-fallback-2",
+        name: "Museum / attraksjon",
+        description: "Et trygt valg på reisedager – sjekk åpningstider og billetter.",
+        location: firstStopName || "",
+        url: makeTicketSearchUrl("Museum", firstStopName || ""),
+        day: 1,
+        price_per_person: null,
+        currency: "NOK"
+      }
+    ];
+  }
+
+  parsed.trip.experiences = tripExperiences;
 
   return parsed;
 }
@@ -1074,6 +1473,87 @@ async function generateTripFromEpisode({
 `.trim()
     : "Ingen personlig profil tilgjengelig.";
 
+  // -------------------------
+  // Helpers
+  // -------------------------
+  const isHttpUrl = (s) => {
+    if (typeof s !== "string") return false;
+    const t = s.trim();
+    return /^https?:\/\/\S+/i.test(t);
+  };
+
+  // Ticket/booking fallback (IKKE Google Maps)
+  const makeTicketSearchUrl = (title, location) => {
+    const t = (title || "").toString().trim();
+    const loc = (location || "").toString().trim();
+    if (!t) return null;
+    const q = encodeURIComponent(loc ? `${t} ${loc} billetter` : `${t} billetter`);
+    return `https://www.google.com/search?q=${q}`;
+  };
+
+  const normalizeExperiencesArray = (raw) => {
+    if (!Array.isArray(raw)) return [];
+
+    return raw
+      .filter((x) => x && typeof x === "object")
+      .map((x, i) => {
+        const name =
+          (typeof x.name === "string" && x.name.trim()) ? x.name.trim()
+          : (typeof x.title === "string" && x.title.trim()) ? x.title.trim()
+          : (typeof x.activity === "string" && x.activity.trim()) ? x.activity.trim()
+          : `Opplevelse ${i + 1}`;
+
+        const location =
+          (typeof x.location === "string" && x.location.trim()) ? x.location.trim()
+          : (typeof x.city === "string" && x.city.trim()) ? x.city.trim()
+          : (typeof x.area === "string" && x.area.trim()) ? x.area.trim()
+          : "";
+
+        const description =
+          (typeof x.description === "string" && x.description.trim()) ? x.description.trim()
+          : "";
+
+        const rawUrl =
+          (typeof x.url === "string" && x.url.trim()) ||
+          (typeof x.booking_url === "string" && x.booking_url.trim()) ||
+          (typeof x.ticket_url === "string" && x.ticket_url.trim()) ||
+          (typeof x.link === "string" && x.link.trim()) ||
+          (typeof x.external_url === "string" && x.external_url.trim()) ||
+          null;
+
+        const url = rawUrl
+          ? (isHttpUrl(rawUrl) ? rawUrl.trim() : null)
+          : makeTicketSearchUrl(name, location);
+
+        const day = typeof x.day === "number" ? x.day : null;
+
+        const price_per_person =
+          typeof x.price_per_person === "number"
+            ? x.price_per_person
+            : (x.price_per_person != null && !isNaN(Number(x.price_per_person)) ? Number(x.price_per_person) : null);
+
+        const currency =
+          typeof x.currency === "string" && x.currency.trim()
+            ? x.currency.trim()
+            : "NOK";
+
+        return {
+          id: x.id ?? `exp-${episodeId || "ep"}-${i}`,
+          name,
+          location,
+          description,
+          url,
+          day,
+          price_per_person,
+          currency
+        };
+      })
+      .filter((e) => e.name);
+  };
+
+  // -------------------------
+  // Prompt
+  // -------------------------
   const systemPrompt = `
 Du er en erfaren reiseplanlegger som lager konkrete reiseforslag basert på
 Grenseløs-episoder OG brukerens ønsker.
@@ -1081,9 +1561,11 @@ Grenseløs-episoder OG brukerens ønsker.
 Du MÅ ALLTID svare med gyldig JSON, uten forklaringstekst rundt.
 
 Returner strukturert JSON med “title”, “description”, “stops”, “packing_list”, “hotels” og “experiences”.
-“experiences” er en array av opplevelser som ofte krever billett/booking, med feltene: title, location, description, og helst booking_url.
 
-Output-format:
+“experiences” er en array av opplevelser/aktiviteter som ofte krever billett/booking.
+Hver experience må ha: title, location, description, og helst booking_url (hvis du er sikker), ellers null.
+
+Output-format (MÅ MATCHES):
 
 {
   "title": "Kort og konkret tittel på reisen",
@@ -1121,7 +1603,16 @@ Output-format:
       "location": "By / område",
       "description": "Kort hvorfor dette passer til turen.",
       "price_per_night": 1200,
-      "url": "https://…"
+      "url": null
+    }
+  ],
+  "experiences": [
+    {
+      "title": "Opplevelse/attraksjon",
+      "location": "By / område",
+      "description": "Kort hvorfor, hva man gjør, og hvorfor verdt det.",
+      "booking_url": null,
+      "day": 1
     }
   ]
 }
@@ -1135,7 +1626,6 @@ KRAV FOR PACKING_LIST:
     4) "Annet"
 - Kategorinavnene må være akkurat disse.
 - Hver kategori SKAL ha en "items"-liste med 3–10 KONKRETE ting.
-- Ikke skriv generelle ting som "annet", "diverse", "osv." som item.
 
 KRAV FOR STOPS:
 - 3–10 stopp.
@@ -1146,6 +1636,10 @@ KRAV FOR HOTELS:
 - 2–6 forslag totalt.
 - Hvert hotell SKAL ha "name".
 - "price_per_night" skal være et tall (omtrentlig pris per natt) i NOK hvis naturlig, ellers null.
+
+KRAV FOR EXPERIENCES:
+- 4–10 experiences totalt.
+- booking_url: kun hvis du er sikker på OFFISIELL billett/booking-side, ellers null.
 `.trim();
 
   const userPrompt = `
@@ -1174,9 +1668,7 @@ ${profileText}
     temperature: 0.7
   });
 
-  const aiText =
-    completion.choices?.[0]?.message?.content?.trim() || "";
-
+  const aiText = completion.choices?.[0]?.message?.content?.trim() || "";
   const parsed = extractJson(aiText);
 
   let trip;
@@ -1188,8 +1680,46 @@ ${profileText}
       description: description || null,
       stops: [],
       packing_list: [],
-      hotels: []
+      hotels: [],
+      experiences: []
     };
+  }
+
+  // ✅ Experiences: normaliser + fallback url
+  // Støtter både trip.experiences og parsed.experiences, siden normalizeTripStructure kan flytte rundt.
+  const rawExperiences =
+    Array.isArray(trip.experiences) ? trip.experiences :
+    Array.isArray(parsed?.experiences) ? parsed.experiences :
+    [];
+
+  trip.experiences = normalizeExperiencesArray(rawExperiences);
+
+  // ✅ Hvis modellen ga 0 experiences, legg inn en liten fallback basert på første stopp
+  if (trip.experiences.length === 0) {
+    const firstStop = Array.isArray(trip.stops) && trip.stops[0] ? trip.stops[0] : null;
+    const loc = (firstStop?.name || "").toString().trim();
+    trip.experiences = [
+      {
+        id: `exp-${episodeId}-fallback-1`,
+        name: "Guidet opplevelse / byvandring",
+        location: loc,
+        description: "Sjekk tilgjengelige turer og billetter i området.",
+        url: makeTicketSearchUrl("Guidet tur", loc),
+        day: typeof firstStop?.day === "number" ? firstStop.day : 1,
+        price_per_person: null,
+        currency: "NOK"
+      },
+      {
+        id: `exp-${episodeId}-fallback-2`,
+        name: "Museum / attraksjon",
+        location: loc,
+        description: "Et trygt valg på reisedager – sjekk åpningstider og billetter.",
+        url: makeTicketSearchUrl("Museum", loc),
+        day: typeof firstStop?.day === "number" ? firstStop.day : 1,
+        price_per_person: null,
+        currency: "NOK"
+      }
+    ];
   }
 
   return { trip, raw: aiText };
