@@ -1080,6 +1080,9 @@ Grenseløs-episoder OG brukerens ønsker.
 
 Du MÅ ALLTID svare med gyldig JSON, uten forklaringstekst rundt.
 
+Returner strukturert JSON med “title”, “description”, “stops”, “packing_list”, “hotels” og “experiences”.
+“experiences” er en array av opplevelser som ofte krever billett/booking, med feltene: title, location, description, og helst booking_url.
+
 Output-format:
 
 {
@@ -2475,6 +2478,9 @@ VIKTIG OM HOTELS:
 - Hvert hotell SKAL ha "name".
 - "price_per_night" skal være et tall (omtrentlig pris per natt) i NOK hvis det er naturlig.
 - Hvis du er usikker på pris, kan "price_per_night" være null.
+
+Returner strukturert JSON med “title”, “description”, “stops”, “packing_list”, “hotels” og “experiences”.
+“experiences” er en array av opplevelser som ofte krever billett/booking, med feltene: title, location, description, og helst booking_url.
 `.trim();
 
     // --- 3) Bygg userPrompt ---
@@ -2620,12 +2626,14 @@ function normalizePackingForClient(rawPacking) {
 
 
 // ----------------------------------------------------------------------
-// 📌 API: Hent alle brukerens reiser (med canonical galleri fra episoder
-//     + generisk galleri for "fra scratch"-reiser + klikkbare hoteller)
+// 📌 API: Hent alle brukerens reiser
+//   - canonical galleri/hoteller/pakkeliste fra system-trips for episoder
+//   - generisk galleri for "fra scratch"
+//   - klikkbare hoteller + opplevelser (experiences)
 // ----------------------------------------------------------------------
 app.get("/api/trips", authMiddleware, async (req, res) => {
   try {
-    // 1) Hent "brukerreiser" – ikke selve system-reisene
+    // 1) Hent brukerens trips
     const baseRes = await query(
       `
       SELECT *
@@ -2643,7 +2651,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
 
     const rows = baseRes.rows || [];
 
-    // 2) Finn alle episoder disse reisene evt. peker på
+    // 2) Finn episodeIds det pekes på
     const episodeIds = [
       ...new Set(
         rows
@@ -2652,7 +2660,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       )
     ];
 
-    // Hjelper: parse et felt som kan være JSON-string, array eller null
+    // --- helpers ---
     const parseJsonArray = (value) => {
       if (!value) return [];
       if (Array.isArray(value)) return value;
@@ -2664,41 +2672,58 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
           return [];
         }
       }
+      // postgres jsonb kan komme som objekt/array avhengig av driver; vi støtter kun array her
       return [];
     };
 
-    // Hjelper: sjekk URL
     const isHttpUrl = (s) => {
       if (typeof s !== "string") return false;
       const t = s.trim();
       return /^https?:\/\/\S+/i.test(t);
     };
 
-    // Hjelper: sørg for at hotell alltid har en .url som frontend kan klikke på
+    // 🏨 Hotell-url normalisering
     const makeHotelUrl = (h) => {
       const raw =
-        (typeof h?.url === "string" && h.url.trim()) ||
-        (typeof h?.booking_url === "string" && h.booking_url.trim()) ||
-        (typeof h?.link === "string" && h.link.trim()) ||
-        (typeof h?.external_url === "string" && h.external_url.trim()) ||
+        (typeof h.url === "string" && h.url.trim()) ||
+        (typeof h.booking_url === "string" && h.booking_url.trim()) ||
+        (typeof h.link === "string" && h.link.trim()) ||
+        (typeof h.external_url === "string" && h.external_url.trim()) ||
         null;
 
       if (raw) return isHttpUrl(raw) ? raw.trim() : null;
 
-      // Fallback: generer en Google Maps-søke-URL basert på navn + sted
-      const name = (h?.name || h?.title || "").toString().trim();
-      const location = (h?.location || h?.city || h?.area || "").toString().trim();
-
+      const name = (h.name || h.title || "").toString().trim();
+      const location = (h.location || h.city || h.area || "").toString().trim();
       if (!name) return null;
 
       const q = encodeURIComponent(location ? `${name} ${location}` : name);
       return `https://www.google.com/maps/search/?api=1&query=${q}`;
     };
 
+    // 🎟️ Opplevelser-url normalisering
+    const makeExperienceUrl = (x) => {
+      const raw =
+        (typeof x.url === "string" && x.url.trim()) ||
+        (typeof x.booking_url === "string" && x.booking_url.trim()) ||
+        (typeof x.link === "string" && x.link.trim()) ||
+        (typeof x.external_url === "string" && x.external_url.trim()) ||
+        null;
+
+      if (raw) return isHttpUrl(raw) ? raw.trim() : null;
+
+      const title = (x.title || x.name || "").toString().trim();
+      const location = (x.location || x.city || x.area || "").toString().trim();
+      if (!title) return null;
+
+      const q = encodeURIComponent(location ? `${title} ${location}` : title);
+      return `https://www.google.com/maps/search/?api=1&query=${q}`;
+    };
+
     let canonicalByEpisodeId = {};
 
     if (episodeIds.length > 0) {
-      // 3) Hent canonical galleri / hoteller / pakkeliste fra SYSTEM-TRIPS
+      // 3) Hent canonical fra system-trips (nyeste per episode)
       const canonRes = await query(
         `
         SELECT
@@ -2715,8 +2740,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
         [episodeIds]
       );
 
-      // Bruk NYESTE system-trip per episode som canonical kilde
-      canonicalByEpisodeId = (canonRes.rows || []).reduce((acc, row) => {
+      canonicalByEpisodeId = canonRes.rows.reduce((acc, row) => {
         const episodeId = row.source_episode_id;
         if (!episodeId) return acc;
 
@@ -2731,36 +2755,37 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       }, {});
     }
 
-    // 4) Normaliser alle brukerreiser + legg inn canonical fallback
+    // 4) Normaliser + canonical fallback
     const trips = rows.map((row) => {
       let stops = parseJsonArray(row.stops);
       let gallery = parseJsonArray(row.gallery);
       let hotels = parseJsonArray(row.hotels);
+      let experiences = parseJsonArray(row.experiences);
       const packing = row.packing_list;
 
       const episodeId = row.source_episode_id;
 
       if (episodeId && canonicalByEpisodeId[episodeId]) {
-        // 🎧 Reise basert på Grenseløs-episode → bruk canonical data
         const canon = canonicalByEpisodeId[episodeId];
         gallery = parseJsonArray(canon.gallery);
         hotels = parseJsonArray(canon.hotels);
       } else {
-        // 🧳 Vanlige KI-/manuelle reiser ("fra scratch"):
         if (!Array.isArray(gallery) || gallery.length === 0) {
           gallery = getGenericVirtualTripGallery(3);
         }
       }
 
-      // 🏨 NORMALISER HOTELLER: sørg for at alle har .url frontend kan bruke
+      // 🏨 hoteller klikkbare
       hotels = (hotels || [])
         .filter((h) => h && typeof h === "object")
-        .map((h) => ({
-          ...h,
-          url: makeHotelUrl(h)
-        }));
+        .map((h) => ({ ...h, url: makeHotelUrl(h) }));
 
-      // 🌟 Normaliser pakkelista til formatet appen forventer
+      // 🎟️ opplevelser klikkbare
+      experiences = (experiences || [])
+        .filter((x) => x && typeof x === "object")
+        .map((x) => ({ ...x, url: makeExperienceUrl(x) }));
+
+      // pakkeliste normaliseres med din eksisterende helper
       const normalizedPacking = normalizePackingForClient(packing);
 
       return {
@@ -2768,19 +2793,15 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
         stops,
         gallery,
         hotels,
-        packing_list: normalizedPacking,
-        _debug: {
-          source_type: row.source_type,
-          source_episode_id: row.source_episode_id
-        }
+        experiences,
+        packing_list: normalizedPacking
       };
     });
 
-    // ✅ Riktig plassering: svar etter map()
-    res.json({ trips });
+    return res.json({ trips });
   } catch (err) {
     console.error("/api/trips GET-feil:", err);
-    res.status(500).json({ error: "Kunne ikke hente reiser." });
+    return res.status(500).json({ error: "Kunne ikke hente reiser." });
   }
 });
 
@@ -3118,6 +3139,8 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       });
     }
 
+    const experiences = Array.isArray(req.body.experiences) ? req.body.experiences : [];
+      
     // ---------------- Kvote-sjekk ----------------
     const { isPremium, isAdmin, tripCount, freeLimit } =
       await getUserTripStats(req.user.id);
@@ -3213,9 +3236,10 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
         source_type,
         source_episode_id,
         gallery,
-        episode_url
+        episode_url,
+        experiences
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
       RETURNING *
       `,
       [
@@ -3228,7 +3252,8 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
         sourceType,
         source_episode_id || null,
         JSON.stringify(finalGallery),
-        episode_url || null
+        episode_url || null.
+        JSON.stringify(experiences)
       ]
     );
 
