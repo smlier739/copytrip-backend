@@ -4049,136 +4049,96 @@ app.get('/api/grenselos/episodes', async (req, res) => {
   }
 });
 
-// -------------------------------------------------------
-//  ANALYSER ÉN EPISODE → PERSONLIG REISE + LAGRE I MINE REISER
-// -------------------------------------------------------
-app.post(
-  "/api/grenselos/episodes/:id/analyze",
-  authMiddleware,
-  async (req, res) => {
-    try {
-      const episodeId = req.params.id;
-      const {
-        name,
-        description,
-        userPreferences,  // 💬 fritekst fra brukeren
-        useProfile        // bool – bruk profil for tilpasning
-      } = req.body ?? {};
+// ----------------------------------------------------------------------
+// ✅ PREVIEW: Analyser episode -> lag trip (MEN IKKE lagre i DB)
+// POST /api/grenselos/episodes/:id/analyze
+// Body: { name, description, userPreferences?, useProfile? }
+// Return: { ok:true, trip, raw }
+// ----------------------------------------------------------------------
+app.post("/api/grenselos/episodes/:id/analyze", authMiddleware, async (req, res) => {
+  try {
+    const episodeId = req.params.id;
 
-      if (!name || !description) {
-        return res
-          .status(400)
-          .json({ error: "Mangler navn eller beskrivelse." });
-      }
+    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    const description =
+      typeof req.body?.description === "string" ? req.body.description.trim() : "";
+    const userPreferences =
+      typeof req.body?.userPreferences === "string" ? req.body.userPreferences.trim() : "";
 
-      console.log("🔥 ANALYZE HIT", {
-        episodeId: req.params.id,
-        userId: req.user?.id,
-        hasName: !!req.body?.name,
-        hasDesc: !!req.body?.description,
-        prefsLen: (req.body?.userPreferences || "").length,
-        useProfile: !!req.body?.useProfile
-      });
-        
-      // 1) Hent evt. profil til prompten
-      let profile = null;
-      if (useProfile && req.user && req.user.id) {
-        try {
-          const result = await query(
-            `
-            SELECT
-              email,
-              full_name,
-              birth_year,
-              home_city,
-              home_country,
-              travel_style,
-              budget_per_day,
-              experience_level
-            FROM users
-            WHERE id = $1
-            `,
-            [req.user.id]
-          );
-          profile = result.rows[0] || null;
-        } catch (e) {
-          console.warn(
-            "Klarte ikke å hente profil til episode-KI-prompt:",
-            e.message
-          );
-        }
-      }
+    const useProfile = req.body?.useProfile !== false; // default true
 
-      // 2) La KI lage personlig reise basert på episode + ønsker + profil
-      const { trip, raw } = await generateTripFromEpisode({
-        episodeId,
-        name,
-        description,
-        userPreferences,
-        userProfile: profile
-      });
-
-      // 3) Lagre som brukerreise (user_episode_trip) i trips-tabellen
-      const insert = await query(
-        `
-        INSERT INTO trips (
-          user_id,
-          title,
-          description,
-          stops,
-          packing_list,
-          hotels,
-          source_type,
-          source_episode_id,
-          gallery
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,'user_episode_trip',$7,$8)
-        RETURNING *
-        `,
-        [
-          req.user.id,
-          trip.title || name,
-          trip.description || description || null,
-          JSON.stringify(trip.stops || []),
-          JSON.stringify(trip.packing_list || []),
-          JSON.stringify(trip.hotels || []),
-          episodeId,
-          JSON.stringify([]) // galleri kommer fra canonical / generiske bilder senere
-        ]
-      );
-
-      const row = insert.rows[0];
-
-      // 4) For direkte bruk i appen: normaliser pakkeliste til klientformat
-      const clientPacking = normalizePackingForClient(trip.packing_list || []);
-
-      const savedTrip = {
-        ...row,
-        stops: trip.stops || [],
-        hotels: trip.hotels || [],
-        gallery: [],
-        packing_list: clientPacking
-      };
-
-      console.log("✅ ANALYZE OK", {
-        episodeId,
-        tripId: row.id,
-        stops: (trip.stops || []).length,
-        source_type: row.source_type
-      });
-        
-      // 5) Returnér både lagret trip og rå KI-tekst (for debug om du vil)
-      res.json({
-        ok: true,
-        trip: savedTrip,
-        raw
-      });
-    } catch (e) {
-      console.error("/api/grenselos/episodes/:id/analyze-feil:", e);
-      res.status(500).json({ error: "Analyse og lagring feilet." });
+    if (!episodeId) {
+      return res.status(400).json({ error: "Mangler episode-id i URL." });
     }
+    if (!name || !description) {
+      return res.status(400).json({
+        error: "Mangler name eller description i request body."
+      });
+    }
+
+    // 1) Hent profil hvis ønsket
+    let userProfile = null;
+    if (useProfile) {
+      try {
+        const profRes = await query(
+          `SELECT full_name, home_city, home_country, birth_year, travel_style, budget_per_day, experience_level
+           FROM profiles
+           WHERE user_id = $1
+           LIMIT 1`,
+          [req.user.id]
+        );
+        userProfile = profRes.rows?.[0] || null;
+      } catch (e) {
+        // Profil er optional – ikke fail hele request
+        console.warn("Kunne ikke hente profil (fortsetter uten):", e?.message || e);
+        userProfile = null;
+      }
+    }
+
+    // 2) Generer trip fra episode (IKKE lagre)
+    const { trip: generatedTrip, raw } = await generateTripFromEpisode({
+      episodeId,
+      name,
+      description,
+      userPreferences,
+      userProfile
+    });
+
+    const trip = (generatedTrip && typeof generatedTrip === "object") ? generatedTrip : {
+      title: name || "Reise fra episode",
+      description: null,
+      stops: [],
+      packing_list: [],
+      hotels: [],
+      experiences: []
+    };
+
+    // 3) Sett metadata som gjør livet enklere i klienten
+    const episodeUrl =
+      typeof req.body?.episode_url === "string" && req.body.episode_url.trim()
+        ? req.body.episode_url.trim()
+        : null;
+
+    const previewTrip = {
+      ...trip,
+      // viktig: ingen "id" her, siden den ikke er lagret
+      id: undefined,
+      source_type: "user_episode_trip_preview",
+      source_episode_id: episodeId,
+      episode_url: episodeUrl
+    };
+
+    // 4) Returner preview
+    return res.json({
+      ok: true,
+      trip: previewTrip,
+      raw: raw || null
+    });
+  } catch (err) {
+    console.error("/api/grenselos/episodes/:id/analyze (preview) feil:", err);
+    return res.status(500).json({ error: "Kunne ikke analysere episoden." });
   }
-);
+});
 
 app.post("/api/ai/generate-gallery", authMiddleware, async (req, res) => {
   try {
