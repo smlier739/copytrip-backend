@@ -3860,7 +3860,7 @@ function buildLocationQueriesFromStops(stops, tripTitle = "", tripDescription = 
 
 app.post("/api/trips", authMiddleware, async (req, res) => {
   try {
-    const {
+    let {
       title,
       description,
       stops,
@@ -3873,7 +3873,7 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       experiences
     } = req.body ?? {};
 
-    // ---------------- Normalisering ----------------
+    // ---------------- Helpers ----------------
     const parseArrayField = (value) => {
       if (!value) return [];
       if (Array.isArray(value)) return value;
@@ -3888,17 +3888,62 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       return [];
     };
 
-    const finalStops = parseArrayField(stops);
-    if (!title || !finalStops.length) {
-      return res.status(400).json({
-        error: "Mangler title eller stops (array) i request body."
-      });
-    }
+    const toNum = (v) => {
+      if (typeof v === "number" && Number.isFinite(v)) return v;
+      if (typeof v === "string" && v.trim()) {
+        const n = Number(v.replace(",", "."));
+        return Number.isFinite(n) ? n : null;
+      }
+      return null;
+    };
 
+    const normalizeStops = (arr) => {
+      const a = Array.isArray(arr) ? arr : [];
+      return a
+        .filter((s) => s && typeof s === "object")
+        .map((s, idx) => {
+          const dayRaw = s.day ?? s.order ?? null;
+          const day =
+            typeof dayRaw === "number"
+              ? dayRaw
+              : toNum(dayRaw) ?? (idx + 1);
+
+          return {
+            ...s,
+            day,
+            name: (s.name || s.title || `Stopp ${idx + 1}`).toString().trim(),
+            description: (s.description || "").toString().trim(),
+            location: (s.location || s.address || s.subtitle || null)?.toString?.().trim?.() ?? s.location ?? null,
+            lat: toNum(s.lat ?? s.latitude),
+            lng: toNum(s.lng ?? s.longitude)
+          };
+        })
+        .filter((s) => s.name);
+    };
+
+    const stopHasCoords = (s) =>
+      s &&
+      typeof s === "object" &&
+      typeof s.lat === "number" &&
+      Number.isFinite(s.lat) &&
+      typeof s.lng === "number" &&
+      Number.isFinite(s.lng);
+
+    // ---------------- Normalisering ----------------
+    const rawStops = parseArrayField(stops);
+    let finalStops = normalizeStops(rawStops);
+
+    if (!title || !String(title).trim()) {
+      return res.status(400).json({ error: "Mangler title i request body." });
+    }
+    title = String(title).trim();
+
+    // Stops kan komme tomt fra preview – men for vanlige reiser krever vi stops
+    // (for episode-reiser kan vi hente stops fra system-trip under)
     let finalPacking = parseArrayField(packing_list);
-    let finalHotels  = parseArrayField(hotels);
+    let finalHotels = parseArrayField(hotels);
     let finalGallery = parseArrayField(gallery);
-    let finalExperiences = parseArrayField(experiences); // ✅
+    let finalExperiences = parseArrayField(experiences);
 
     // ---------------- Kvote-sjekk ----------------
     const { isPremium, isAdmin, tripCount, freeLimit } =
@@ -3920,7 +3965,7 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
 
       const sysRes = await query(
         `
-          SELECT packing_list, hotels, gallery, experiences
+          SELECT stops, packing_list, hotels, gallery, experiences
           FROM trips
           WHERE source_type = 'grenselos_episode'
             AND source_episode_id = $1
@@ -3933,6 +3978,15 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       if (sysRes.rowCount > 0) {
         const sys = sysRes.rows[0];
 
+        const sysStops = normalizeStops(parseArrayField(sys.stops));
+        const clientHasAnyCoords = finalStops.some(stopHasCoords);
+
+        // ✅ Viktig: hvis klienten ikke har coords (eller stops er tomme) → bruk system-stops
+        if (finalStops.length === 0 || !clientHasAnyCoords) {
+          if (sysStops.length > 0) finalStops = sysStops;
+        }
+
+        // Packing/hotels fallback fra system hvis klienten ikke sendte
         if (finalPacking.length === 0) finalPacking = parseArrayField(sys.packing_list);
         if (finalHotels.length === 0) finalHotels = parseArrayField(sys.hotels);
 
@@ -3945,12 +3999,26 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
           finalExperiences = parseArrayField(sys.experiences);
         }
       }
+
+      // Hvis episode-reise fortsatt mangler stops → avvis tydelig (siden kartet blir tomt uansett)
+      if (finalStops.length === 0) {
+        return res.status(400).json({
+          error:
+            "Episode-reise mangler stops. Fant heller ingen system-trip å kopiere stops fra."
+        });
+      }
     } else {
       // ---------------- Vanlige KI / scratch-reiser ----------------
       sourceType = source_type || null;
 
+      // For vanlige reiser må klient sende stops
+      if (finalStops.length === 0) {
+        return res.status(400).json({
+          error: "Mangler stops (array) i request body."
+        });
+      }
+
       if (finalGallery.length === 0) {
-        // Forutsetter at du har denne implementert
         finalGallery = await generateGalleryForTrip(title, description, finalStops);
       }
     }
@@ -3975,26 +4043,27 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       RETURNING *
       `,
       [
-        req.user.id,                         // $1
-        title,                               // $2
-        description || null,                 // $3
-        JSON.stringify(finalStops),          // $4
-        JSON.stringify(finalPacking),        // $5
-        JSON.stringify(finalHotels),         // $6
-        sourceType,                          // $7
-        source_episode_id || null,           // $8
-        JSON.stringify(finalGallery),        // $9
-        episode_url || null,                 // $10 ✅ (uten punktum)
-        JSON.stringify(finalExperiences)     // $11 ✅
+        req.user.id, // $1
+        title, // $2
+        description ? String(description) : null, // $3
+        JSON.stringify(finalStops), // $4
+        JSON.stringify(finalPacking), // $5
+        JSON.stringify(finalHotels), // $6
+        sourceType, // $7
+        source_episode_id || null, // $8
+        JSON.stringify(finalGallery), // $9
+        episode_url || null, // $10
+        JSON.stringify(finalExperiences) // $11
       ]
     );
 
     const row = insert.rows[0];
 
-    res.status(201).json({
+    return res.status(201).json({
       ok: true,
       trip: {
         ...row,
+        // Returnér normalisert struktur (så appen får coords med en gang)
         stops: finalStops,
         packing_list: finalPacking,
         hotels: finalHotels,
@@ -4004,7 +4073,7 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
     });
   } catch (e) {
     console.error("/api/trips POST-feil:", e);
-    res.status(500).json({ error: "Kunne ikke opprette reise." });
+    return res.status(500).json({ error: "Kunne ikke opprette reise." });
   }
 });
 
