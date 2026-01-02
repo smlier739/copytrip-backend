@@ -3858,6 +3858,29 @@ function buildLocationQueriesFromStops(stops, tripTitle = "", tripDescription = 
   return expanded.slice(0, 6);
 }
 
+function sanitizeUrl(u) {
+  if (!u || typeof u !== "string") return null;
+  const s = u.trim();
+  if (!s) return null;
+
+  const withProto = /^https?:\/\//i.test(s) ? s : `https://${s}`;
+  const lower = withProto.toLowerCase();
+
+  if (
+    lower.includes("example.com") ||
+    lower.includes("example.org") ||
+    lower.includes("example.net")
+  ) return null;
+
+  // Enkel URL-validering
+  try {
+    new URL(withProto);
+    return withProto;
+  } catch {
+    return null;
+  }
+}
+
 app.post("/api/trips", authMiddleware, async (req, res) => {
   try {
     let {
@@ -4023,6 +4046,16 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       }
     }
 
+    finalHotels = finalHotels.map(h => ({
+      ...h,
+      url: sanitizeUrl(h?.url),
+    }));
+
+    finalExperiences = finalExperiences.map(e => ({
+      ...e,
+      url: sanitizeUrl(e?.booking_url || e?.url || e?.ticket_url || e?.link || e?.external_url),
+    }));
+      
     // ---------------- Lagre i database ----------------
     const insert = await query(
       `
