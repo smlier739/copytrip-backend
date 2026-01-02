@@ -4046,11 +4046,30 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       }
     }
 
-    finalHotels = finalHotels.map(h => ({
-      ...h,
-      url: sanitizeUrl(h?.url),
-    }));
+    const isHttpUrl = (s) => {
+      if (typeof s !== "string") return false;
+      const t = s.trim();
+      return /^https?:\/\/\S+/i.test(t);
+    };
 
+    // Bedre enn maps for hotell: søk "hotel + sted" (funner alltid noe)
+    function makeHotelFallbackUrl(h) {
+      const name = (h?.name || h?.title || "").toString().trim();
+      const location = (h?.location || h?.city || h?.area || "").toString().trim();
+      if (!name) return null;
+          
+      const q = encodeURIComponent(location ? `${name} ${location} hotell` : `${name} hotell`);
+      return `https://www.google.com/search?q=${q}`;
+    }
+      
+    finalHotels = finalHotels.map((h) => {
+      const cleaned = sanitizeUrl(h?.url);
+      return {
+        ...h,
+        url: cleaned || makeHotelFallbackUrl(h) // ✅ alltid noe brukbart
+      };
+    });
+      
     finalExperiences = finalExperiences.map(e => ({
       ...e,
       url: sanitizeUrl(e?.booking_url || e?.url || e?.ticket_url || e?.link || e?.external_url),
@@ -4491,6 +4510,11 @@ app.post("/api/grenselos/episodes/:id/analyze", authMiddleware, async (req, res)
       episode_url: episodeUrl
     };
 
+    previewTrip.hotels = (previewTrip.hotels || []).map(h => ({
+      ...h,
+      url: (sanitizeUrl(h?.url) || makeHotelFallbackUrl(h))
+    }));
+      
     // 4) Returner preview
     return res.json({
       ok: true,
