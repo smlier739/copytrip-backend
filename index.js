@@ -13,6 +13,7 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { Resend } from "resend";
+import fetch from "node-fetch";
 
 dotenv.config({ override: true });
 
@@ -47,7 +48,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // ---------- Filopplasting for galleri / virtuell reise ----------
 
-const uploadDir = "/var/data/uploads";
+const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, "uploads");
 
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -150,6 +151,83 @@ async function getSpotifyAccessToken() {
   }
 
   return resp.data.access_token;
+}
+
+function makeHotelFallbackUrl(h) {
+  const name = (h?.name || h?.title || "").toString().trim();
+  const location = (h?.location || h?.city || h?.area || "").toString().trim();
+  if (!name) return null;
+  const q = encodeURIComponent(location ? `${name} ${location} hotell` : `${name} hotell`);
+  return `https://www.google.com/search?q=${q}`;
+}
+
+function makeExperienceFallbackUrl(x) {
+  const name = (x?.name || x?.title || "").toString().trim();
+  const location = (x?.location || x?.city || x?.area || "").toString().trim();
+  if (!name) return null;
+  const q = encodeURIComponent(location ? `${name} ${location} billetter` : `${name} billetter`);
+  return `https://www.google.com/search?q=${q}`;
+}
+
+async function getUserEntitlements(userId) {
+  const r = await query(`SELECT is_premium, is_admin FROM users WHERE id=$1`, [userId]);
+  const u = r.rows?.[0] || {};
+  return { isPro: !!(u.is_premium || u.is_admin), is_admin: !!u.is_admin, is_premium: !!u.is_premium };
+}
+
+function requirePro(req, res, next) {
+  if (req.user?.is_admin || req.user?.is_premium) return next();
+  return res.status(402).json({ error: "Krever Pro/Premium for tilgang." });
+}
+
+// Bruk søk-fallback (ikke Maps) hvis ingen eksplisitt URL finnes
+function makeHotelUrl(h) {
+  // 1) Direkte URL-felter
+  const direct =
+    sanitizeUrl(h?.url) ||
+    sanitizeUrl(h?.booking_url) ||
+    sanitizeUrl(h?.link) ||
+    sanitizeUrl(h?.external_url);
+
+  if (direct) return direct;
+
+  // 2) Fallback: Google-søk (bedre enn maps for hoteller)
+  const name = (h?.name || h?.title || "").toString().trim();
+  const location = (h?.location || h?.city || h?.area || "").toString().trim();
+
+  if (!name) return null;
+
+  const q = encodeURIComponent(
+    location ? `${name} ${location} hotell` : `${name} hotell`
+  );
+
+  return `https://www.booking.com/searchresults.html?ss=${encodeURIComponent(
+    location ? `${name} ${location}` : name
+  )}`;
+}
+
+function makeExperienceUrl(x) {
+  // 1) Prøv eksplisitte URL-felt
+  const direct =
+    sanitizeUrl(x?.url) ||
+    sanitizeUrl(x?.booking_url) ||
+    sanitizeUrl(x?.ticket_url) ||
+    sanitizeUrl(x?.link) ||
+    sanitizeUrl(x?.external_url);
+
+  if (direct) return direct;
+
+  // 2) Fallback: Google-søk på billetter
+  const name = (x?.name || x?.title || "").toString().trim();
+  const location = (x?.location || x?.city || x?.area || "").toString().trim();
+
+  if (!name) return null;
+
+  const q = encodeURIComponent(
+    location ? `${name} ${location} billetter` : `${name} billetter`
+  );
+
+  return `https://www.google.com/search?q=${q}`;
 }
 
 // -------------------------------------------------------
@@ -972,31 +1050,6 @@ async function adminOnlyMiddleware(req, res, next) {
 // -------------------------------------------------------
 //  SPOTIFY HELPERS
 // -------------------------------------------------------
-
-async function getSpotifyToken() {
-  if (!process.env.SPOTIFY_CLIENT_ID || !process.env.SPOTIFY_CLIENT_SECRET) {
-    throw new Error("SPOTIFY_CLIENT_ID eller SPOTIFY_CLIENT_SECRET mangler");
-  }
-
-  const tokenRes = await axios.post(
-    "https://accounts.spotify.com/api/token",
-    new URLSearchParams({ grant_type: "client_credentials" }),
-    {
-      headers: {
-        Authorization:
-          "Basic " +
-          Buffer.from(
-            process.env.SPOTIFY_CLIENT_ID +
-              ":" +
-              process.env.SPOTIFY_CLIENT_SECRET
-          ).toString("base64"),
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-    }
-  );
-
-  return tokenRes.data.access_token;
-}
 
 async function fetchGrenselosEpisodes() {
   const token = await getSpotifyAccessToken();
@@ -2404,7 +2457,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
     );
 
     // 3) Reset-lenke til FRONTEND
-    const resetUrl = `https://www.podtech.no/endre-passord-i-grenselos-reise-appen/?token=${encodeURIComponent(resetToken)}`;
+      const resetUrl = `${FRONTEND_BASE_URL.replace(/\/+$/, "")}/endre-passord-i-grenselos-reise-appen/?token=${encodeURIComponent(resetToken)}`;
       
     // 4) Send e-post via Resend
     const sendRes = await resend.emails.send({
@@ -3396,8 +3449,8 @@ function normalizePackingForClient(rawPacking) {
 // ----------------------------------------------------------------------
 app.get("/api/trips", authMiddleware, async (req, res) => {
   try {
-    // 🔑 Premium/admin = full tilgang til detaljer
-    const detailsUnlocked = !!(req.user?.is_admin || req.user?.is_premium);
+    const ent = await getUserEntitlements(req.user.id);
+    const isPro = !!ent?.isPro;
 
     // 1) Hent brukerens reiser (ikke system-trips)
     const baseRes = await query(
@@ -3426,75 +3479,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       )
     ];
 
-    // ---------------- Helpers ----------------
-
-    const parseJsonArray = (value) => {
-      if (!value) return [];
-      if (Array.isArray(value)) return value;
-
-      if (typeof value === "string") {
-        try {
-          const parsed = JSON.parse(value);
-          return Array.isArray(parsed) ? parsed : [];
-        } catch {
-          return [];
-        }
-      }
-
-      // JSON/JSONB kan komme som object (sjeldent), men hvis det ikke er array -> []
-      return [];
-    };
-
-    const isHttpUrl = (s) => {
-      if (typeof s !== "string") return false;
-      const t = s.trim();
-      return /^https?:\/\/\S+/i.test(t);
-    };
-
-    // Hoteller: alltid gi .url
-    const makeHotelUrl = (h) => {
-      const raw =
-        (typeof h?.url === "string" && h.url.trim()) ||
-        (typeof h?.booking_url === "string" && h.booking_url.trim()) ||
-        (typeof h?.link === "string" && h.link.trim()) ||
-        (typeof h?.external_url === "string" && h.external_url.trim()) ||
-        null;
-
-      if (raw) return isHttpUrl(raw) ? raw.trim() : null;
-
-      const name = (h?.name || h?.title || "").toString().trim();
-      const location = (h?.location || h?.city || h?.area || "").toString().trim();
-      if (!name) return null;
-
-      const q = encodeURIComponent(location ? `${name} ${location}` : name);
-      return `https://www.google.com/maps/search/?api=1&query=${q}`;
-    };
-
-    // Opplevelser: alltid gi .url (billett/booking)
-    const makeExperienceUrl = (x) => {
-      const raw =
-        (typeof x?.url === "string" && x.url.trim()) ||
-        (typeof x?.booking_url === "string" && x.booking_url.trim()) ||
-        (typeof x?.ticket_url === "string" && x.ticket_url.trim()) ||
-        (typeof x?.link === "string" && x.link.trim()) ||
-        (typeof x?.external_url === "string" && x.external_url.trim()) ||
-        null;
-
-      if (raw) return isHttpUrl(raw) ? raw.trim() : null;
-
-      // Fallback: Google-søk (ofte bedre for billetter enn maps)
-      const name = (x?.name || x?.title || "").toString().trim();
-      const location = (x?.location || x?.city || x?.area || "").toString().trim();
-      if (!name) return null;
-
-      const q = encodeURIComponent(
-        location ? `${name} ${location} billetter` : `${name} billetter`
-      );
-      return `https://www.google.com/search?q=${q}`;
-    };
-
-    // 3) Hent canonical data fra SYSTEM-trips for relevante episoder
-    //    (nyeste per episode)
+    // 3) Hent canonical data fra SYSTEM-trips for relevante episoder (nyeste per episode)
     let canonicalByEpisodeId = {};
     if (episodeIds.length > 0) {
       const canonRes = await query(
@@ -3518,20 +3503,19 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
         const epId = row.source_episode_id;
         if (!epId) return acc;
 
-        // tar første (pga ORDER BY created_at DESC)
         if (!acc[epId]) {
           acc[epId] = {
             gallery: parseJsonArray(row.gallery),
             hotels: parseJsonArray(row.hotels),
             packing_list: row.packing_list,
-            experiences: parseJsonArray(row.experiences),
+            experiences: parseJsonArray(row.experiences)
           };
         }
         return acc;
       }, {});
     }
 
-    // 4) Normaliser alle brukerreiser + canonical fallback
+    // 4) Normaliser + gate payload
     const trips = rows.map((row) => {
       const stops = parseJsonArray(row.stops);
 
@@ -3544,73 +3528,69 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
 
       if (episodeId && canonicalByEpisodeId[episodeId]) {
         const canon = canonicalByEpisodeId[episodeId];
-
-        // 🎧 episode-reise: bruk canonical gallery/hotels/packing/experiences
         gallery = parseJsonArray(canon.gallery);
         hotels = parseJsonArray(canon.hotels);
         packing = canon.packing_list;
         experiences = parseJsonArray(canon.experiences);
       } else {
-        // 🧳 scratch/vanlig: hvis tomt galleri -> generisk
         if (!Array.isArray(gallery) || gallery.length === 0) {
+          // behold din eksisterende:
           gallery = getGenericVirtualTripGallery(3);
         }
       }
 
-      // 🏨 Normaliser hoteller til alltid å ha .url
-      const normalizedHotels = (hotels || [])
+      // Full normalisering (kun brukt når pro, ellers teaser)
+      const hotelsFull = (hotels || [])
         .filter((h) => h && typeof h === "object")
-        .map((h) => ({
-          ...h,
-          url: makeHotelUrl(h),
-        }));
+        .map((h) => ({ ...h, url: makeHotelUrl(h) }));
 
-      // 🎟️ Normaliser experiences til alltid å ha .url
-      const normalizedExperiences = (experiences || [])
+      const experiencesFull = (experiences || [])
         .filter((x) => x && typeof x === "object")
-        .map((x) => ({
-          ...x,
-          url: makeExperienceUrl(x),
-        }));
+        .map((x) => ({ ...x, url: makeExperienceUrl(x) }));
 
-      // 🌟 Normaliser pakkeliste til format appen forventer
-      const normalizedPacking = normalizePackingForClient(packing);
+      const packingFull = normalizePackingForClient(packing);
 
-      // 🔒 Paywall: lås detaljene hvis ikke premium/admin
-      const locked = !detailsUnlocked;
+      // Teasers (gratis)
+      const hotelsPreview = hotelsFull.slice(0, 3).map((h) => ({
+        name: h?.name || h?.title || "Hotell",
+        location: h?.location || h?.city || h?.area || null
+      }));
+
+      const experiencesPreview = experiencesFull.slice(0, 3).map((x) => ({
+        name: x?.name || x?.title || "Opplevelse",
+        location: x?.location || x?.city || x?.area || null
+      }));
+
+      const packingPreview = Array.isArray(packingFull) ? packingFull.slice(0, 6) : [];
+
+      const locked = {
+        hotels: !isPro,
+        experiences: !isPro,
+        packing_list: !isPro
+      };
 
       return {
         ...row,
         stops,
         gallery,
 
-        hotels: locked ? [] : normalizedHotels,
-        experiences: locked ? [] : normalizedExperiences,
-        packing_list: locked ? [] : normalizedPacking,
+        // 👇 Her er selve “mur”-effekten:
+        hotels: isPro ? hotelsFull : hotelsPreview,
+        experiences: isPro ? experiencesFull : experiencesPreview,
+        packing_list: isPro ? packingFull : packingPreview,
 
-        // nyttig for appen (UI)
-        details_locked: locked,
-        details_preview: locked
-          ? {
-              hotels_count: normalizedHotels.length,
-              experiences_count: normalizedExperiences.length,
-              packing_categories: (normalizedPacking || [])
-                .map((g) => g?.category)
-                .filter(Boolean)
-                .slice(0, 6),
-            }
-          : null,
+        entitlements: { isPro, locked },
+
+        // praktisk for UI (kan vise “Se alle (12)” selv om preview):
+        counts: {
+          hotels: hotelsFull.length,
+          experiences: experiencesFull.length,
+          packing_list: Array.isArray(packingFull) ? packingFull.length : 0
+        }
       };
     });
 
-    return res.json({
-      trips,
-      entitlement: {
-        details_unlocked: detailsUnlocked,
-        is_premium: !!req.user?.is_premium,
-        is_admin: !!req.user?.is_admin,
-      },
-    });
+    return res.json({ trips });
   } catch (err) {
     console.error("/api/trips GET-feil:", err);
     return res.status(500).json({ error: "Kunne ikke hente reiser." });
@@ -4134,7 +4114,9 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       
     finalExperiences = finalExperiences.map(e => ({
       ...e,
-      url: sanitizeUrl(e?.booking_url || e?.url || e?.ticket_url || e?.link || e?.external_url),
+      url:
+        sanitizeUrl(e?.booking_url || e?.url || e?.ticket_url || e?.link || e?.external_url) ||
+        makeExperienceFallbackUrl(e)
     }));
       
     // ---------------- Lagre i database ----------------
@@ -4427,7 +4409,7 @@ app.post(
 
 app.get('/api/grenselos/episodes', async (req, res) => {
   try {
-    const token = await getSpotifyToken();
+    const token = await getSpotifyAccessToken();
     const showId = process.env.SPOTIFY_SHOW_ID;
 
     if (!showId) {
@@ -4587,7 +4569,7 @@ app.post(
           const profRes = await query(
             `
             SELECT full_name, home_city, home_country, birth_year, travel_style, budget_per_day, experience_level
-            FROM profiles
+            FROM users
             WHERE user_id = $1
             LIMIT 1
             `,
@@ -4809,8 +4791,12 @@ app.get("/api/community/posts", authMiddleware, async (req, res) => {
 // Detail (brukes av CommunityPostDetailScreen)
 app.get("/api/community/posts/:id", authMiddleware, async (req, res) => {
   try {
-    const userId = req.user.id;
-    const postId = Number(req.params.id);
+    const userId = req.user.id; // behold som string/int, ikke tving Number
+    const postId = Number.parseInt(req.params.id, 10);
+
+    if (!Number.isInteger(postId) || postId <= 0) {
+      return res.status(400).json({ error: "Ugyldig post-id." });
+    }
 
     const result = await query(
       `
@@ -4975,6 +4961,146 @@ app.post("/api/community/posts", authMiddleware, async (req, res) => {
   }
 });
 
+app.get("/api/trips/:id/hotels", authMiddleware, requirePro, async (req, res) => {
+  try {
+    const tripId = req.params.id;
+
+    const tripRes = await query(
+      `SELECT id, source_episode_id, source_type, hotels
+       FROM trips
+       WHERE id = $1 AND user_id = $2
+       LIMIT 1`,
+      [tripId, req.user.id]
+    );
+
+    if (tripRes.rows.length === 0) {
+      return res.status(404).json({ error: "Fant ikke denne reisen." });
+    }
+
+    const row = tripRes.rows[0];
+    let hotels = parseJsonArray(row.hotels);
+
+    // episode-trip: hent canonical hotels
+    if (row.source_episode_id) {
+      const canonRes = await query(
+        `
+        SELECT hotels
+        FROM trips
+        WHERE source_type = 'grenselos_episode'
+          AND source_episode_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [row.source_episode_id]
+      );
+      if (canonRes.rows?.[0]) {
+        hotels = parseJsonArray(canonRes.rows[0].hotels);
+      }
+    }
+
+    const hotelsFull = (hotels || [])
+      .filter((h) => h && typeof h === "object")
+      .map((h) => ({ ...h, url: makeHotelUrl(h) }));
+
+    return res.json({ ok: true, tripId, hotels: hotelsFull });
+  } catch (e) {
+    console.error("/api/trips/:id/hotels-feil:", e);
+    return res.status(500).json({ error: "Kunne ikke hente hoteller." });
+  }
+});
+
+app.get("/api/trips/:id/experiences", authMiddleware, requirePro, async (req, res) => {
+  try {
+    const tripId = req.params.id;
+
+    const tripRes = await query(
+      `SELECT id, source_episode_id, experiences
+       FROM trips
+       WHERE id = $1 AND user_id = $2
+       LIMIT 1`,
+      [tripId, req.user.id]
+    );
+
+    if (tripRes.rows.length === 0) {
+      return res.status(404).json({ error: "Fant ikke denne reisen." });
+    }
+
+    const row = tripRes.rows[0];
+    let experiences = parseJsonArray(row.experiences);
+
+    if (row.source_episode_id) {
+      const canonRes = await query(
+        `
+        SELECT experiences
+        FROM trips
+        WHERE source_type = 'grenselos_episode'
+          AND source_episode_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [row.source_episode_id]
+      );
+      if (canonRes.rows?.[0]) {
+        experiences = parseJsonArray(canonRes.rows[0].experiences);
+      }
+    }
+
+    const experiencesFull = (experiences || [])
+      .filter((x) => x && typeof x === "object")
+      .map((x) => ({ ...x, url: makeExperienceUrl(x) }));
+
+    return res.json({ ok: true, tripId, experiences: experiencesFull });
+  } catch (e) {
+    console.error("/api/trips/:id/experiences-feil:", e);
+    return res.status(500).json({ error: "Kunne ikke hente opplevelser." });
+  }
+});
+
+app.get("/api/trips/:id/packing-list", authMiddleware, requirePro, async (req, res) => {
+  try {
+    const tripId = req.params.id;
+
+    const tripRes = await query(
+      `SELECT id, source_episode_id, packing_list
+       FROM trips
+       WHERE id = $1 AND user_id = $2
+       LIMIT 1`,
+      [tripId, req.user.id]
+    );
+
+    if (tripRes.rows.length === 0) {
+      return res.status(404).json({ error: "Fant ikke denne reisen." });
+    }
+
+    const row = tripRes.rows[0];
+    let packing = row.packing_list;
+
+    if (row.source_episode_id) {
+      const canonRes = await query(
+        `
+        SELECT packing_list
+        FROM trips
+        WHERE source_type = 'grenselos_episode'
+          AND source_episode_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [row.source_episode_id]
+      );
+      if (canonRes.rows?.[0]) {
+        packing = canonRes.rows[0].packing_list;
+      }
+    }
+
+    const packingFull = normalizePackingForClient(packing);
+
+    return res.json({ ok: true, tripId, packing_list: packingFull });
+  } catch (e) {
+    console.error("/api/trips/:id/packing-list-feil:", e);
+    return res.status(500).json({ error: "Kunne ikke hente pakkeliste." });
+  }
+});
+
 // Like/unlike
 app.post("/api/community/posts/:id/like", authMiddleware, async (req, res) => {
   try {
@@ -5087,49 +5213,43 @@ app.post(
 
 app.delete("/api/community/posts/:id", authMiddleware, async (req, res) => {
   try {
-    const userId = req.user.id;
-    const postId = Number(req.params.id);
+    const userId = Number(req.user?.id);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(401).json({ error: "Ikke innlogget." });
+    }
 
-    if (!postId) {
+    const postId = Number.parseInt(req.params.id, 10);
+    if (!Number.isInteger(postId) || postId <= 0) {
       return res.status(400).json({ error: "Ugyldig post-id." });
     }
 
-    // 🔐 Hent kun is_admin (IKKE role)
-    const u = await query(
-      `SELECT is_admin FROM users WHERE id=$1`,
-      [userId]
-    );
+    // 🔐 admin?
+    const u = await query(`SELECT is_admin FROM users WHERE id=$1`, [userId]);
+    if (!u.rows.length) {
+      return res.status(401).json({ error: "Bruker finnes ikke." });
+    }
+    const isAdmin = u.rows[0].is_admin === true;
 
-    const isAdmin = u.rows[0]?.is_admin === true;
-
-    // 📄 Finn innlegget
-    const p = await query(
-      `SELECT id, user_id FROM community_posts WHERE id=$1`,
-      [postId]
-    );
-
+    // 📄 post?
+    const p = await query(`SELECT id, user_id FROM community_posts WHERE id=$1`, [postId]);
     const post = p.rows[0];
     if (!post) {
       return res.status(404).json({ error: "Innlegg finnes ikke." });
     }
 
-    // 🔒 Tillat kun admin (eller eier hvis du vil)
     const isOwner = post.user_id === userId;
 
     if (!isAdmin && !isOwner) {
       return res.status(403).json({ error: "Ikke tilgang til å slette dette innlegget." });
     }
 
-    // 🗑️ Slett
-    await query(
-      `DELETE FROM community_posts WHERE id=$1`,
-      [postId]
-    );
+    await query(`DELETE FROM community_posts WHERE id=$1`, [postId]);
 
     return res.json({ ok: true });
+    // evt: return res.status(204).send();
   } catch (e) {
     console.error("/api/community/posts/:id DELETE error:", e);
-    res.status(500).json({ error: "Kunne ikke slette innlegg." });
+    return res.status(500).json({ error: "Kunne ikke slette innlegg." });
   }
 });
 
@@ -5146,8 +5266,10 @@ app.use((err, req, res, next) => {
 // -------------------------------------------------------
 
 app.use((err, req, res, next) => {
-  console.error("Uventet serverfeil:", err);
-  res.status(500).json({ error: "Uventet serverfeil." });
+  if (err && (err instanceof multer.MulterError || err.message)) {
+    return res.status(400).json({ error: err.message });
+  }
+  next(err);
 });
 
 // -------------------------------------------------------
@@ -5155,5 +5277,8 @@ app.use((err, req, res, next) => {
 // -------------------------------------------------------
 
 app.listen(PORT, () => {
+  if (process.env.NODE_ENV === "production") {
+    assertEnvOrThrow();
+  }
   console.log(`🚀 Grenseløs Reise backend kjører på port ${PORT}`);
 });

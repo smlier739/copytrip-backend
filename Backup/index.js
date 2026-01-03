@@ -432,126 +432,296 @@ function normalizePackingToFourCategoriesSmart(rawPacking, tripContextText = "")
   ];
 }
 
+// ---------- helpers: JSON + URL ----------
+const parseJsonArray = (value) => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  // pg JSONB kan komme som object i enkelte tilfeller – bare avvis alt som ikke er array
+  return [];
+};
+
+const isHttpUrl = (s) => {
+  if (typeof s !== "string") return false;
+  const t = s.trim();
+  return /^https?:\/\/\S+/i.test(t);
+};
+
+const makeFallbackPlaceUrl = (name, location) => {
+  const n = (name || "").toString().trim();
+  const loc = (location || "").toString().trim();
+  if (!n) return null;
+  const q = encodeURIComponent(loc ? `${n} ${loc}` : n);
+  return `https://www.google.com/maps/search/?api=1&query=${q}`;
+};
+
+// Normaliser experiences til { name, description, location, url, day, price }
+const normalizeExperiences = (raw) => {
+  const arr = parseJsonArray(raw);
+
+  return arr
+    .filter((x) => x && typeof x === "object")
+    .map((x, i) => {
+      const name =
+        (x.name || x.title || x.activity || "").toString().trim() ||
+        `Opplevelse ${i + 1}`;
+
+      const description = (x.description || "").toString().trim();
+      const location = (x.location || x.city || x.area || "").toString().trim();
+
+      const rawUrl =
+        (typeof x.url === "string" && x.url.trim()) ||
+        (typeof x.booking_url === "string" && x.booking_url.trim()) ||
+        (typeof x.ticket_url === "string" && x.ticket_url.trim()) ||
+        (typeof x.link === "string" && x.link.trim()) ||
+        (typeof x.external_url === "string" && x.external_url.trim()) ||
+        null;
+
+      const url = rawUrl ? (isHttpUrl(rawUrl) ? rawUrl.trim() : null) : makeFallbackPlaceUrl(name, location);
+
+      const day = typeof x.day === "number" ? x.day : null;
+      const price = typeof x.price === "number" ? x.price : null;
+
+      return {
+        id: x.id ?? `exp-${i}`,
+        name,
+        description,
+        location,
+        url,
+        day,
+        price
+      };
+    })
+    .filter((e) => e.name);
+};
+
 function normalizeTripStructure(parsed) {
+  // -------------------------
+  // Helpers
+  // -------------------------
+  const safeStr = (v) =>
+    typeof v === "string" ? v.trim() : v == null ? "" : String(v).trim();
+
+  const toNumOrNull = (v) => {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string" && v.trim()) {
+      const n = Number(v.replace(",", "."));
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  };
+
+  const isHttpUrl = (s) => {
+    if (typeof s !== "string") return false;
+    const t = s.trim();
+    return /^https?:\/\/\S+/i.test(t);
+  };
+
+  const parseArrayField = (value) => {
+    if (!value) return [];
+    if (Array.isArray(value)) return value;
+    if (typeof value === "string") {
+      try {
+        const p = JSON.parse(value);
+        return Array.isArray(p) ? p : [];
+      } catch {
+        return [];
+      }
+    }
+    return [];
+  };
+
+  // Booking/ticket fallback (IKKE maps)
+  const makeTicketSearchUrl = (title, location) => {
+    const t = safeStr(title);
+    const loc = safeStr(location);
+    if (!t) return null;
+    const q = encodeURIComponent(loc ? `${t} ${loc} billetter` : `${t} billetter`);
+    return `https://www.google.com/search?q=${q}`;
+  };
+
+  // -------------------------
+  // Guard
+  // -------------------------
   if (!parsed || typeof parsed !== "object") {
     return {
       title: "Reiseforslag fra KI",
       description: null,
       stops: [],
-      packing_list: [],
-      hotels: []
+      packing_list: normalizePackingToFourCategoriesSmart([], ""),
+      hotels: [],
+      experiences: []
     };
   }
 
-  const title =
-    typeof parsed.title === "string" && parsed.title.trim()
-      ? parsed.title.trim()
-      : "Reiseforslag fra KI";
+  // -------------------------
+  // Title / description
+  // -------------------------
+  const title = safeStr(parsed.title) || "Reiseforslag fra KI";
+  const description = safeStr(parsed.description) || null;
 
-  const description =
-    typeof parsed.description === "string" && parsed.description.trim()
-      ? parsed.description.trim()
-      : null;
+  // -------------------------
+  // STOPS
+  // -------------------------
+  const rawStops = parseArrayField(parsed.stops);
 
-  // ---- STOPS ----
-  const rawStops = Array.isArray(parsed.stops) ? parsed.stops : [];
-  const stops = rawStops.map((s, idx) => {
-    const name =
-      (s && (s.name || s.title)) ||
-      `Stopp ${idx + 1}`;
+  const stops = rawStops
+    .filter((s) => s && typeof s === "object")
+    .map((s, idx) => {
+      const name = safeStr(s.name || s.title) || `Stopp ${idx + 1}`;
+      const desc = safeStr(s.description) || "";
 
-    const desc =
-      s && typeof s.description === "string"
-        ? s.description
-        : "";
+      const lat = toNumOrNull(s.lat ?? s.latitude);
+      const lng = toNumOrNull(s.lng ?? s.longitude);
 
-    let lat = s && (s.lat ?? s.latitude ?? null);
-    let lng = s && (s.lng ?? s.longitude ?? null);
-    let day = s && (s.day ?? null);
+      let day = s.day ?? null;
+      day = typeof day === "number" ? day : toNumOrNull(day);
+      if (day == null) day = idx + 1;
 
-    // Streng → tall (lat/lng)
-    if (typeof lat === "string" && lat.trim() !== "") {
-      const n = Number(lat.replace(",", "."));
-      lat = isNaN(n) ? null : n;
-    }
-    if (typeof lng === "string" && lng.trim() !== "") {
-      const n = Number(lng.replace(",", "."));
-      lng = isNaN(n) ? null : n;
-    }
+      const location = safeStr(s.location || s.address || s.subtitle) || null;
 
-    // Streng → tall (day)
-    if (typeof day === "string" && day.trim() !== "") {
-      const n = Number(day);
-      day = isNaN(n) ? null : n;
-    }
-    if (day == null) {
-      day = idx + 1;
-    }
+      // Hotels pr stop (valgfritt)
+      const stopHotels = parseArrayField(s.hotels)
+        .filter((h) => h && typeof h === "object")
+        .map((h, hi) => {
+          const hn = safeStr(h.name || h.title) || `Hotell ${hi + 1}`;
+          const hl = safeStr(h.location || h.area || h.city) || null;
+          const hd = safeStr(h.description || h.notes) || "";
+          const price =
+            typeof h.price_per_night === "number"
+              ? h.price_per_night
+              : toNumOrNull(h.price_per_night ?? h.approx_price_per_night);
 
-    return {
-      name,
-      description: desc,
-      lat: typeof lat === "number" ? lat : null,
-      lng: typeof lng === "number" ? lng : null,
-      day
-    };
-  });
+          const rawUrl = safeStr(h.url || h.booking_url || h.link || h.external_url) || null;
+          const url = rawUrl && isHttpUrl(rawUrl) ? rawUrl : null;
 
-    // ---- PACKING LIST ----
-    const rawPacking =
-      parsed.packing_list ||
-      parsed.packingList ||
-      parsed.packing ||
-      [];
+          return { name: hn, location: hl, description: hd, price_per_night: price, url };
+        })
+        .filter((h) => safeStr(h.name));
 
-    const contextText = `${parsed.title || ""}\n${parsed.description || ""}\n` +
-      (Array.isArray(parsed.stops) ? parsed.stops.map(s => `${s?.name || ""} ${s?.description || ""}`).join("\n") : "");
+      return {
+        id: s.id ?? `s-${idx}`,
+        day,
+        name,
+        description: desc,
+        location,
+        lat,
+        lng,
+        hotels: stopHotels
+      };
+    })
+    .filter((s) => safeStr(s.name));
 
-    const packing_list = normalizePackingToFourCategoriesSmart(rawPacking, contextText);
-
-      // ---- HOTELLER / OVERNATTING ----
-  const rawHotels =
-    parsed.hotels ||
-    parsed.accommodations ||
-    parsed.accommodation_suggestions ||
+  // -------------------------
+  // PACKING LIST -> NØYAKTIG 4 kategorier (smart)
+  // -------------------------
+  const rawPacking =
+    parsed.packing_list ||
+    parsed.packingList ||
+    parsed.packing ||
     [];
 
-  const hotels = Array.isArray(rawHotels)
-    ? rawHotels.map((h) => {
-        const name =
-          (h && (h.name || h.title)) ||
-          "Hotell/overnatting";
+  const contextText =
+    `${title}\n${description || ""}\n` +
+    stops.map((s) => `${safeStr(s.name)} ${safeStr(s.description)}`).join("\n");
 
-        const location =
-          (h && (h.location || h.city || h.area)) ||
-          null;
+  const packing_list = normalizePackingToFourCategoriesSmart(rawPacking, contextText);
 
-        const description =
-          h && typeof h.description === "string"
-            ? h.description
-            : null;
+  // -------------------------
+  // HOTELS (flat) + inkluder evt. hotels fra stops
+  // -------------------------
+  const rawHotelsCombined = [
+    ...(Array.isArray(parsed.hotels) ? parsed.hotels : parseArrayField(parsed.hotels)),
+    ...stops.flatMap((s) => (Array.isArray(s.hotels) ? s.hotels : []))
+  ];
 
-        let price = h && (h.price_per_night ?? h.approximate_price_per_night ?? null);
-        if (typeof price === "string" && price.trim() !== "") {
-          const n = Number(price.replace(",", "."));
-          price = isNaN(n) ? null : n;
-        }
+  const hotels = rawHotelsCombined
+    .filter((h) => h && typeof h === "object")
+    .map((h, idx) => {
+      const name = safeStr(h.name || h.title) || `Hotell ${idx + 1}`;
+      const location = safeStr(h.location || h.area || h.city) || null;
+      const descriptionH = safeStr(h.description || h.notes) || "";
 
-        const url =
-          (h && (h.url || h.link || h.booking_url)) ||
-          null;
+      const price =
+        typeof h.price_per_night === "number"
+          ? h.price_per_night
+          : toNumOrNull(h.price_per_night ?? h.approx_price_per_night);
 
-        return {
-          name,
-          location,
-          description,
-          price_per_night: typeof price === "number" ? price : null,
-          url
-        };
-      })
-    : [];
+      const rawUrl = safeStr(h.url || h.booking_url || h.link || h.external_url) || null;
+      const url = rawUrl && isHttpUrl(rawUrl) ? rawUrl : null;
 
-  return { title, description, stops, packing_list, hotels };
+      return {
+        id: h.id ?? `h-${idx}`,
+        name,
+        location,
+        description: descriptionH,
+        price_per_night: price ?? null,
+        url
+      };
+    })
+    .filter((h) => safeStr(h.name));
+
+  // -------------------------
+  // EXPERIENCES (ny!)
+  // -------------------------
+  const rawExperiences =
+    parseArrayField(parsed.experiences).length
+      ? parseArrayField(parsed.experiences)
+      : parseArrayField(parsed.activities || parsed.tickets || parsed.bookings);
+
+  const experiences = rawExperiences
+    .filter((x) => x && typeof x === "object")
+    .map((x, idx) => {
+      const name = safeStr(x.title || x.name || x.activity) || `Opplevelse ${idx + 1}`;
+      const location = safeStr(x.location || x.city || x.area) || null;
+      const descriptionX = safeStr(x.description) || "";
+
+      const rawUrl = safeStr(
+        x.booking_url || x.url || x.ticket_url || x.link || x.external_url
+      ) || null;
+
+      const url = rawUrl
+        ? (isHttpUrl(rawUrl) ? rawUrl : null)
+        : makeTicketSearchUrl(name, location);
+
+      const day =
+        typeof x.day === "number" ? x.day : toNumOrNull(x.day);
+
+      const price_per_person =
+        typeof x.price_per_person === "number"
+          ? x.price_per_person
+          : toNumOrNull(x.price_per_person);
+
+      const currency = safeStr(x.currency) || "NOK";
+
+      return {
+        id: x.id ?? `exp-${idx}`,
+        name,
+        location,
+        description: descriptionX,
+        url,
+        day: day ?? null,
+        price_per_person: price_per_person ?? null,
+        currency
+      };
+    })
+    .filter((e) => safeStr(e.name));
+
+  return {
+    title,
+    description,
+    stops,
+    packing_list,
+    hotels,
+    experiences
+  };
 }
 
 // Bruk KI til å gjette hovedland for en reise ut fra tittel/beskrivelse/stopp
@@ -745,7 +915,7 @@ async function authMiddleware(req, res, next) {
 
     // Hent bruker fra DB slik at vi alltid har is_admin + navn tilgjengelig
     const u = await query(
-      `SELECT id, email, full_name, is_admin FROM users WHERE id=$1`,
+      `SELECT id, email, full_name, is_admin, is_premium FROM users WHERE id=$1`,
       [decoded.userId]
     );
 
@@ -758,7 +928,8 @@ async function authMiddleware(req, res, next) {
       id: user.id,
       email: user.email,
       full_name: user.full_name,
-      is_admin: !!user.is_admin
+      is_admin: !!user.is_admin,
+      is_premium: !!user.is_premium
     };
 
     next();
@@ -766,6 +937,10 @@ async function authMiddleware(req, res, next) {
     console.warn("JWT-feil:", err.message);
     res.status(401).json({ error: "Ugyldig eller utløpt token." });
   }
+}
+
+function canSeeTripDetails(req) {
+  return !!(req.user?.is_admin || req.user?.is_premium);
 }
 
 // -------------------------------------------------------
@@ -888,11 +1063,89 @@ async function generateTripFromAI({ sourceUrl, userDescription, userProfile }) {
       ? Number(userProfile.budget_per_day)
       : null;
 
-  // En enkel “pris”-heuristikk (du kan justere)
+  // En enkel “pris”-heuristikk
   const defaultHotelPrice = budgetPerDay
     ? Math.max(500, Math.round(budgetPerDay * 0.7))
     : 1200;
 
+  // -------------------------
+  // Helpers
+  // -------------------------
+  const isHttpUrl = (s) => {
+    if (typeof s !== "string") return false;
+    const t = s.trim();
+    return /^https?:\/\/\S+/i.test(t);
+  };
+
+  // Ticket/booking fallback (IKKE Google Maps, men søk)
+  const makeTicketSearchUrl = (name, location) => {
+    const n = (name || "").toString().trim();
+    const loc = (location || "").toString().trim();
+    if (!n) return null;
+    const q = encodeURIComponent(loc ? `${n} ${loc} billetter` : `${n} billetter`);
+    return `https://www.google.com/search?q=${q}`;
+  };
+
+  const normalizeExperiencesArray = (raw, fallbackLocation = "") => {
+    if (!Array.isArray(raw)) return [];
+
+    return raw
+      .filter((x) => x && typeof x === "object")
+      .map((x, i) => {
+        const name =
+          (typeof x.name === "string" && x.name.trim()) ? x.name.trim()
+          : (typeof x.title === "string" && x.title.trim()) ? x.title.trim()
+          : (typeof x.activity === "string" && x.activity.trim()) ? x.activity.trim()
+          : `Opplevelse ${i + 1}`;
+
+        const description = typeof x.description === "string" ? x.description.trim() : "";
+        const location =
+          (typeof x.location === "string" && x.location.trim()) ? x.location.trim()
+          : (typeof x.city === "string" && x.city.trim()) ? x.city.trim()
+          : (typeof x.area === "string" && x.area.trim()) ? x.area.trim()
+          : (fallbackLocation || "");
+
+        const rawUrl =
+          (typeof x.url === "string" && x.url.trim()) ||
+          (typeof x.ticket_url === "string" && x.ticket_url.trim()) ||
+          (typeof x.booking_url === "string" && x.booking_url.trim()) ||
+          (typeof x.link === "string" && x.link.trim()) ||
+          (typeof x.external_url === "string" && x.external_url.trim()) ||
+          null;
+
+        const url = rawUrl
+          ? (isHttpUrl(rawUrl) ? rawUrl.trim() : null)
+          : makeTicketSearchUrl(name, location);
+
+        const day = typeof x.day === "number" ? x.day : null;
+
+        const price_per_person =
+          typeof x.price_per_person === "number"
+            ? x.price_per_person
+            : (x.price_per_person != null && !isNaN(Number(x.price_per_person)) ? Number(x.price_per_person) : null);
+
+        const currency =
+          typeof x.currency === "string" && x.currency.trim()
+            ? x.currency.trim()
+            : "NOK";
+
+        return {
+          id: x.id ?? `exp-${i}`,
+          name,
+          description,
+          location,
+          url,
+          day,
+          price_per_person,
+          currency
+        };
+      })
+      .filter((e) => e.name);
+  };
+
+  // -------------------------
+  // Prompt
+  // -------------------------
   const sysPrompt = `
 Du er en reiseplanlegger for appen "Grenseløs Reise".
 
@@ -919,7 +1172,29 @@ Struktur:
             "notes": "Kort begrunnelse",
             "url": null
           }
+        ],
+        "experiences": [
+          {
+            "name": "Opplevelse/attraksjon",
+            "description": "Kort hva/hvorfor",
+            "location": "Sted/by/område",
+            "day": 1,
+            "url": null,
+            "price_per_person": null,
+            "currency": "NOK"
+          }
         ]
+      }
+    ],
+    "experiences": [
+      {
+        "name": "Opplevelse/attraksjon",
+        "description": "Kort hva/hvorfor",
+        "location": "Sted/by/område",
+        "day": 1,
+        "url": null,
+        "price_per_person": null,
+        "currency": "NOK"
       }
     ],
     "packing_list": ["..."]
@@ -940,6 +1215,12 @@ KRAV FOR HOTELS:
 - notes: kort begrunnelse.
 - url er VALGFRI: bruk en konkret URL hvis du er sikker, ellers null.
 - Ikke bruk Google-søk/Google Maps-søk-URL.
+
+KRAV FOR EXPERIENCES:
+- trip.experiences SKAL være en array med 4–10 opplevelser totalt.
+- I tillegg KAN du legge 0–3 experiences per stopp (stop.experiences) hvis relevant.
+- url: bruk offisiell billett/booking-side hvis du er sikker, ellers null.
+- IKKE bruk Google-søk/Google Maps-søk-URL.
 
 KRAV FOR PACKING_LIST:
 - packing_list SKAL være array med minst 8–12 konkrete ting.
@@ -965,7 +1246,7 @@ ${profileText}
       { role: "system", content: sysPrompt },
       { role: "user", content: userPrompt }
     ],
-    max_output_tokens: 1600 // litt mer rom => mindre “drop” av hotels
+    max_output_tokens: 1800
   });
 
   const raw = response.output_text || "{}";
@@ -997,21 +1278,23 @@ ${profileText}
     console.error("❌ Klarte ikke å parse KI-svar som JSON:", e);
     console.error("📄 Innhold som feilet parsing:", jsonText);
     return {
-      trip: { title: "Reiseforslag", description: null, stops: [], packing_list: [] }
+      trip: { title: "Reiseforslag", description: null, stops: [], packing_list: [], experiences: [] }
     };
   }
 
+  // -------------------------
   // Defensiv normalisering
+  // -------------------------
   if (!parsed.trip || typeof parsed.trip !== "object") parsed.trip = {};
   if (!Array.isArray(parsed.trip.stops)) parsed.trip.stops = [];
   if (!Array.isArray(parsed.trip.packing_list)) parsed.trip.packing_list = [];
+  if (!Array.isArray(parsed.trip.experiences)) parsed.trip.experiences = [];
 
-  // ✅ Sikre hotels per stop + fallback hvis tomt
+  // ✅ Normaliser stops + sørg for hotels per stop
   parsed.trip.stops = parsed.trip.stops.map((stop, idx) => {
     const s = stop && typeof stop === "object" ? stop : {};
     let hotels = Array.isArray(s.hotels) ? s.hotels : [];
 
-    // Rens hotellobjekter
     hotels = hotels
       .filter((h) => h && typeof h === "object")
       .map((h) => ({
@@ -1024,11 +1307,11 @@ ${profileText}
         notes: typeof h.notes === "string" ? h.notes.trim() : "",
         url: typeof h.url === "string" && h.url.trim() ? h.url.trim() : null
       }))
-      .filter((h) => h.name); // må ha navn
+      .filter((h) => h.name);
 
-    // Hvis modellen fortsatt ga 0 hoteller -> legg inn fallback-forslag
     if (hotels.length === 0) {
-      const place = (typeof s.name === "string" && s.name.trim()) ? s.name.trim() : `Stopp ${idx + 1}`;
+      const place =
+        (typeof s.name === "string" && s.name.trim()) ? s.name.trim() : `Stopp ${idx + 1}`;
       hotels = [
         {
           name: `Budsjett-hotell i ${place}`,
@@ -1047,8 +1330,56 @@ ${profileText}
       ];
     }
 
-    return { ...s, hotels };
+    // ✅ Normaliser stop.experiences (valgfritt felt)
+    const stopLocation =
+      (typeof s.name === "string" && s.name.trim()) ? s.name.trim() : "";
+    const stopExperiences = normalizeExperiencesArray(s.experiences, stopLocation);
+
+    return { ...s, hotels, experiences: stopExperiences };
   });
+
+  // ✅ Normaliser trip.experiences
+  let tripExperiences = normalizeExperiencesArray(parsed.trip.experiences, "");
+
+  // ✅ Hvis modellen la experiences på stopp men ikke på trip → løft opp til trip
+  if (tripExperiences.length === 0) {
+    const lifted = [];
+    for (const s of parsed.trip.stops) {
+      if (Array.isArray(s.experiences)) {
+        for (const e of s.experiences) lifted.push(e);
+      }
+    }
+    tripExperiences = lifted.slice(0, 12);
+  }
+
+  // ✅ Hvis fortsatt tomt: legg inn en liten fallback-liste basert på stoppnavn
+  if (tripExperiences.length === 0 && parsed.trip.stops.length > 0) {
+    const firstStopName = (parsed.trip.stops[0]?.name || "").toString().trim();
+    tripExperiences = [
+      {
+        id: "exp-fallback-1",
+        name: "Guidet opplevelse / byvandring",
+        description: "Sjekk tilgjengelige turer og billetter i området.",
+        location: firstStopName || "",
+        url: makeTicketSearchUrl("Guidet tur", firstStopName || ""),
+        day: 1,
+        price_per_person: null,
+        currency: "NOK"
+      },
+      {
+        id: "exp-fallback-2",
+        name: "Museum / attraksjon",
+        description: "Et trygt valg på reisedager – sjekk åpningstider og billetter.",
+        location: firstStopName || "",
+        url: makeTicketSearchUrl("Museum", firstStopName || ""),
+        day: 1,
+        price_per_person: null,
+        currency: "NOK"
+      }
+    ];
+  }
+
+  parsed.trip.experiences = tripExperiences;
 
   return parsed;
 }
@@ -1074,13 +1405,99 @@ async function generateTripFromEpisode({
 `.trim()
     : "Ingen personlig profil tilgjengelig.";
 
+  // -------------------------
+  // Helpers
+  // -------------------------
+  const isHttpUrl = (s) => {
+    if (typeof s !== "string") return false;
+    const t = s.trim();
+    return /^https?:\/\/\S+/i.test(t);
+  };
+
+  // Ticket/booking fallback (IKKE Google Maps)
+  const makeTicketSearchUrl = (title, location) => {
+    const t = (title || "").toString().trim();
+    const loc = (location || "").toString().trim();
+    if (!t) return null;
+    const q = encodeURIComponent(loc ? `${t} ${loc} billetter` : `${t} billetter`);
+    return `https://www.google.com/search?q=${q}`;
+  };
+
+  const normalizeExperiencesArray = (raw) => {
+    if (!Array.isArray(raw)) return [];
+
+    return raw
+      .filter((x) => x && typeof x === "object")
+      .map((x, i) => {
+        const name =
+          (typeof x.name === "string" && x.name.trim()) ? x.name.trim()
+          : (typeof x.title === "string" && x.title.trim()) ? x.title.trim()
+          : (typeof x.activity === "string" && x.activity.trim()) ? x.activity.trim()
+          : `Opplevelse ${i + 1}`;
+
+        const location =
+          (typeof x.location === "string" && x.location.trim()) ? x.location.trim()
+          : (typeof x.city === "string" && x.city.trim()) ? x.city.trim()
+          : (typeof x.area === "string" && x.area.trim()) ? x.area.trim()
+          : "";
+
+        const description =
+          (typeof x.description === "string" && x.description.trim()) ? x.description.trim()
+          : "";
+
+        const rawUrl =
+          (typeof x.url === "string" && x.url.trim()) ||
+          (typeof x.booking_url === "string" && x.booking_url.trim()) ||
+          (typeof x.ticket_url === "string" && x.ticket_url.trim()) ||
+          (typeof x.link === "string" && x.link.trim()) ||
+          (typeof x.external_url === "string" && x.external_url.trim()) ||
+          null;
+
+        const url = rawUrl
+          ? (isHttpUrl(rawUrl) ? rawUrl.trim() : null)
+          : makeTicketSearchUrl(name, location);
+
+        const day = typeof x.day === "number" ? x.day : null;
+
+        const price_per_person =
+          typeof x.price_per_person === "number"
+            ? x.price_per_person
+            : (x.price_per_person != null && !isNaN(Number(x.price_per_person)) ? Number(x.price_per_person) : null);
+
+        const currency =
+          typeof x.currency === "string" && x.currency.trim()
+            ? x.currency.trim()
+            : "NOK";
+
+        return {
+          id: x.id ?? `exp-${episodeId || "ep"}-${i}`,
+          name,
+          location,
+          description,
+          url,
+          day,
+          price_per_person,
+          currency
+        };
+      })
+      .filter((e) => e.name);
+  };
+
+  // -------------------------
+  // Prompt
+  // -------------------------
   const systemPrompt = `
 Du er en erfaren reiseplanlegger som lager konkrete reiseforslag basert på
 Grenseløs-episoder OG brukerens ønsker.
 
 Du MÅ ALLTID svare med gyldig JSON, uten forklaringstekst rundt.
 
-Output-format:
+Returner strukturert JSON med “title”, “description”, “stops”, “packing_list”, “hotels” og “experiences”.
+
+“experiences” er en array av opplevelser/aktiviteter som ofte krever billett/booking.
+Hver experience må ha: title, location, description, og helst booking_url (hvis du er sikker), ellers null.
+
+Output-format (MÅ MATCHES):
 
 {
   "title": "Kort og konkret tittel på reisen",
@@ -1118,7 +1535,16 @@ Output-format:
       "location": "By / område",
       "description": "Kort hvorfor dette passer til turen.",
       "price_per_night": 1200,
-      "url": "https://…"
+      "url": null
+    }
+  ],
+  "experiences": [
+    {
+      "title": "Opplevelse/attraksjon",
+      "location": "By / område",
+      "description": "Kort hvorfor, hva man gjør, og hvorfor verdt det.",
+      "booking_url": null,
+      "day": 1
     }
   ]
 }
@@ -1132,7 +1558,6 @@ KRAV FOR PACKING_LIST:
     4) "Annet"
 - Kategorinavnene må være akkurat disse.
 - Hver kategori SKAL ha en "items"-liste med 3–10 KONKRETE ting.
-- Ikke skriv generelle ting som "annet", "diverse", "osv." som item.
 
 KRAV FOR STOPS:
 - 3–10 stopp.
@@ -1143,6 +1568,10 @@ KRAV FOR HOTELS:
 - 2–6 forslag totalt.
 - Hvert hotell SKAL ha "name".
 - "price_per_night" skal være et tall (omtrentlig pris per natt) i NOK hvis naturlig, ellers null.
+
+KRAV FOR EXPERIENCES:
+- 4–10 experiences totalt.
+- booking_url: kun hvis du er sikker på OFFISIELL billett/booking-side, ellers null.
 `.trim();
 
   const userPrompt = `
@@ -1171,9 +1600,7 @@ ${profileText}
     temperature: 0.7
   });
 
-  const aiText =
-    completion.choices?.[0]?.message?.content?.trim() || "";
-
+  const aiText = completion.choices?.[0]?.message?.content?.trim() || "";
   const parsed = extractJson(aiText);
 
   let trip;
@@ -1185,23 +1612,65 @@ ${profileText}
       description: description || null,
       stops: [],
       packing_list: [],
-      hotels: []
+      hotels: [],
+      experiences: []
     };
+  }
+
+  // ✅ Experiences: normaliser + fallback url
+  // Støtter både trip.experiences og parsed.experiences, siden normalizeTripStructure kan flytte rundt.
+  const rawExperiences =
+    Array.isArray(trip.experiences) ? trip.experiences :
+    Array.isArray(parsed?.experiences) ? parsed.experiences :
+    [];
+
+  trip.experiences = normalizeExperiencesArray(rawExperiences);
+
+  // ✅ Hvis modellen ga 0 experiences, legg inn en liten fallback basert på første stopp
+  if (trip.experiences.length === 0) {
+    const firstStop = Array.isArray(trip.stops) && trip.stops[0] ? trip.stops[0] : null;
+    const loc = (firstStop?.name || "").toString().trim();
+    trip.experiences = [
+      {
+        id: `exp-${episodeId}-fallback-1`,
+        name: "Guidet opplevelse / byvandring",
+        location: loc,
+        description: "Sjekk tilgjengelige turer og billetter i området.",
+        url: makeTicketSearchUrl("Guidet tur", loc),
+        day: typeof firstStop?.day === "number" ? firstStop.day : 1,
+        price_per_person: null,
+        currency: "NOK"
+      },
+      {
+        id: `exp-${episodeId}-fallback-2`,
+        name: "Museum / attraksjon",
+        location: loc,
+        description: "Et trygt valg på reisedager – sjekk åpningstider og billetter.",
+        url: makeTicketSearchUrl("Museum", loc),
+        day: typeof firstStop?.day === "number" ? firstStop.day : 1,
+        price_per_person: null,
+        currency: "NOK"
+      }
+    ];
   }
 
   return { trip, raw: aiText };
 }
 
 // -------------------------------------------------------
-//  AUTO-GENERERE TRIPS FOR EPISODER (BRUKT I SYNC)
+//  AUTO-GENERERE TRIPS FOR EPISODER (SYSTEM-TRIPS)
+//  - Oppretter 1 canonical system-trip per episode per bruker
+//  - Lagrer stops + hotels + packing_list + experiences + gallery
+//  - Geokoder stop-lat/lng via Mapbox hvis MAPBOX_TOKEN finnes
 // -------------------------------------------------------
-
 async function ensureTripForEpisode(episode, userId) {
-  // 1) Finn eksisterende *system-trip* for denne episoden for denne brukeren
-  //    Vi skiller den tydelig fra vanlige brukerreiser via source_type = 'grenselos_episode'
+  if (!episode?.id) throw new Error("ensureTripForEpisode: episode.id mangler");
+  if (!userId) throw new Error("ensureTripForEpisode: userId mangler");
+
+  // 1) Gjenbruk eksisterende system-trip
   const existing = await query(
     `
-      SELECT id, stops, packing_list, hotels, gallery, source_type, created_at
+      SELECT id, created_at
       FROM trips
       WHERE source_episode_id = $1
         AND user_id = $2
@@ -1222,21 +1691,180 @@ async function ensureTripForEpisode(episode, userId) {
     return existing.rows[0].id;
   }
 
-  // 2) Ingen system-trip ennå: lag en ny med KI-innhold som «mal»,
-  //    men galleri er TOMT inntil Admin laster opp.
+  // ---------------- helpers ----------------
+  const toNumOrNull = (v) => {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string" && v.trim()) {
+      const n = Number(v.replace(",", "."));
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  };
+
+  const isHttpUrl = (s) => {
+    if (typeof s !== "string") return false;
+    const t = s.trim();
+    return /^https?:\/\/\S+/i.test(t);
+  };
+
+  // Ticket/booking fallback (IKKE maps)
+  const makeTicketSearchUrl = (title, location) => {
+    const t = (title || "").toString().trim();
+    const loc = (location || "").toString().trim();
+    if (!t) return null;
+    const q = encodeURIComponent(loc ? `${t} ${loc} billetter` : `${t} billetter`);
+    return `https://www.google.com/search?q=${q}`;
+  };
+
+  // Geocoding via Mapbox (valgfritt)
+  async function geocodePlaceMapbox(queryText) {
+    const token = process.env.MAPBOX_TOKEN;
+    if (!token) return null;
+
+    const q = String(queryText || "").trim();
+    if (!q) return null;
+
+    const url =
+      "https://api.mapbox.com/geocoding/v5/mapbox.places/" +
+      encodeURIComponent(q) +
+      ".json";
+
+    try {
+      const r = await axios.get(url, {
+        params: { limit: 1, access_token: token }
+      });
+
+      const f = r.data?.features?.[0];
+      if (!f?.center || f.center.length < 2) return null;
+
+      return { lng: f.center[0], lat: f.center[1] };
+    } catch (e) {
+      console.warn("[geocodePlaceMapbox] feilet:", e?.response?.status || "", e?.message || e);
+      return null;
+    }
+  }
+
+  // Normaliser experiences til app-format
+  const normalizeExperience = (x, fallbackLocation = null) => {
+    if (!x || typeof x !== "object") return null;
+
+    const name =
+      (typeof x.name === "string" && x.name.trim()) ? x.name.trim() :
+      (typeof x.title === "string" && x.title.trim()) ? x.title.trim() :
+      (typeof x.activity === "string" && x.activity.trim()) ? x.activity.trim() :
+      null;
+
+    if (!name) return null;
+
+    const location =
+      (typeof x.location === "string" && x.location.trim()) ? x.location.trim() :
+      (typeof x.city === "string" && x.city.trim()) ? x.city.trim() :
+      (typeof x.area === "string" && x.area.trim()) ? x.area.trim() :
+      (fallbackLocation || null);
+
+    const description = (typeof x.description === "string" ? x.description.trim() : "") || null;
+
+    const rawUrl =
+      (typeof x.url === "string" && x.url.trim()) ||
+      (typeof x.booking_url === "string" && x.booking_url.trim()) ||
+      (typeof x.ticket_url === "string" && x.ticket_url.trim()) ||
+      (typeof x.link === "string" && x.link.trim()) ||
+      (typeof x.external_url === "string" && x.external_url.trim()) ||
+      null;
+
+    const url = rawUrl
+      ? (isHttpUrl(rawUrl) ? rawUrl.trim() : null)
+      : makeTicketSearchUrl(name, location || "");
+
+    const day = typeof x.day === "number" ? x.day : toNumOrNull(x.day);
+
+    const price_per_person =
+      typeof x.price_per_person === "number"
+        ? x.price_per_person
+        : toNumOrNull(x.price_per_person);
+
+    const currency =
+      (typeof x.currency === "string" && x.currency.trim()) ? x.currency.trim() : "NOK";
+
+    return {
+      name,
+      location,
+      description,
+      url,
+      day: day ?? null,
+      price_per_person: price_per_person ?? null,
+      currency
+    };
+  };
+
+  // ---------------- 2) Generer ny system-trip fra AI ----------------
   const ai = await generateTripFromAI({
     sourceUrl: episode.external_url,
     userDescription: `Lag en reise basert på Grenseløs-episoden: ${episode.name}`,
     userProfile: null
   });
 
-  const trip = ai.trip || {};
-  const stops = Array.isArray(trip.stops) ? trip.stops : [];
-  const packingList = Array.isArray(trip.packing_list)
-    ? trip.packing_list
-    : [];
+  const trip = ai?.trip && typeof ai.trip === "object" ? ai.trip : {};
 
-  // 🔁 FLATT UT hoteller fra hvert stopp til et felles hotels-array
+  let stops = Array.isArray(trip.stops) ? trip.stops : [];
+  let packingList = Array.isArray(trip.packing_list) ? trip.packing_list : [];
+  const tripLevelExperiences = Array.isArray(trip.experiences) ? trip.experiences : [];
+
+  // ---------------- 3) Normaliser stops + day + lat/lng ----------------
+  stops = stops
+    .filter((s) => s && typeof s === "object")
+    .map((s, idx) => {
+      const dayRaw = s.day ?? (idx + 1);
+      const day = typeof dayRaw === "number" ? dayRaw : (toNumOrNull(dayRaw) ?? (idx + 1));
+
+      const name = (typeof s.name === "string" && s.name.trim())
+        ? s.name.trim()
+        : `Stopp ${idx + 1}`;
+
+      const location =
+        (typeof s.location === "string" && s.location.trim()) ? s.location.trim() :
+        (typeof s.address === "string" && s.address.trim()) ? s.address.trim() :
+        null;
+
+      const lat = toNumOrNull(s.lat ?? s.latitude);
+      const lng = toNumOrNull(s.lng ?? s.longitude);
+
+      // Behold ev. hotels / experiences på stopp
+      const stopHotels = Array.isArray(s.hotels) ? s.hotels : [];
+      const stopExperiences = Array.isArray(s.experiences) ? s.experiences : [];
+
+      return {
+        ...s,
+        day,
+        name,
+        location,
+        lat: lat ?? null,
+        lng: lng ?? null,
+        hotels: stopHotels,
+        experiences: stopExperiences
+      };
+    });
+
+  // Geokode manglende koordinater (hvis MAPBOX_TOKEN finnes)
+  if (process.env.MAPBOX_TOKEN) {
+    for (const s of stops) {
+      const has = typeof s.lat === "number" && typeof s.lng === "number";
+      if (has) continue;
+
+      const q = [s.name, s.location, trip.title].filter(Boolean).join(", ");
+      const hit = await geocodePlaceMapbox(q);
+
+      if (hit) {
+        s.lat = hit.lat;
+        s.lng = hit.lng;
+      }
+    }
+  }
+
+  // ---------------- 4) Flat ut HOTELS fra hvert stopp ----------------
+  // En enkel “pris”-heuristikk lik i generateTripFromAI
+  const defaultHotelPrice = 1200;
+
   const hotels = [];
   for (const s of stops) {
     if (!s || typeof s !== "object") continue;
@@ -1246,21 +1874,111 @@ async function ensureTripForEpisode(episode, userId) {
       if (!h || typeof h !== "object") continue;
 
       let price = h.approx_price_per_night ?? h.price_per_night ?? null;
-      if (typeof price === "string" && price.trim() !== "") {
-        const n = Number(price.replace(",", "."));
-        price = isNaN(n) ? null : n;
-      }
+      price = toNumOrNull(price);
+
+      const name =
+        (typeof h.name === "string" && h.name.trim()) ? h.name.trim() :
+        (typeof h.title === "string" && h.title.trim()) ? h.title.trim() :
+        "Hotell/overnatting";
+
+      const rawUrl =
+        (typeof h.url === "string" && h.url.trim()) ||
+        (typeof h.booking_url === "string" && h.booking_url.trim()) ||
+        (typeof h.link === "string" && h.link.trim()) ||
+        (typeof h.external_url === "string" && h.external_url.trim()) ||
+        null;
+
+      const url = rawUrl && isHttpUrl(rawUrl) ? rawUrl.trim() : null;
 
       hotels.push({
-        name: h.name || h.title || "Hotell/overnatting",
+        name,
         location: s.name || null,
-        description: h.notes || h.description || null,
-        price_per_night: typeof price === "number" ? price : null,
-        url: h.url || h.booking_url || null
+        description: (h.notes || h.description || null),
+        price_per_night: price ?? defaultHotelPrice,
+        url
       });
     }
   }
 
+  // Hvis KI ga 0 hoteller totalt, legg inn minimale fallback-hoteller
+  if (hotels.length === 0 && stops.length > 0) {
+    const first = stops[0]?.name || "første stopp";
+    hotels.push(
+      {
+        name: `Budsjett-hotell i ${first}`,
+        location: first,
+        description: "Forslag generert uten sikker lenke – velg etter beliggenhet og omtaler.",
+        price_per_night: defaultHotelPrice,
+        url: null
+      },
+      {
+        name: `Sentral overnatting i ${first}`,
+        location: first,
+        description: "Et alternativ nær sentrum/transport – sjekk tilgjengelighet i booking.",
+        price_per_night: Math.round(defaultHotelPrice * 1.2),
+        url: null
+      }
+    );
+  }
+
+  // ---------------- 5) Samle EXPERIENCES (trip + per stop) ----------------
+  const experiences = [];
+
+  // trip-level
+  for (const x of tripLevelExperiences) {
+    const e = normalizeExperience(x, null);
+    if (e) experiences.push(e);
+  }
+
+  // stop-level
+  for (const s of stops) {
+    if (!Array.isArray(s.experiences)) continue;
+    for (const x of s.experiences) {
+      const e = normalizeExperience(x, s.name || null);
+      if (e) {
+        // hvis day mangler, bruk stop-day
+        if (e.day == null && typeof s.day === "number") e.day = s.day;
+        experiences.push(e);
+      }
+    }
+  }
+
+  // Hvis fortsatt tomt: fallback
+  if (experiences.length === 0) {
+    const loc = stops[0]?.name || "";
+    experiences.push(
+      {
+        name: "Guidet opplevelse / byvandring",
+        location: loc || null,
+        description: "Sjekk tilgjengelige turer og billetter i området.",
+        url: makeTicketSearchUrl("Guidet tur", loc),
+        day: stops[0]?.day ?? 1,
+        price_per_person: null,
+        currency: "NOK"
+      },
+      {
+        name: "Museum / attraksjon",
+        location: loc || null,
+        description: "Et trygt valg på reisedager – sjekk åpningstider og billetter.",
+        url: makeTicketSearchUrl("Museum", loc),
+        day: stops[0]?.day ?? 1,
+        price_per_person: null,
+        currency: "NOK"
+      }
+    );
+  }
+
+  // Dedup experiences (name+location+day)
+  const seenExp = new Set();
+  const dedupedExperiences = [];
+  for (const e of experiences) {
+    const key = `${(e.name || "").toLowerCase()}|${(e.location || "").toLowerCase()}|${e.day ?? ""}`;
+    if (seenExp.has(key)) continue;
+    seenExp.add(key);
+    dedupedExperiences.push(e);
+  }
+
+  // ---------------- 6) INSERT system-trip ----------------
   const insert = await query(
     `
       INSERT INTO trips (
@@ -1270,23 +1988,25 @@ async function ensureTripForEpisode(episode, userId) {
         stops,
         packing_list,
         hotels,
+        experiences,
         source_type,
         source_episode_id,
         gallery,
         episode_url
       )
-      VALUES ($1,$2,$3,$4,$5,$6,'grenselos_episode',$7,$8,$9)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,'grenselos_episode',$8,$9,$10)
       RETURNING id
     `,
     [
       userId,
       trip.title || episode.name,
-      trip.description || episode.description,
+      trip.description || episode.description || null,
       JSON.stringify(stops),
       JSON.stringify(packingList),
       JSON.stringify(hotels),
+      JSON.stringify(dedupedExperiences),
       episode.id,
-      JSON.stringify([]),   // galleri fylles KUN via admin-endepunktene
+      JSON.stringify([]), // galleri fylles via admin-endepunktene
       episode.external_url || null
     ]
   );
@@ -1295,7 +2015,13 @@ async function ensureTripForEpisode(episode, userId) {
     "[ensureTripForEpisode] Opprettet NY system-trip for episode",
     episode.id,
     "trip_id =",
-    insert.rows[0].id
+    insert.rows[0].id,
+    "stops:",
+    stops.length,
+    "hotels:",
+    hotels.length,
+    "experiences:",
+    dedupedExperiences.length
   );
 
   return insert.rows[0].id;
@@ -1511,48 +2237,87 @@ app.post("/api/auth/signup", async (req, res) => {
 });
 
 app.get(
-  '/api/trips/:id/travel-advice',
+  "/api/trips/:id/travel-advice",
   authMiddleware,
   async (req, res) => {
     try {
-      const tripId = req.params.id;
+      const tripId = (req.params.id || "").toString().trim();
+      if (!tripId) {
+        return res.status(400).json({ error: "Mangler trip-id i URL." });
+      }
 
-      // Hent reise – bare kolonner du vet finnes
+      // Hent reise (kun kolonner vi er sikre på)
       const tripRes = await query(
         `
         SELECT id, title, description, stops
         FROM trips
         WHERE id = $1 AND user_id = $2
+        LIMIT 1
         `,
         [tripId, req.user.id]
       );
 
-      if (tripRes.rows.length === 0) {
-        return res.status(404).json({ error: 'Fant ikke denne reisen.' });
+      if (!tripRes.rows?.length) {
+        return res.status(404).json({ error: "Fant ikke denne reisen." });
       }
 
       const trip = tripRes.rows[0];
 
-      const country = await inferCountryForTrip(trip);  // 👈 viktig: await
-      const advice = await buildTravelAdviceText(country);
+      // Robust stops: kan komme som JSON-string, array, null
+      const parseJsonArray = (value) => {
+        if (!value) return [];
+        if (Array.isArray(value)) return value;
+        if (typeof value === "string") {
+          try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed) ? parsed : [];
+          } catch {
+            return [];
+          }
+        }
+        return [];
+      };
 
-      console.log('DEBUG travel-advice:', { tripId, country, adviceSnippet: advice.slice(0, 120) });
-      console.log(
-        'DEBUG travel-advice country for trip',
+      const tripNormalized = {
+        ...trip,
+        stops: parseJsonArray(trip.stops),
+      };
+
+      // Finn land + bygg råd (med trygge fallbacks)
+      let country = null;
+      try {
+        country = await inferCountryForTrip(tripNormalized);
+      } catch (err) {
+        console.warn("inferCountryForTrip feilet (fortsetter):", err?.message || err);
+        country = null;
+      }
+
+      // Hvis vi ikke klarer land: gi generelle råd
+      let advice = "";
+      try {
+        advice = await buildTravelAdviceText(country || "generelt");
+      } catch (err) {
+        console.warn("buildTravelAdviceText feilet (fallback):", err?.message || err);
+        advice =
+          "Generelle reiseråd: Sjekk pass/visumregler, reiseforsikring, lokale lover og skikker, helse/anbefalte vaksiner, og oppdaterte reiseråd fra UD. Ha digitale og fysiske kopier av viktige dokumenter, og lag en plan for betaling og nødnummer.";
+      }
+
+      console.log("DEBUG travel-advice:", {
         tripId,
-        '=>',
-        country
-      );
-        
-      res.json({
+        country,
+        adviceSnippet: (advice || "").slice(0, 120),
+      });
+
+      return res.json({
+        ok: true,
         tripId,
         country: country || null,
-        advice
+        advice: advice || "",
       });
     } catch (e) {
-      console.error('/api/trips/:id/travel-advice-feil:', e);
-      res.status(500).json({
-        error: 'Kunne ikke hente reiseråd.'
+      console.error("/api/trips/:id/travel-advice-feil:", e);
+      return res.status(500).json({
+        error: "Kunne ikke hente reiseråd.",
       });
     }
   }
@@ -2475,6 +3240,9 @@ VIKTIG OM HOTELS:
 - Hvert hotell SKAL ha "name".
 - "price_per_night" skal være et tall (omtrentlig pris per natt) i NOK hvis det er naturlig.
 - Hvis du er usikker på pris, kan "price_per_night" være null.
+
+Returner strukturert JSON med “title”, “description”, “stops”, “packing_list”, “hotels” og “experiences”.
+“experiences” er en array av opplevelser som ofte krever billett/booking, med feltene: title, location, description, og helst booking_url.
 `.trim();
 
     // --- 3) Bygg userPrompt ---
@@ -2620,12 +3388,18 @@ function normalizePackingForClient(rawPacking) {
 
 
 // ----------------------------------------------------------------------
-// 📌 API: Hent alle brukerens reiser (med canonical galleri fra episoder
-//     + generisk galleri for "fra scratch"-reiser + klikkbare hoteller)
+// 📌 API: Hent alle brukerens reiser
+//  - Canonical galleri/hoteller/pakkeliste/opplevelser for episode-reiser
+//  - Generisk galleri for "fra scratch"-reiser
+//  - Klikkbare hoteller og opplevelser (url)
+//  - 🔒 Paywall: låser hoteller/pakkeliste/opplevelser for ikke-premium (ikke antall turer)
 // ----------------------------------------------------------------------
 app.get("/api/trips", authMiddleware, async (req, res) => {
   try {
-    // 1) Hent "brukerreiser" – ikke selve system-reisene
+    // 🔑 Premium/admin = full tilgang til detaljer
+    const detailsUnlocked = !!(req.user?.is_admin || req.user?.is_premium);
+
+    // 1) Hent brukerens reiser (ikke system-trips)
     const baseRes = await query(
       `
       SELECT *
@@ -2643,7 +3417,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
 
     const rows = baseRes.rows || [];
 
-    // 2) Finn alle episoder disse reisene evt. peker på
+    // 2) Finn episode-IDs som brukerturene peker på
     const episodeIds = [
       ...new Set(
         rows
@@ -2652,10 +3426,12 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
       )
     ];
 
-    // Hjelper: parse et felt som kan være JSON-string, array eller null
+    // ---------------- Helpers ----------------
+
     const parseJsonArray = (value) => {
       if (!value) return [];
       if (Array.isArray(value)) return value;
+
       if (typeof value === "string") {
         try {
           const parsed = JSON.parse(value);
@@ -2664,17 +3440,18 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
           return [];
         }
       }
+
+      // JSON/JSONB kan komme som object (sjeldent), men hvis det ikke er array -> []
       return [];
     };
 
-    // Hjelper: sjekk URL
     const isHttpUrl = (s) => {
       if (typeof s !== "string") return false;
       const t = s.trim();
       return /^https?:\/\/\S+/i.test(t);
     };
 
-    // Hjelper: sørg for at hotell alltid har en .url som frontend kan klikke på
+    // Hoteller: alltid gi .url
     const makeHotelUrl = (h) => {
       const raw =
         (typeof h?.url === "string" && h.url.trim()) ||
@@ -2685,20 +3462,41 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
 
       if (raw) return isHttpUrl(raw) ? raw.trim() : null;
 
-      // Fallback: generer en Google Maps-søke-URL basert på navn + sted
       const name = (h?.name || h?.title || "").toString().trim();
       const location = (h?.location || h?.city || h?.area || "").toString().trim();
-
       if (!name) return null;
 
       const q = encodeURIComponent(location ? `${name} ${location}` : name);
       return `https://www.google.com/maps/search/?api=1&query=${q}`;
     };
 
-    let canonicalByEpisodeId = {};
+    // Opplevelser: alltid gi .url (billett/booking)
+    const makeExperienceUrl = (x) => {
+      const raw =
+        (typeof x?.url === "string" && x.url.trim()) ||
+        (typeof x?.booking_url === "string" && x.booking_url.trim()) ||
+        (typeof x?.ticket_url === "string" && x.ticket_url.trim()) ||
+        (typeof x?.link === "string" && x.link.trim()) ||
+        (typeof x?.external_url === "string" && x.external_url.trim()) ||
+        null;
 
+      if (raw) return isHttpUrl(raw) ? raw.trim() : null;
+
+      // Fallback: Google-søk (ofte bedre for billetter enn maps)
+      const name = (x?.name || x?.title || "").toString().trim();
+      const location = (x?.location || x?.city || x?.area || "").toString().trim();
+      if (!name) return null;
+
+      const q = encodeURIComponent(
+        location ? `${name} ${location} billetter` : `${name} billetter`
+      );
+      return `https://www.google.com/search?q=${q}`;
+    };
+
+    // 3) Hent canonical data fra SYSTEM-trips for relevante episoder
+    //    (nyeste per episode)
+    let canonicalByEpisodeId = {};
     if (episodeIds.length > 0) {
-      // 3) Hent canonical galleri / hoteller / pakkeliste fra SYSTEM-TRIPS
       const canonRes = await query(
         `
         SELECT
@@ -2706,6 +3504,7 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
           gallery,
           hotels,
           packing_list,
+          experiences,
           created_at
         FROM trips
         WHERE source_type = 'grenselos_episode'
@@ -2715,72 +3514,106 @@ app.get("/api/trips", authMiddleware, async (req, res) => {
         [episodeIds]
       );
 
-      // Bruk NYESTE system-trip per episode som canonical kilde
-      canonicalByEpisodeId = (canonRes.rows || []).reduce((acc, row) => {
-        const episodeId = row.source_episode_id;
-        if (!episodeId) return acc;
+      canonicalByEpisodeId = canonRes.rows.reduce((acc, row) => {
+        const epId = row.source_episode_id;
+        if (!epId) return acc;
 
-        if (!acc[episodeId]) {
-          acc[episodeId] = {
+        // tar første (pga ORDER BY created_at DESC)
+        if (!acc[epId]) {
+          acc[epId] = {
             gallery: parseJsonArray(row.gallery),
             hotels: parseJsonArray(row.hotels),
-            packing_list: row.packing_list
+            packing_list: row.packing_list,
+            experiences: parseJsonArray(row.experiences),
           };
         }
         return acc;
       }, {});
     }
 
-    // 4) Normaliser alle brukerreiser + legg inn canonical fallback
+    // 4) Normaliser alle brukerreiser + canonical fallback
     const trips = rows.map((row) => {
-      let stops = parseJsonArray(row.stops);
+      const stops = parseJsonArray(row.stops);
+
       let gallery = parseJsonArray(row.gallery);
       let hotels = parseJsonArray(row.hotels);
-      const packing = row.packing_list;
+      let packing = row.packing_list;
+      let experiences = parseJsonArray(row.experiences);
 
       const episodeId = row.source_episode_id;
 
       if (episodeId && canonicalByEpisodeId[episodeId]) {
-        // 🎧 Reise basert på Grenseløs-episode → bruk canonical data
         const canon = canonicalByEpisodeId[episodeId];
+
+        // 🎧 episode-reise: bruk canonical gallery/hotels/packing/experiences
         gallery = parseJsonArray(canon.gallery);
         hotels = parseJsonArray(canon.hotels);
+        packing = canon.packing_list;
+        experiences = parseJsonArray(canon.experiences);
       } else {
-        // 🧳 Vanlige KI-/manuelle reiser ("fra scratch"):
+        // 🧳 scratch/vanlig: hvis tomt galleri -> generisk
         if (!Array.isArray(gallery) || gallery.length === 0) {
           gallery = getGenericVirtualTripGallery(3);
         }
       }
 
-      // 🏨 NORMALISER HOTELLER: sørg for at alle har .url frontend kan bruke
-      hotels = (hotels || [])
+      // 🏨 Normaliser hoteller til alltid å ha .url
+      const normalizedHotels = (hotels || [])
         .filter((h) => h && typeof h === "object")
         .map((h) => ({
           ...h,
-          url: makeHotelUrl(h)
+          url: makeHotelUrl(h),
         }));
 
-      // 🌟 Normaliser pakkelista til formatet appen forventer
+      // 🎟️ Normaliser experiences til alltid å ha .url
+      const normalizedExperiences = (experiences || [])
+        .filter((x) => x && typeof x === "object")
+        .map((x) => ({
+          ...x,
+          url: makeExperienceUrl(x),
+        }));
+
+      // 🌟 Normaliser pakkeliste til format appen forventer
       const normalizedPacking = normalizePackingForClient(packing);
+
+      // 🔒 Paywall: lås detaljene hvis ikke premium/admin
+      const locked = !detailsUnlocked;
 
       return {
         ...row,
         stops,
         gallery,
-        hotels,
-        packing_list: normalizedPacking,
-        _debug: {
-          source_type: row.source_type,
-          source_episode_id: row.source_episode_id
-        }
+
+        hotels: locked ? [] : normalizedHotels,
+        experiences: locked ? [] : normalizedExperiences,
+        packing_list: locked ? [] : normalizedPacking,
+
+        // nyttig for appen (UI)
+        details_locked: locked,
+        details_preview: locked
+          ? {
+              hotels_count: normalizedHotels.length,
+              experiences_count: normalizedExperiences.length,
+              packing_categories: (normalizedPacking || [])
+                .map((g) => g?.category)
+                .filter(Boolean)
+                .slice(0, 6),
+            }
+          : null,
       };
     });
 
-    // ✅ Riktig plassering: svar etter map()
-    res.json({ trips });
+    return res.json({
+      trips,
+      entitlement: {
+        details_unlocked: detailsUnlocked,
+        is_premium: !!req.user?.is_premium,
+        is_admin: !!req.user?.is_admin,
+      },
+    });
   } catch (err) {
     console.error("/api/trips GET-feil:", err);
-    res.status(500).json({ error: "Kunne ikke hente reiser." });
+    return res.status(500).json({ error: "Kunne ikke hente reiser." });
   }
 });
 
@@ -3098,40 +3931,45 @@ function buildLocationQueriesFromStops(stops, tripTitle = "", tripDescription = 
   return expanded.slice(0, 6);
 }
 
+function sanitizeUrl(u) {
+  if (!u || typeof u !== "string") return null;
+  const s = u.trim();
+  if (!s) return null;
+
+  const withProto = /^https?:\/\//i.test(s) ? s : `https://${s}`;
+  const lower = withProto.toLowerCase();
+
+  if (
+    lower.includes("example.com") ||
+    lower.includes("example.org") ||
+    lower.includes("example.net")
+  ) return null;
+
+  // Enkel URL-validering
+  try {
+    new URL(withProto);
+    return withProto;
+  } catch {
+    return null;
+  }
+}
+
 app.post("/api/trips", authMiddleware, async (req, res) => {
   try {
-    const {
+    let {
       title,
       description,
       stops,
       packing_list,
       hotels,
-      gallery,                // 👈 Hentet fra klient hvis KI genererer galleri
+      gallery,
       source_type,
-      source_episode_id,      // 👈 ID fra Spotify-episoden
-      episode_url             // optional
+      source_episode_id,
+      episode_url,
+      experiences
     } = req.body ?? {};
 
-    if (!title || !Array.isArray(stops)) {
-      return res.status(400).json({
-        error: "Mangler title eller stops (array) i request body."
-      });
-    }
-
-    // ---------------- Kvote-sjekk ----------------
-    const { isPremium, isAdmin, tripCount, freeLimit } =
-      await getUserTripStats(req.user.id);
-
-    // Admin-brukere skal ikke stoppes av gratisgrense
-    if (!isPremium && !isAdmin && tripCount >= freeLimit) {
-      return res.status(402).json({
-        error: "Gratisgrensen er nådd.",
-        code: "FREE_LIMIT_REACHED",
-        details: { tripCount, freeLimit }
-      });
-    }
-
-    // ---------------- Normalisering ----------------
+    // ---------------- Helpers ----------------
     const parseArrayField = (value) => {
       if (!value) return [];
       if (Array.isArray(value)) return value;
@@ -3146,19 +3984,73 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       return [];
     };
 
-    let finalStops   = parseArrayField(stops);
-    let finalPacking = parseArrayField(packing_list);
-    let finalHotels  = parseArrayField(hotels);
-    let finalGallery = parseArrayField(gallery);   // 👈 Hent galleri fra klienten hvis det finnes
-    let sourceType   = null;
+    const toNum = (v) => {
+      if (typeof v === "number" && Number.isFinite(v)) return v;
+      if (typeof v === "string" && v.trim()) {
+        const n = Number(v.replace(",", "."));
+        return Number.isFinite(n) ? n : null;
+      }
+      return null;
+    };
 
+    const normalizeStops = (arr) => {
+      const a = Array.isArray(arr) ? arr : [];
+      return a
+        .filter((s) => s && typeof s === "object")
+        .map((s, idx) => {
+          const dayRaw = s.day ?? s.order ?? null;
+          const day =
+            typeof dayRaw === "number"
+              ? dayRaw
+              : toNum(dayRaw) ?? (idx + 1);
+
+          return {
+            ...s,
+            day,
+            name: (s.name || s.title || `Stopp ${idx + 1}`).toString().trim(),
+            description: (s.description || "").toString().trim(),
+            location: (s.location || s.address || s.subtitle || null)?.toString?.().trim?.() ?? s.location ?? null,
+            lat: toNum(s.lat ?? s.latitude),
+            lng: toNum(s.lng ?? s.longitude)
+          };
+        })
+        .filter((s) => s.name);
+    };
+
+    const stopHasCoords = (s) =>
+      s &&
+      typeof s === "object" &&
+      typeof s.lat === "number" &&
+      Number.isFinite(s.lat) &&
+      typeof s.lng === "number" &&
+      Number.isFinite(s.lng);
+
+    // ---------------- Normalisering ----------------
+    const rawStops = parseArrayField(stops);
+    let finalStops = normalizeStops(rawStops);
+
+    if (!title || !String(title).trim()) {
+      return res.status(400).json({ error: "Mangler title i request body." });
+    }
+    title = String(title).trim();
+
+    // Stops kan komme tomt fra preview – men for vanlige reiser krever vi stops
+    // (for episode-reiser kan vi hente stops fra system-trip under)
+    let finalPacking = parseArrayField(packing_list);
+    let finalHotels = parseArrayField(hotels);
+    let finalGallery = parseArrayField(gallery);
+    let finalExperiences = parseArrayField(experiences);
+
+    
     // ---------------- Episode-baserte reiser ----------------
+    let sourceType = null;
+
     if (source_episode_id) {
       sourceType = "user_episode_trip";
 
       const sysRes = await query(
         `
-          SELECT packing_list, hotels, gallery
+          SELECT stops, packing_list, hotels, gallery, experiences
           FROM trips
           WHERE source_type = 'grenselos_episode'
             AND source_episode_id = $1
@@ -3171,35 +4063,80 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
       if (sysRes.rowCount > 0) {
         const sys = sysRes.rows[0];
 
-        // Pakkeliste
-        if (finalPacking.length === 0) {
-          finalPacking = parseArrayField(sys.packing_list);
+        const sysStops = normalizeStops(parseArrayField(sys.stops));
+        const clientHasAnyCoords = finalStops.some(stopHasCoords);
+
+        // ✅ Viktig: hvis klienten ikke har coords (eller stops er tomme) → bruk system-stops
+        if (finalStops.length === 0 || !clientHasAnyCoords) {
+          if (sysStops.length > 0) finalStops = sysStops;
         }
 
-        // Hoteller
-        if (finalHotels.length === 0) {
-          finalHotels = parseArrayField(sys.hotels);
-        }
+        // Packing/hotels fallback fra system hvis klienten ikke sendte
+        if (finalPacking.length === 0) finalPacking = parseArrayField(sys.packing_list);
+        if (finalHotels.length === 0) finalHotels = parseArrayField(sys.hotels);
 
-        // GALLERI — alltid bruk systemets galleri for episode
+        // Galleri: alltid bruk systemets galleri hvis det finnes
         const g = parseArrayField(sys.gallery);
-        if (g.length > 0) {
-          finalGallery = g;
+        if (g.length > 0) finalGallery = g;
+
+        // Experiences: bruk systemets hvis klienten ikke har sendt
+        if (finalExperiences.length === 0) {
+          finalExperiences = parseArrayField(sys.experiences);
         }
       }
 
+      // Hvis episode-reise fortsatt mangler stops → avvis tydelig (siden kartet blir tomt uansett)
+      if (finalStops.length === 0) {
+        return res.status(400).json({
+          error:
+            "Episode-reise mangler stops. Fant heller ingen system-trip å kopiere stops fra."
+        });
+      }
     } else {
       // ---------------- Vanlige KI / scratch-reiser ----------------
       sourceType = source_type || null;
 
-      // Hvis KI har generert galleri → bruk det.
+      // For vanlige reiser må klient sende stops
+      if (finalStops.length === 0) {
+        return res.status(400).json({
+          error: "Mangler stops (array) i request body."
+        });
+      }
+
       if (finalGallery.length === 0) {
-        // Ingen KI-galleri mottatt → lag et relevant galleri fra destinasjonen.
-        // Krever at du har implementert generateGalleryForTrip().
         finalGallery = await generateGalleryForTrip(title, description, finalStops);
       }
     }
 
+    const isHttpUrl = (s) => {
+      if (typeof s !== "string") return false;
+      const t = s.trim();
+      return /^https?:\/\/\S+/i.test(t);
+    };
+
+    // Bedre enn maps for hotell: søk "hotel + sted" (funner alltid noe)
+    function makeHotelFallbackUrl(h) {
+      const name = (h?.name || h?.title || "").toString().trim();
+      const location = (h?.location || h?.city || h?.area || "").toString().trim();
+      if (!name) return null;
+          
+      const q = encodeURIComponent(location ? `${name} ${location} hotell` : `${name} hotell`);
+      return `https://www.google.com/search?q=${q}`;
+    }
+      
+    finalHotels = finalHotels.map((h) => {
+      const cleaned = sanitizeUrl(h?.url);
+      return {
+        ...h,
+        url: cleaned || makeHotelFallbackUrl(h) // ✅ alltid noe brukbart
+      };
+    });
+      
+    finalExperiences = finalExperiences.map(e => ({
+      ...e,
+      url: sanitizeUrl(e?.booking_url || e?.url || e?.ticket_url || e?.link || e?.external_url),
+    }));
+      
     // ---------------- Lagre i database ----------------
     const insert = await query(
       `
@@ -3213,40 +4150,44 @@ app.post("/api/trips", authMiddleware, async (req, res) => {
         source_type,
         source_episode_id,
         gallery,
-        episode_url
+        episode_url,
+        experiences
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
       RETURNING *
       `,
       [
-        req.user.id,
-        title,
-        description || null,
-        JSON.stringify(finalStops),
-        JSON.stringify(finalPacking),
-        JSON.stringify(finalHotels),
-        sourceType,
-        source_episode_id || null,
-        JSON.stringify(finalGallery),
-        episode_url || null
+        req.user.id, // $1
+        title, // $2
+        description ? String(description) : null, // $3
+        JSON.stringify(finalStops), // $4
+        JSON.stringify(finalPacking), // $5
+        JSON.stringify(finalHotels), // $6
+        sourceType, // $7
+        source_episode_id || null, // $8
+        JSON.stringify(finalGallery), // $9
+        episode_url || null, // $10
+        JSON.stringify(finalExperiences) // $11
       ]
     );
 
     const row = insert.rows[0];
 
-    res.status(201).json({
+    return res.status(201).json({
+      ok: true,
       trip: {
         ...row,
+        // Returnér normalisert struktur (så appen får coords med en gang)
         stops: finalStops,
         packing_list: finalPacking,
         hotels: finalHotels,
-        gallery: finalGallery
+        gallery: finalGallery,
+        experiences: finalExperiences
       }
     });
-
   } catch (e) {
     console.error("/api/trips POST-feil:", e);
-    res.status(500).json({ error: "Kunne ikke opprette reise." });
+    return res.status(500).json({ error: "Kunne ikke opprette reise." });
   }
 });
 
@@ -3552,133 +4493,224 @@ app.get('/api/grenselos/episodes', async (req, res) => {
   }
 });
 
-// -------------------------------------------------------
-//  ANALYSER ÉN EPISODE → PERSONLIG REISE + LAGRE I MINE REISER
-// -------------------------------------------------------
+// ----------------------------------------------------------------------
+// ✅ PREVIEW: Analyser episode -> lag trip (MEN IKKE lagre i DB)
+// POST /api/grenselos/episodes/:id/analyze
+// Body: { name, description, userPreferences?, useProfile?, episode_url? }
+// Return: { ok:true, trip, raw, entitlement }
+// ----------------------------------------------------------------------
 app.post(
   "/api/grenselos/episodes/:id/analyze",
   authMiddleware,
   async (req, res) => {
     try {
-      const episodeId = req.params.id;
-      const {
-        name,
-        description,
-        userPreferences,  // 💬 fritekst fra brukeren
-        useProfile        // bool – bruk profil for tilpasning
-      } = req.body ?? {};
+      const episodeId = (req.params.id || "").toString().trim();
 
+      const name =
+        typeof req.body?.name === "string" ? req.body.name.trim() : "";
+      const description =
+        typeof req.body?.description === "string"
+          ? req.body.description.trim()
+          : "";
+      const userPreferences =
+        typeof req.body?.userPreferences === "string"
+          ? req.body.userPreferences.trim()
+          : "";
+
+      const useProfile = req.body?.useProfile !== false; // default true
+      const episodeUrl =
+        typeof req.body?.episode_url === "string" && req.body.episode_url.trim()
+          ? req.body.episode_url.trim()
+          : null;
+
+      if (!episodeId) {
+        return res.status(400).json({ error: "Mangler episode-id i URL." });
+      }
       if (!name || !description) {
-        return res
-          .status(400)
-          .json({ error: "Mangler navn eller beskrivelse." });
+        return res.status(400).json({
+          error: "Mangler name eller description i request body.",
+        });
       }
 
-      console.log("🔥 ANALYZE HIT", {
-        episodeId: req.params.id,
-        userId: req.user?.id,
-        hasName: !!req.body?.name,
-        hasDesc: !!req.body?.description,
-        prefsLen: (req.body?.userPreferences || "").length,
-        useProfile: !!req.body?.useProfile
-      });
-        
-      // 1) Hent evt. profil til prompten
-      let profile = null;
-      if (useProfile && req.user && req.user.id) {
+      // 🔑 Premium/admin: detaljer kan vises (paywall på hoteller/pakkeliste/opplevelser)
+      const detailsUnlocked = !!(req.user?.is_admin || req.user?.is_premium);
+
+      // ---------------- Helpers ----------------
+      const parseJsonArray = (value) => {
+        if (!value) return [];
+        if (Array.isArray(value)) return value;
+        if (typeof value === "string") {
+          try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed) ? parsed : [];
+          } catch {
+            return [];
+          }
+        }
+        return [];
+      };
+
+      const isHttpUrl = (s) => {
+        if (typeof s !== "string") return false;
+        const t = s.trim();
+        return /^https?:\/\/\S+/i.test(t);
+      };
+
+      const sanitizeUrl = (s) => (isHttpUrl(s) ? s.trim() : null);
+
+      const makeHotelFallbackUrl = (h) => {
+        const name = (h?.name || h?.title || "").toString().trim();
+        const location = (h?.location || h?.city || h?.area || "")
+          .toString()
+          .trim();
+        if (!name) return null;
+        const q = encodeURIComponent(location ? `${name} ${location}` : name);
+        return `https://www.google.com/maps/search/?api=1&query=${q}`;
+      };
+
+      const makeExperienceFallbackUrl = (x) => {
+        const name = (x?.name || x?.title || "").toString().trim();
+        const location = (x?.location || x?.city || x?.area || "")
+          .toString()
+          .trim();
+        if (!name) return null;
+        const q = encodeURIComponent(
+          location ? `${name} ${location} billetter` : `${name} billetter`
+        );
+        return `https://www.google.com/search?q=${q}`;
+      };
+
+      // 1) Hent profil hvis ønsket
+      let userProfile = null;
+      if (useProfile) {
         try {
-          const result = await query(
+          const profRes = await query(
             `
-            SELECT
-              email,
-              full_name,
-              birth_year,
-              home_city,
-              home_country,
-              travel_style,
-              budget_per_day,
-              experience_level
-            FROM users
-            WHERE id = $1
+            SELECT full_name, home_city, home_country, birth_year, travel_style, budget_per_day, experience_level
+            FROM profiles
+            WHERE user_id = $1
+            LIMIT 1
             `,
             [req.user.id]
           );
-          profile = result.rows[0] || null;
+          userProfile = profRes.rows?.[0] || null;
         } catch (e) {
+          // Profil er optional – ikke fail hele request
           console.warn(
-            "Klarte ikke å hente profil til episode-KI-prompt:",
-            e.message
+            "Kunne ikke hente profil (fortsetter uten):",
+            e?.message || e
           );
+          userProfile = null;
         }
       }
 
-      // 2) La KI lage personlig reise basert på episode + ønsker + profil
-      const { trip, raw } = await generateTripFromEpisode({
+      // 2) Generer trip fra episode (IKKE lagre)
+      const { trip: generatedTrip, raw } = await generateTripFromEpisode({
         episodeId,
         name,
         description,
         userPreferences,
-        userProfile: profile
+        userProfile,
       });
 
-      // 3) Lagre som brukerreise (user_episode_trip) i trips-tabellen
-      const insert = await query(
-        `
-        INSERT INTO trips (
-          user_id,
-          title,
-          description,
-          stops,
-          packing_list,
-          hotels,
-          source_type,
-          source_episode_id,
-          gallery
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,'user_episode_trip',$7,$8)
-        RETURNING *
-        `,
-        [
-          req.user.id,
-          trip.title || name,
-          trip.description || description || null,
-          JSON.stringify(trip.stops || []),
-          JSON.stringify(trip.packing_list || []),
-          JSON.stringify(trip.hotels || []),
-          episodeId,
-          JSON.stringify([]) // galleri kommer fra canonical / generiske bilder senere
-        ]
-      );
+      const baseTrip =
+        generatedTrip && typeof generatedTrip === "object"
+          ? generatedTrip
+          : {
+              title: name || "Reise fra episode",
+              description: null,
+              stops: [],
+              packing_list: [],
+              hotels: [],
+              experiences: [],
+              gallery: [],
+            };
 
-      const row = insert.rows[0];
+      // 3) Normaliser felter slik klienten alltid får riktig format
+      const stops = parseJsonArray(baseTrip.stops);
+      const gallery = parseJsonArray(baseTrip.gallery);
 
-      // 4) For direkte bruk i appen: normaliser pakkeliste til klientformat
-      const clientPacking = normalizePackingForClient(trip.packing_list || []);
+      const normalizedHotels = parseJsonArray(baseTrip.hotels)
+        .filter((h) => h && typeof h === "object")
+        .map((h) => ({
+          ...h,
+          url:
+            sanitizeUrl(h?.url) ||
+            sanitizeUrl(h?.booking_url) ||
+            sanitizeUrl(h?.link) ||
+            sanitizeUrl(h?.external_url) ||
+            makeHotelFallbackUrl(h),
+        }));
 
-      const savedTrip = {
-        ...row,
-        stops: trip.stops || [],
-        hotels: trip.hotels || [],
-        gallery: [],
-        packing_list: clientPacking
+      const normalizedExperiences = parseJsonArray(baseTrip.experiences)
+        .filter((x) => x && typeof x === "object")
+        .map((x) => ({
+          ...x,
+          url:
+            sanitizeUrl(x?.url) ||
+            sanitizeUrl(x?.booking_url) ||
+            sanitizeUrl(x?.ticket_url) ||
+            sanitizeUrl(x?.link) ||
+            sanitizeUrl(x?.external_url) ||
+            makeExperienceFallbackUrl(x),
+        }));
+
+      const normalizedPacking = normalizePackingForClient(baseTrip.packing_list);
+
+      // 4) Bygg preview-trip + paywall på detaljer (ikke på antall turer)
+      const locked = !detailsUnlocked;
+
+      const previewTrip = {
+        ...baseTrip,
+
+        // viktig: ingen "id" her, siden den ikke er lagret
+        id: undefined,
+
+        title: baseTrip.title || name || "Reise fra episode",
+        stops,
+        gallery,
+
+        source_type: "user_episode_trip_preview",
+        source_episode_id: episodeId,
+        episode_url: episodeUrl,
+
+        // 🔒 Lås detaljene hvis ikke premium/admin
+        hotels: locked ? [] : normalizedHotels,
+        experiences: locked ? [] : normalizedExperiences,
+        packing_list: locked ? [] : normalizedPacking,
+
+        details_locked: locked,
+        details_preview: locked
+          ? {
+              hotels_count: normalizedHotels.length,
+              experiences_count: normalizedExperiences.length,
+              packing_categories: (normalizedPacking || [])
+                .map((g) => g?.category)
+                .filter(Boolean)
+                .slice(0, 6),
+            }
+          : null,
       };
 
-      console.log("✅ ANALYZE OK", {
-        episodeId,
-        tripId: row.id,
-        stops: (trip.stops || []).length,
-        source_type: row.source_type
-      });
-        
-      // 5) Returnér både lagret trip og rå KI-tekst (for debug om du vil)
-      res.json({
+      // 5) Returner preview
+      return res.json({
         ok: true,
-        trip: savedTrip,
-        raw
+        trip: previewTrip,
+        raw: raw || null,
+        entitlement: {
+          details_unlocked: detailsUnlocked,
+          is_premium: !!req.user?.is_premium,
+          is_admin: !!req.user?.is_admin,
+        },
       });
-    } catch (e) {
-      console.error("/api/grenselos/episodes/:id/analyze-feil:", e);
-      res.status(500).json({ error: "Analyse og lagring feilet." });
+    } catch (err) {
+      console.error(
+        "/api/grenselos/episodes/:id/analyze (preview) feil:",
+        err
+      );
+      return res
+        .status(500)
+        .json({ error: "Kunne ikke analysere episoden." });
     }
   }
 );
