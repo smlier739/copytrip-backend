@@ -14,6 +14,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { Resend } from "resend";
 import fetch from "node-fetch";
+import crypto from "crypto";
 
 dotenv.config({ override: true });
 
@@ -115,6 +116,62 @@ if (process.env.DATABASE_URL) {
 }
 
 const JWT_SECRET = process.env.JWT_SECRET || "superhemmelig-dev-token";
+
+// -------------------------------------------------------
+//  AVIASALES REAL-TIME FLIGHT SEARCH (Travelpayouts)
+// -------------------------------------------------------
+const TP_TOKEN = process.env.TP_API_TOKEN;
+const TP_MARKER = process.env.TP_MARKER;
+const TP_REAL_HOST = process.env.TP_REAL_HOST || "localhost";
+
+if (!TP_TOKEN || !TP_MARKER) {
+  console.warn("⚠️ Mangler TP_API_TOKEN/TP_MARKER. Flight Search API vil feile.");
+}
+
+// Cache (in-memory) searchId -> resultsUrl (MVP). Bytt til DB/Redis senere.
+const flightSearchCache = new Map();
+
+function getUserIp(req) {
+  // Render/Proxy: x-forwarded-for kan være "ip, ip, ip"
+  const xf = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return xf || req.socket?.remoteAddress || "127.0.0.1";
+}
+
+// Travelpayouts signatur: token + values(sortert) => MD5
+// Ref: Travelpayouts sin signatur-guide.  [oai_citation:4‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/210996008-How-to-create-a-signature-md-5?utm_source=chatgpt.com)
+function collectValuesSorted(obj) {
+  if (obj === null || obj === undefined) return [];
+  if (Array.isArray(obj)) return obj.flatMap(collectValuesSorted);
+  if (typeof obj === "object") {
+    return Object.keys(obj)
+      .sort((a, b) => a.localeCompare(b))
+      .flatMap((k) => collectValuesSorted(obj[k]));
+  }
+  return [String(obj)];
+}
+
+function makeSignature(token, bodyObj) {
+  const values = collectValuesSorted(bodyObj);
+  const base = [token, ...values].join(":");
+  return crypto.createHash("md5").update(base).digest("hex");
+}
+
+// Base headers som doc beskriver for ny search API.  [oai_citation:5‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/30565016140434-Aviasales-Flights-Search-API-real-time-and-multi-city-search?utm_source=chatgpt.com)
+function makeHeaders(req, signature) {
+  return {
+    "Content-Type": "application/json",
+    "x-affiliate-user-id": TP_TOKEN,
+    "x-signature": signature,
+    "x-real-host": TP_REAL_HOST,
+    "x-user-ip": getUserIp(req),
+  };
+}
+
+function toDdMmYyyy(iso /* YYYY-MM-DD */) {
+  const [y, m, d] = String(iso || "").split("-");
+  if (!y || !m || !d) return null;
+  return `${d}/${m}/${y}`;
+}
 
 const openaiConfig = {
   apiKey: process.env.OPENAI_API_KEY,
@@ -2405,8 +2462,6 @@ app.post("/api/auth/login", async (req, res) => {
     res.status(500).json({ error: "Kunne ikke logge inn." });
   }
 });
-
-import crypto from "crypto";
 
 // ============ FORGOT PASSWORD ============
 app.post("/api/auth/forgot-password", async (req, res) => {
@@ -5253,32 +5308,222 @@ app.delete("/api/community/posts/:id", authMiddleware, async (req, res) => {
   }
 });
 
-// Multer / upload-feil → 400 (ikke 500)
-app.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError || err?.message?.includes("tillatt")) {
-    return res.status(400).json({ error: err.message });
+// Flight search
+// -------------------------------------------------------
+//  1) START: POST /api/flights/start
+//  Body eksempel:
+//  {
+//    "currency":"NOK",
+//    "locale":"no",
+//    "trip_class":"Y",
+//    "passengers":{"adults":1,"children":0,"infants":0},
+//    "segments":[{"origin":"OSL","destination":"ROM","date":"2026-02-01"}]
+//  }
+// -------------------------------------------------------
+app.post("/api/flights/start", async (req, res) => {
+  try {
+    if (!TP_TOKEN || !TP_MARKER) {
+      return res.status(500).json({ error: "TP_API_TOKEN/TP_MARKER mangler på server." });
+    }
+
+    const body = req.body || {};
+
+    // Marker må være med i payload i følge signatur-eksemplene (brukes typisk i requests)
+    // Vi setter den inn om klienten ikke sendte den.
+    const payload = {
+      ...body,
+      marker: body.marker || TP_MARKER,
+    };
+
+    const sig = makeSignature(TP_TOKEN, payload);
+
+    const r = await axios.post(
+      "https://tickets-api.travelpayouts.com/search/affiliate/start",
+      payload,
+      { headers: makeHeaders(req, sig), timeout: 15000 }
+    );
+
+    // Forventet: search_id + results_url (API-artikkelen beskriver flyten).  [oai_citation:6‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/30565016140434-Aviasales-Flights-Search-API-real-time-and-multi-city-search?utm_source=chatgpt.com)
+    const search_id = r.data?.search_id;
+    const results_url = r.data?.results_url;
+
+    if (!search_id || !results_url) {
+      return res.status(502).json({ error: "Uventet svar fra Travelpayouts (mangler search_id/results_url)." });
+    }
+
+    // Cache for results/click
+    flightSearchCache.set(String(search_id), {
+      results_url: String(results_url).replace(/\/+$/, ""),
+      created_at: Date.now(),
+    });
+
+    return res.json({ ok: true, search_id, results_url });
+  } catch (e) {
+    console.error("❌ flights/start error:", e?.response?.data || e.message);
+    return res.status(502).json({ error: "Upstream start failed" });
   }
-  next(err);
 });
 
 // -------------------------------------------------------
-//  GLOBAL FEILHANDLER
+//  2) RESULTS: POST /api/flights/results
+//  Body: { "search_id":"...", "last_update_timestamp":0 }
+//  Poll til is_over=true.  [oai_citation:7‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/30565016140434-Aviasales-Flights-Search-API-real-time-and-multi-city-search?utm_source=chatgpt.com)
+//
+//  Tips: Kall første gang med 0, deretter send tilbake timestamp fra forrige respons.
+// -------------------------------------------------------
+app.post("/api/flights/results", async (req, res) => {
+  try {
+    if (!TP_TOKEN || !TP_MARKER) {
+      return res.status(500).json({ error: "TP_API_TOKEN/TP_MARKER mangler på server." });
+    }
+
+    const { search_id, last_update_timestamp = 0 } = req.body || {};
+    const sid = String(search_id || "").trim();
+    if (!sid) return res.status(400).json({ error: "Mangler search_id" });
+
+    const cached = flightSearchCache.get(sid);
+    if (!cached?.results_url) {
+      return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
+    }
+
+    const payload = {
+      marker: TP_MARKER,
+      search_id: sid,
+      last_update_timestamp: Number(last_update_timestamp) || 0,
+    };
+
+    const sig = makeSignature(TP_TOKEN, payload);
+
+    // results-endepunktet ligger under results_url (API-doc beskriver at du poller results).  [oai_citation:8‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/30565016140434-Aviasales-Flights-Search-API-real-time-and-multi-city-search?utm_source=chatgpt.com)
+    const url = `${cached.results_url}/search/affiliate/results`;
+
+    const r = await axios.post(url, payload, {
+      headers: makeHeaders(req, sig),
+      timeout: 20000,
+    });
+
+    return res.json({ ok: true, ...r.data });
+  } catch (e) {
+    console.error("❌ flights/results error:", e?.response?.data || e.message);
+    return res.status(502).json({ error: "Upstream results failed" });
+  }
+});
+
+// -------------------------------------------------------
+//  3) CLICK: POST /api/flights/click
+//  Body: { "search_id":"...", "proposal_id":"..." }
+//
+//  Viktig: Buy-link skal lages først når bruker klikker "Bestill".  [oai_citation:9‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/30565016140434-Aviasales-Flights-Search-API-real-time-and-multi-city-search?utm_source=chatgpt.com)
+// -------------------------------------------------------
+app.post("/api/flights/click", async (req, res) => {
+  try {
+    if (!TP_TOKEN || !TP_MARKER) {
+      return res.status(500).json({ error: "TP_API_TOKEN/TP_MARKER mangler på server." });
+    }
+
+    const { search_id, proposal_id } = req.body || {};
+    const sid = String(search_id || "").trim();
+    const pid = String(proposal_id || "").trim();
+
+    if (!sid || !pid) {
+      return res.status(400).json({ error: "Mangler search_id eller proposal_id" });
+    }
+
+    const cached = flightSearchCache.get(sid);
+    if (!cached?.results_url) {
+      return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
+    }
+
+    // Noen integrasjoner trenger marker + proposal/search i signatur også her
+    const payload = { marker: TP_MARKER, search_id: sid, proposal_id: pid };
+    const sig = makeSignature(TP_TOKEN, payload);
+
+    // Click-URL: docs beskriver at man genererer lenke ved click på forslag.  [oai_citation:10‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/30565016140434-Aviasales-Flights-Search-API-real-time-and-multi-city-search?utm_source=chatgpt.com)
+    const url = `${cached.results_url}/searches/${encodeURIComponent(sid)}/clicks/${encodeURIComponent(pid)}`;
+
+    const r = await axios.post(url, payload, {
+      headers: makeHeaders(req, sig),
+      timeout: 15000,
+    });
+
+    // Returner kjøpslenke til appen (ofte i r.data.url eller lignende)
+    return res.json({ ok: true, ...r.data });
+  } catch (e) {
+    console.error("❌ flights/click error:", e?.response?.data || e.message);
+    return res.status(502).json({ error: "Upstream click failed" });
+  }
+});
+
+// -------------------------------------------------------
+//  FLIGHTS + LOCATIONS
 // -------------------------------------------------------
 
+// GET /api/locations/suggest?q=oslo
+app.get("/api/locations/suggest", async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    if (!q) return res.json({ locations: [] });
+
+    const r = await axios.get("https://autocomplete.travelpayouts.com/places2", {
+      params: {
+        term: q,
+        locale: "no",
+        // du kan finjustere: city + airport
+        "types[]": ["city", "airport"],
+      },
+      timeout: 10000,
+    });
+
+    // Aviasales autocomplete returnerer "places" med forskjellige felt.
+    // Vi normaliserer til samme format som du allerede bruker i appen.
+    const locations = (Array.isArray(r.data) ? r.data : []).slice(0, 10).map((p) => ({
+      id: p.code,                 // bruk IATA (OSL/ROM/NYC) som ID i MVP
+      code: p.code || null,       // IATA
+      name: p.name || p.city_name || p.country_name || p.code,
+      city: p.city_name || null,
+      country: p.country_name || null,
+      type: p.type || null,       // city/airport
+      subdivision: null,
+    }));
+
+    return res.json({ locations });
+  } catch (e) {
+    console.error("TP autocomplete error:", e?.response?.data || e.message);
+    return res.status(502).json({ error: "Upstream autocomplete failed" });
+  }
+});
+
+
+// -------------------------------------------------------
+//  GLOBAL FEILHANDLER (helt nederst)
+// -------------------------------------------------------
 app.use((err, req, res, next) => {
-  if (err && (err instanceof multer.MulterError || err.message)) {
+  if (!err) return next();
+
+  // 1) Multer-feil -> 400
+  if (err instanceof multer.MulterError) {
     return res.status(400).json({ error: err.message });
   }
-  next(err);
+
+  // 2) Våre "user input" feil (du bruker bl.a. "tillatt"-teksten)
+  const msg = String(err.message || "");
+  if (msg.includes("Kun JPG, PNG og WEBP er tillatt") || msg.includes("tillatt")) {
+    return res.status(400).json({ error: msg });
+  }
+
+  // 3) Default -> 500
+  console.error("❌ Unhandled error:", err);
+  return res.status(500).json({ error: "Uventet serverfeil." });
 });
 
 // -------------------------------------------------------
 //  SERVER START
 // -------------------------------------------------------
 
+if (process.env.NODE_ENV === "production") {
+  assertEnvOrThrow();
+}
+
 app.listen(PORT, () => {
-  if (process.env.NODE_ENV === "production") {
-    assertEnvOrThrow();
-  }
   console.log(`🚀 Grenseløs Reise backend kjører på port ${PORT}`);
 });
