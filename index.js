@@ -5328,14 +5328,41 @@ app.post("/api/flights/start", async (req, res) => {
 
     const body = req.body || {};
 
-    // Marker må være med i payload i følge signatur-eksemplene (brukes typisk i requests)
-    // Vi setter den inn om klienten ikke sendte den.
+    // ✅ Støtt både gammelt "segments" (fra appen) og riktig "search_params.directions"
+    const inputDirections =
+      body?.search_params?.directions ||
+      body?.directions ||
+      body?.segments || [];
+
+    const directions = (Array.isArray(inputDirections) ? inputDirections : [])
+      .map(d => ({
+        origin: String(d?.origin || "").trim().toUpperCase(),
+        destination: String(d?.destination || "").trim().toUpperCase(),
+        date: String(d?.date || "").trim(),
+      }))
+      .filter(d => d.origin && d.destination && d.date && d.origin !== d.destination);
+
+    if (directions.length < 1) {
+      return res.status(400).json({
+        error: "Mangler directions. Send minst 1 retning: [{origin,destination,date}]",
+      });
+    }
+
     const payload = {
-      ...body,
-      marker: body.marker || TP_MARKER,
+      marker: TP_MARKER,
+      locale: body.locale || "no",
+      market_code: body.market_code || "NO",
+      currency_code: body.currency_code || body.currency || "NOK",
+      search_params: {
+        trip_class: body?.search_params?.trip_class || body.trip_class || "Y",
+        passengers: body?.search_params?.passengers || body.passengers || { adults: 1, children: 0, infants: 0 },
+        directions,
+      },
     };
 
+    // ✅ Signaturen må inn i både header og body for start, ifølge doc
     const sig = makeSignature(TP_TOKEN, payload);
+    payload.signature = sig;
 
     const r = await axios.post(
       "https://tickets-api.travelpayouts.com/search/affiliate/start",
@@ -5343,7 +5370,6 @@ app.post("/api/flights/start", async (req, res) => {
       { headers: makeHeaders(req, sig), timeout: 15000 }
     );
 
-    // Forventet: search_id + results_url (API-artikkelen beskriver flyten).  [oai_citation:6‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/30565016140434-Aviasales-Flights-Search-API-real-time-and-multi-city-search?utm_source=chatgpt.com)
     const search_id = r.data?.search_id;
     const results_url = r.data?.results_url;
 
@@ -5351,7 +5377,6 @@ app.post("/api/flights/start", async (req, res) => {
       return res.status(502).json({ error: "Uventet svar fra Travelpayouts (mangler search_id/results_url)." });
     }
 
-    // Cache for results/click
     flightSearchCache.set(String(search_id), {
       results_url: String(results_url).replace(/\/+$/, ""),
       created_at: Date.now(),
@@ -5360,7 +5385,7 @@ app.post("/api/flights/start", async (req, res) => {
     return res.json({ ok: true, search_id, results_url });
   } catch (e) {
     console.error("❌ flights/start error:", e?.response?.data || e.message);
-    return res.status(502).json({ error: "Upstream start failed" });
+    return res.status(502).json({ error: "Upstream start failed", details: e?.response?.data || null });
   }
 });
 
