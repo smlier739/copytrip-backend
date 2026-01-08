@@ -131,12 +131,6 @@ if (!TP_TOKEN || !TP_MARKER) {
 // Cache (in-memory) searchId -> resultsUrl (MVP). Bytt til DB/Redis senere.
 const flightSearchCache = new Map();
 
-function getUserIp(req) {
-  // Render/Proxy: x-forwarded-for kan være "ip, ip, ip"
-  const xf = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
-  return xf || req.socket?.remoteAddress || "127.0.0.1";
-}
-
 // Travelpayouts signatur: token + values(sortert) => MD5
 // Ref: Travelpayouts sin signatur-guide.  [oai_citation:4‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/210996008-How-to-create-a-signature-md-5?utm_source=chatgpt.com)
 function collectValuesSorted(obj) {
@@ -150,37 +144,83 @@ function collectValuesSorted(obj) {
   return [String(obj)];
 }
 
-function flattenParams(obj, prefix = "", out = []) {
+function flattenParams(obj, prefix = "") {
+  const out = [];
+
+  // helper for å lage path
+  const join = (p, k) => (p ? `${p}.${k}` : String(k));
+
+  // null/undefined: utelat
   if (obj === null || obj === undefined) return out;
 
-  // arrays: behold indeks i key path
-  if (Array.isArray(obj)) {
-    obj.forEach((v, i) => flattenParams(v, `${prefix}[${i}]`, out));
+  // Date -> ISO
+  if (obj instanceof Date) {
+    out.push([prefix, obj.toISOString()]);
     return out;
   }
 
-  // object
-  if (typeof obj === "object") {
-    Object.keys(obj).forEach((k) => {
-      if (k === "signature") return; // ikke signer signature-feltet
-      const nextPrefix = prefix ? `${prefix}.${k}` : k;
-      flattenParams(obj[k], nextPrefix, out);
+  // Primitive -> string
+  const t = typeof obj;
+  if (t === "string" || t === "number" || t === "boolean") {
+    out.push([prefix, String(obj)]);
+    return out;
+  }
+
+  // Array
+  if (Array.isArray(obj)) {
+    obj.forEach((v, i) => {
+      out.push(...flattenParams(v, join(prefix, i)));
     });
     return out;
   }
 
-  // primitive
+  // Object
+  if (t === "object") {
+    // viktig: bruk Object.keys (ikke sortér her; vi sorterer globalt etterpå)
+    for (const k of Object.keys(obj)) {
+      out.push(...flattenParams(obj[k], join(prefix, k)));
+    }
+    return out;
+  }
+
+  // fallback: stringify
   out.push([prefix, String(obj)]);
   return out;
 }
 
-function makeSignature(token, bodyObj) {
-  const pairs = flattenParams(bodyObj);
-  pairs.sort((a, b) => a[0].localeCompare(b[0])); // sorter på key path
+/**
+ * Samler ALLE primitive verdier i payload (string/number/bool),
+ * ekskluderer nøkkelen "signature", og sorterer VERDIENE alfabetisk.
+ */
+function collectValues(obj, out = []) {
+  if (obj === null || obj === undefined) return out;
 
-  const values = pairs.map(([, v]) => v);
-  const base = [token, ...values].join(":");
+  if (Array.isArray(obj)) {
+    for (const v of obj) collectValues(v, out);
+    return out;
+  }
 
+  if (typeof obj === "object") {
+    for (const [k, v] of Object.entries(obj)) {
+      if (k === "signature") continue;
+      collectValues(v, out);
+    }
+    return out;
+  }
+
+  // primitive
+  out.push(String(obj));
+  return out;
+}
+
+export function makeSignature(token, marker, bodyObj) {
+  const values = collectValues(bodyObj, []);
+
+  // Viktig: sorter VERDIENE (ikke key paths)
+  values.sort((a, b) => a.localeCompare(b, "en"));
+
+  // Doc: token + marker + alle verdier
+  const base = [String(token), String(marker), ...values].join(":");
   return crypto.createHash("md5").update(base).digest("hex");
 }
 
@@ -197,22 +237,13 @@ function getUserIp(req) {
   ).toString();
 }
 
-function makeHeaders(req, signature) {
-  if (!TP_REAL_HOST) {
-    // Sett denne i env til f.eks. bundle-id eller domenet ditt
-    // Eks: com.batong.grenselosreise (anbefalt) eller copytrip-backend.onrender.com
-    throw new Error("TP_REAL_HOST mangler (x-real-host).");
-  }
-
-  const ip = getUserIp(req);
-  if (!ip) throw new Error("Klarte ikke å bestemme bruker-IP (x-user-ip).");
-
+export function makeHeaders(req, signature) {
   return {
     "Content-Type": "application/json",
-    "x-affiliate-user-id": TP_TOKEN,   // API token (ikke marker)
+    "x-affiliate-user-id": TP_TOKEN,     // API token
     "x-signature": signature,
-    "x-real-host": TP_REAL_HOST,
-    "x-user-ip": ip,
+    "x-real-host": TP_REAL_HOST,         // domenet/app-id som er godkjent hos TP
+    "x-user-ip": getUserIp(req),         // sluttbruker-IP (fra x-forwarded-for)
   };
 }
 
@@ -5361,39 +5392,49 @@ app.delete("/api/community/posts/:id", authMiddleware, async (req, res) => {
 app.post("/api/flights/start", async (req, res) => {
   try {
     if (!TP_TOKEN || !TP_MARKER || !TP_REAL_HOST) {
-      return res.status(500).json({ error: "TP_TOKEN/TP_MARKER/TP_REAL_HOST mangler på server." });
+      return res.status(500).json({
+        error: "TP_TOKEN/TP_MARKER/TP_REAL_HOST mangler på server.",
+      });
     }
 
     const body = req.body || {};
-
-    // Appen din sender:
-    // { currency, locale, trip_class, passengers, segments:[{origin,destination,date}] }
     const segments = Array.isArray(body.segments) ? body.segments : [];
+
+    // Viktig: filtrer vekk tomme/ugyldige segments så directions ikke blir 0
+    const directions = segments
+      .map((s) => ({
+        origin: String(s?.origin || "").trim().toUpperCase(),
+        destination: String(s?.destination || "").trim().toUpperCase(),
+        date: String(s?.date || "").trim(),
+      }))
+      .filter((d) => d.origin && d.destination && d.date);
+
+    if (!directions.length) {
+      return res.status(400).json({
+        error: "Mangler segments/directions (må være minst 1 med origin/destination/date).",
+      });
+    }
+
+    if (directions.some((d) => d.origin === d.destination)) {
+      return res.status(400).json({ error: "origin og destination kan ikke være like." });
+    }
 
     const payload = {
       marker: TP_MARKER,
       locale: body.locale || "no",
       currency_code: body.currency || "NOK",
+      market_code: body.market_code || "NO", // anbefalt å sette eksplisitt
       search_params: {
-        trip_class: body.trip_class || "Y",
+        trip_class: (body.trip_class || "Y").toUpperCase(),
         passengers: body.passengers || { adults: 1, children: 0, infants: 0 },
-        directions: segments.map((s) => ({
-          origin: String(s.origin || "").toUpperCase(),
-          destination: String(s.destination || "").toUpperCase(),
-          date: String(s.date || ""),
-        })),
+        directions,
       },
     };
 
-    // Sikkerhetsvalidering før upstream
-    if (!payload.search_params.directions.length) {
-      return res.status(400).json({ error: "Mangler segments/directions (må være minst 1)." });
-    }
+    // ✅ Signatur: token + marker + alle verdier (uten signature)
+    const sig = makeSignature(TP_TOKEN, TP_MARKER, payload);
 
-    // Lag signatur over payload UTEN signature
-    const sig = makeSignature(TP_TOKEN, payload);
-
-    // Travelpayouts krever signature også i body på start
+    // Doc: for start må signature være i header OG body
     const payloadWithSig = { ...payload, signature: sig };
 
     const r = await axios.post(
@@ -5406,7 +5447,10 @@ app.post("/api/flights/start", async (req, res) => {
     const results_url = r.data?.results_url;
 
     if (!search_id || !results_url) {
-      return res.status(502).json({ error: "Uventet svar fra Travelpayouts (mangler search_id/results_url)." });
+      return res.status(502).json({
+        error: "Uventet svar fra Travelpayouts (mangler search_id/results_url).",
+        details: r.data || null,
+      });
     }
 
     flightSearchCache.set(String(search_id), {
@@ -5417,7 +5461,10 @@ app.post("/api/flights/start", async (req, res) => {
     return res.json({ ok: true, search_id, results_url });
   } catch (e) {
     console.error("❌ flights/start error:", e?.response?.data || e.message);
-    return res.status(502).json({ error: "Upstream start failed", details: e?.response?.data || null });
+    return res.status(502).json({
+      error: "Upstream start failed",
+      details: e?.response?.data || null,
+    });
   }
 });
 
