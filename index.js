@@ -150,20 +150,69 @@ function collectValuesSorted(obj) {
   return [String(obj)];
 }
 
+function flattenParams(obj, prefix = "", out = []) {
+  if (obj === null || obj === undefined) return out;
+
+  // arrays: behold indeks i key path
+  if (Array.isArray(obj)) {
+    obj.forEach((v, i) => flattenParams(v, `${prefix}[${i}]`, out));
+    return out;
+  }
+
+  // object
+  if (typeof obj === "object") {
+    Object.keys(obj).forEach((k) => {
+      if (k === "signature") return; // ikke signer signature-feltet
+      const nextPrefix = prefix ? `${prefix}.${k}` : k;
+      flattenParams(obj[k], nextPrefix, out);
+    });
+    return out;
+  }
+
+  // primitive
+  out.push([prefix, String(obj)]);
+  return out;
+}
+
 function makeSignature(token, bodyObj) {
-  const values = collectValuesSorted(bodyObj);
+  const pairs = flattenParams(bodyObj);
+  pairs.sort((a, b) => a[0].localeCompare(b[0])); // sorter på key path
+
+  const values = pairs.map(([, v]) => v);
   const base = [token, ...values].join(":");
+
   return crypto.createHash("md5").update(base).digest("hex");
 }
 
-// Base headers som doc beskriver for ny search API.  [oai_citation:5‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/30565016140434-Aviasales-Flights-Search-API-real-time-and-multi-city-search?utm_source=chatgpt.com)
+function getUserIp(req) {
+  // Render/Proxy: ta første IP i x-forwarded-for
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) return String(xff).split(",")[0].trim();
+
+  // fallback
+  return (
+    req.headers["x-real-ip"] ||
+    req.socket?.remoteAddress ||
+    ""
+  ).toString();
+}
+
 function makeHeaders(req, signature) {
+  if (!TP_REAL_HOST) {
+    // Sett denne i env til f.eks. bundle-id eller domenet ditt
+    // Eks: com.batong.grenselosreise (anbefalt) eller copytrip-backend.onrender.com
+    throw new Error("TP_REAL_HOST mangler (x-real-host).");
+  }
+
+  const ip = getUserIp(req);
+  if (!ip) throw new Error("Klarte ikke å bestemme bruker-IP (x-user-ip).");
+
   return {
     "Content-Type": "application/json",
-    "x-affiliate-user-id": TP_TOKEN,
+    "x-affiliate-user-id": TP_TOKEN,   // API token (ikke marker)
     "x-signature": signature,
     "x-real-host": TP_REAL_HOST,
-    "x-user-ip": getUserIp(req),
+    "x-user-ip": ip,
   };
 }
 
@@ -5309,64 +5358,47 @@ app.delete("/api/community/posts/:id", authMiddleware, async (req, res) => {
 });
 
 // Flight search
-// -------------------------------------------------------
-//  1) START: POST /api/flights/start
-//  Body eksempel:
-//  {
-//    "currency":"NOK",
-//    "locale":"no",
-//    "trip_class":"Y",
-//    "passengers":{"adults":1,"children":0,"infants":0},
-//    "segments":[{"origin":"OSL","destination":"ROM","date":"2026-02-01"}]
-//  }
-// -------------------------------------------------------
 app.post("/api/flights/start", async (req, res) => {
   try {
-    if (!TP_TOKEN || !TP_MARKER) {
-      return res.status(500).json({ error: "TP_API_TOKEN/TP_MARKER mangler på server." });
+    if (!TP_TOKEN || !TP_MARKER || !TP_REAL_HOST) {
+      return res.status(500).json({ error: "TP_TOKEN/TP_MARKER/TP_REAL_HOST mangler på server." });
     }
 
     const body = req.body || {};
 
-    // ✅ Støtt både gammelt "segments" (fra appen) og riktig "search_params.directions"
-    const inputDirections =
-      body?.search_params?.directions ||
-      body?.directions ||
-      body?.segments || [];
-
-    const directions = (Array.isArray(inputDirections) ? inputDirections : [])
-      .map(d => ({
-        origin: String(d?.origin || "").trim().toUpperCase(),
-        destination: String(d?.destination || "").trim().toUpperCase(),
-        date: String(d?.date || "").trim(),
-      }))
-      .filter(d => d.origin && d.destination && d.date && d.origin !== d.destination);
-
-    if (directions.length < 1) {
-      return res.status(400).json({
-        error: "Mangler directions. Send minst 1 retning: [{origin,destination,date}]",
-      });
-    }
+    // Appen din sender:
+    // { currency, locale, trip_class, passengers, segments:[{origin,destination,date}] }
+    const segments = Array.isArray(body.segments) ? body.segments : [];
 
     const payload = {
       marker: TP_MARKER,
       locale: body.locale || "no",
-      market_code: body.market_code || "NO",
-      currency_code: body.currency_code || body.currency || "NOK",
+      currency_code: body.currency || "NOK",
       search_params: {
-        trip_class: body?.search_params?.trip_class || body.trip_class || "Y",
-        passengers: body?.search_params?.passengers || body.passengers || { adults: 1, children: 0, infants: 0 },
-        directions,
+        trip_class: body.trip_class || "Y",
+        passengers: body.passengers || { adults: 1, children: 0, infants: 0 },
+        directions: segments.map((s) => ({
+          origin: String(s.origin || "").toUpperCase(),
+          destination: String(s.destination || "").toUpperCase(),
+          date: String(s.date || ""),
+        })),
       },
     };
 
-    // ✅ Signaturen må inn i både header og body for start, ifølge doc
+    // Sikkerhetsvalidering før upstream
+    if (!payload.search_params.directions.length) {
+      return res.status(400).json({ error: "Mangler segments/directions (må være minst 1)." });
+    }
+
+    // Lag signatur over payload UTEN signature
     const sig = makeSignature(TP_TOKEN, payload);
-    payload.signature = sig;
+
+    // Travelpayouts krever signature også i body på start
+    const payloadWithSig = { ...payload, signature: sig };
 
     const r = await axios.post(
       "https://tickets-api.travelpayouts.com/search/affiliate/start",
-      payload,
+      payloadWithSig,
       { headers: makeHeaders(req, sig), timeout: 15000 }
     );
 
@@ -5389,13 +5421,6 @@ app.post("/api/flights/start", async (req, res) => {
   }
 });
 
-// -------------------------------------------------------
-//  2) RESULTS: POST /api/flights/results
-//  Body: { "search_id":"...", "last_update_timestamp":0 }
-//  Poll til is_over=true.  [oai_citation:7‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/30565016140434-Aviasales-Flights-Search-API-real-time-and-multi-city-search?utm_source=chatgpt.com)
-//
-//  Tips: Kall første gang med 0, deretter send tilbake timestamp fra forrige respons.
-// -------------------------------------------------------
 app.post("/api/flights/results", async (req, res) => {
   try {
     if (!TP_TOKEN || !TP_MARKER) {
