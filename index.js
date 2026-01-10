@@ -5282,108 +5282,117 @@ app.delete("/api/community/posts/:id", authMiddleware, async (req, res) => {
 
 // routes/flights.js
 
-const TP_START_URL = "https://tickets-api.travelpayouts.com/search/affiliate/start";
+const TP_START_URL =
+  "https://tickets-api.travelpayouts.com/search/affiliate/start";
 
-export function registerFlightRoutes(app, flightSearchCache) {
-  // -------------------------
-  // START
-  // -------------------------
-  app.post("/api/flights/start", async (req, res) => {
-    try {
-      if (!tp?.token || !tp?.marker) {
-        return res.status(500).json({
-          error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_TOKEN / TRAVELPAYOUTS_MARKER mangler)",
-        });
-      }
-      if (!tp?.realHost) {
-        // Ikke alltid påkrevd, men ofte nødvendig. Bedre feilmelding enn “upstream failed”.
-        return res.status(500).json({
-          error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
-        });
-      }
-
-      const body = req.body || {};
-      const segments = Array.isArray(body.segments) ? body.segments : [];
-
-      const directions = segments
-        .map((s) => ({
-          origin: String(s?.origin || "").trim().toUpperCase(),
-          destination: String(s?.destination || "").trim().toUpperCase(),
-          date: String(s?.date || "").trim(),
-        }))
-        .filter((d) => d.origin && d.destination && d.date);
-
-      if (!directions.length) {
-        return res.status(400).json({
-          error: "Minst ett segment kreves (origin, destination, date)",
-        });
-      }
-      if (directions.some((d) => d.origin === d.destination)) {
-        return res.status(400).json({
-          error: "origin og destination kan ikke være like",
-        });
-      }
-
-      const passengers = body.passengers || {};
-      const adults = Number(passengers.adults ?? 1);
-      const children = Number(passengers.children ?? 0);
-      const infants = Number(passengers.infants ?? 0);
-
-      if (!Number.isFinite(adults) || adults < 1 || infants > adults || children < 0 || infants < 0) {
-        return res.status(400).json({ error: "Ugyldig passasjer-oppsett" });
-      }
-
-      const payload = {
-        marker: tp.marker,
-        locale: body.locale || "no",
-        currency_code: body.currency || "NOK",
-        market_code: body.market_code || "NO",
-        search_params: {
-          trip_class: String(body.trip_class || "Y").toUpperCase(),
-          passengers: { adults, children, infants },
-          directions,
-        },
-      };
-
-      const signature = makeSignature(tp.token, tp.marker, payload);
-
-      const response = await axios.post(
-        TP_START_URL,
-        { ...payload, signature },
-        {
-          headers: makeHeaders(req, signature, tp),
-          timeout: 15000,
-        }
-      );
-
-      const searchId = response.data?.search_id;
-      const resultsUrl = response.data?.results_url;
-
-      if (!searchId || !resultsUrl) {
-        return res.status(502).json({
-          error: "Ugyldig svar fra Travelpayouts (mangler search_id/results_url)",
-          details: response.data || null,
-        });
-      }
-
-      flightSearchCache.set(String(searchId), {
-        results_url: String(resultsUrl).replace(/\/+$/, ""),
-        created_at: Date.now(),
-      });
-
-      return res.json({
-        ok: true,
-        search_id: String(searchId),
-        results_url: String(resultsUrl),
-      });
-    } catch (err) {
-      console.error("❌ /api/flights/start feilet:", err?.response?.data || err?.message || err);
-      return res.status(502).json({
-        error: "Upstream start failed",
-        details: err?.response?.data || null,
+app.post("/api/flights/start", async (req, res) => {
+  try {
+    if (!tp?.token || !tp?.marker) {
+      return res.status(500).json({
+        error:
+          "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_TOKEN / TRAVELPAYOUTS_MARKER mangler)",
       });
     }
-  });
+
+    if (!tp?.realHost) {
+      return res.status(500).json({
+        error:
+          "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
+      });
+    }
+
+    const body = req.body || {};
+    const segments = Array.isArray(body.segments) ? body.segments : [];
+
+    const directions = segments
+      .map((s) => ({
+        origin: String(s?.origin || "").trim().toUpperCase(),
+        destination: String(s?.destination || "").trim().toUpperCase(),
+        date: String(s?.date || "").trim(),
+      }))
+      .filter((d) => d.origin && d.destination && d.date);
+
+    if (!directions.length) {
+      return res.status(400).json({
+        error: "Minst ett segment kreves (origin, destination, date)",
+      });
+    }
+
+    if (directions.some((d) => d.origin === d.destination)) {
+      return res.status(400).json({
+        error: "origin og destination kan ikke være like",
+      });
+    }
+
+    const passengers = body.passengers || {};
+    const adults = Number(passengers.adults ?? 1);
+    const children = Number(passengers.children ?? 0);
+    const infants = Number(passengers.infants ?? 0);
+
+    if (
+      !Number.isFinite(adults) ||
+      adults < 1 ||
+      infants > adults ||
+      children < 0 ||
+      infants < 0
+    ) {
+      return res.status(400).json({ error: "Ugyldig passasjer-oppsett" });
+    }
+
+    const payload = {
+      marker: tp.marker,
+      locale: body.locale || "no",
+      currency_code: body.currency || "NOK",
+      market_code: body.market_code || "NO",
+      search_params: {
+        trip_class: String(body.trip_class || "Y").toUpperCase(),
+        passengers: { adults, children, infants },
+        directions,
+      },
+    };
+
+    const signature = makeSignature(tp.token, tp.marker, payload);
+
+    const response = await axios.post(
+      TP_START_URL,
+      { ...payload, signature },
+      {
+        headers: makeHeaders(req, signature, tp),
+        timeout: 15000,
+      }
+    );
+
+    const { search_id, results_url } = response.data || {};
+
+    if (!search_id || !results_url) {
+      return res.status(502).json({
+        error:
+          "Ugyldig svar fra Travelpayouts (mangler search_id/results_url)",
+        details: response.data || null,
+      });
+    }
+
+    flightSearchCache.set(String(search_id), {
+      results_url: String(results_url).replace(/\/+$/, ""),
+      created_at: Date.now(),
+    });
+
+    return res.json({
+      ok: true,
+      search_id: String(search_id),
+      results_url: String(results_url),
+    });
+  } catch (err) {
+    console.error(
+      "❌ /api/flights/start feilet:",
+      err?.response?.data || err?.message || err
+    );
+    return res.status(502).json({
+      error: "Upstream start failed",
+      details: err?.response?.data || null,
+    });
+  }
+});
 
   // -------------------------
   // RESULTS (polling)
@@ -5563,23 +5572,6 @@ app.use((err, req, res, next) => {
 if (process.env.NODE_ENV === "production") {
   assertEnvOrThrow();
 }
-
-function listRoutes(app) {
-  const out = [];
-  const stack = app?._router?.stack || [];
-  for (const layer of stack) {
-    if (layer?.route?.path) {
-      const methods = Object.keys(layer.route.methods || {})
-        .filter((m) => layer.route.methods[m])
-        .map((m) => m.toUpperCase())
-        .join(",");
-      out.push(`${methods} ${layer.route.path}`);
-    }
-  }
-  return out.sort();
-}
-
-console.log("✅ ROUTES /api:", listRoutes(app).filter((r) => r.includes("/api/")));
 
 app.listen(PORT, () => {
   console.log(`🚀 Grenseløs Reise backend kjører på port ${PORT}`);
