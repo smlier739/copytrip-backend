@@ -120,137 +120,24 @@ const JWT_SECRET = process.env.JWT_SECRET || "superhemmelig-dev-token";
 // -------------------------------------------------------
 //  AVIASALES REAL-TIME FLIGHT SEARCH (Travelpayouts)
 // -------------------------------------------------------
-const TP_TOKEN = process.env.TP_API_TOKEN;
-const TP_MARKER = process.env.TP_MARKER;
-const TP_REAL_HOST = process.env.TP_REAL_HOST || "localhost";
 
-if (!TP_TOKEN || !TP_MARKER) {
-  console.warn("⚠️ Mangler TP_API_TOKEN/TP_MARKER. Flight Search API vil feile.");
+import { makeSignature, makeHeaders, travelpayoutsConfig as tp } from "../src/config/travelpayouts.js";
+
+if (!tp.token || !tp.marker || !tp.realHost) {
+  console.warn("⚠️ Mangler TRAVELPAYOUTS/T P config. Flight Search API vil feile.", {
+    hasToken: !!tp.token,
+    hasMarker: !!tp.marker,
+    hasRealHost: !!tp.realHost,
+  });
 }
 
 // Cache (in-memory) searchId -> resultsUrl (MVP). Bytt til DB/Redis senere.
-const flightSearchCache = new Map();
+export const flightSearchCache = new Map();
 
-// Travelpayouts signatur: token + values(sortert) => MD5
-// Ref: Travelpayouts sin signatur-guide.  [oai_citation:4‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/210996008-How-to-create-a-signature-md-5?utm_source=chatgpt.com)
-function collectValuesSorted(obj) {
-  if (obj === null || obj === undefined) return [];
-  if (Array.isArray(obj)) return obj.flatMap(collectValuesSorted);
-  if (typeof obj === "object") {
-    return Object.keys(obj)
-      .sort((a, b) => a.localeCompare(b))
-      .flatMap((k) => collectValuesSorted(obj[k]));
-  }
-  return [String(obj)];
-}
 
-function flattenParams(obj, prefix = "") {
-  const out = [];
-
-  // helper for å lage path
-  const join = (p, k) => (p ? `${p}.${k}` : String(k));
-
-  // null/undefined: utelat
-  if (obj === null || obj === undefined) return out;
-
-  // Date -> ISO
-  if (obj instanceof Date) {
-    out.push([prefix, obj.toISOString()]);
-    return out;
-  }
-
-  // Primitive -> string
-  const t = typeof obj;
-  if (t === "string" || t === "number" || t === "boolean") {
-    out.push([prefix, String(obj)]);
-    return out;
-  }
-
-  // Array
-  if (Array.isArray(obj)) {
-    obj.forEach((v, i) => {
-      out.push(...flattenParams(v, join(prefix, i)));
-    });
-    return out;
-  }
-
-  // Object
-  if (t === "object") {
-    // viktig: bruk Object.keys (ikke sortér her; vi sorterer globalt etterpå)
-    for (const k of Object.keys(obj)) {
-      out.push(...flattenParams(obj[k], join(prefix, k)));
-    }
-    return out;
-  }
-
-  // fallback: stringify
-  out.push([prefix, String(obj)]);
-  return out;
-}
-
-/**
- * Samler ALLE primitive verdier i payload (string/number/bool),
- * ekskluderer nøkkelen "signature", og sorterer VERDIENE alfabetisk.
- */
-function collectValues(obj, out = []) {
-  if (obj === null || obj === undefined) return out;
-
-  if (Array.isArray(obj)) {
-    for (const v of obj) collectValues(v, out);
-    return out;
-  }
-
-  if (typeof obj === "object") {
-    for (const [k, v] of Object.entries(obj)) {
-      if (k === "signature") continue;
-      collectValues(v, out);
-    }
-    return out;
-  }
-
-  // primitive
-  out.push(String(obj));
-  return out;
-}
-
-export function makeSignature(token, marker, bodyObj) {
-  const values = collectValues(bodyObj, []);
-
-  // Viktig: sorter VERDIENE (ikke key paths)
-  values.sort((a, b) => a.localeCompare(b, "en"));
-
-  // Doc: token + marker + alle verdier
-  const base = [String(token), String(marker), ...values].join(":");
-  return crypto.createHash("md5").update(base).digest("hex");
-}
-
-function getUserIp(req) {
-  // Render/Proxy: ta første IP i x-forwarded-for
-  const xff = req.headers["x-forwarded-for"];
-  if (xff) return String(xff).split(",")[0].trim();
-
-  // fallback
-  return (
-    req.headers["x-real-ip"] ||
-    req.socket?.remoteAddress ||
-    ""
-  ).toString();
-}
-
-export function makeHeaders(req, signature) {
-  return {
-    "Content-Type": "application/json",
-    "x-affiliate-user-id": TP_TOKEN,     // API token
-    "x-signature": signature,
-    "x-real-host": TP_REAL_HOST,         // domenet/app-id som er godkjent hos TP
-    "x-user-ip": getUserIp(req),         // sluttbruker-IP (fra x-forwarded-for)
-  };
-}
-
-function toDdMmYyyy(iso /* YYYY-MM-DD */) {
-  const [y, m, d] = String(iso || "").split("-");
-  if (!y || !m || !d) return null;
-  return `${d}/${m}/${y}`;
+function normalizeIp(ip) {
+  if (!ip) return "";
+  return String(ip).replace(/^::ffff:/, "");
 }
 
 const openaiConfig = {
@@ -5388,168 +5275,220 @@ app.delete("/api/community/posts/:id", authMiddleware, async (req, res) => {
   }
 });
 
-// Flight search
-app.post("/api/flights/start", async (req, res) => {
-  try {
-    if (!TP_TOKEN || !TP_MARKER || !TP_REAL_HOST) {
-      return res.status(500).json({
-        error: "TP_TOKEN/TP_MARKER/TP_REAL_HOST mangler på server.",
+// routes/flights.js
+
+const TP_START_URL = "https://tickets-api.travelpayouts.com/search/affiliate/start";
+
+export function registerFlightRoutes(app, flightSearchCache) {
+  // -------------------------
+  // START
+  // -------------------------
+  app.post("/api/flights/start", async (req, res) => {
+    try {
+      if (!tp?.token || !tp?.marker) {
+        return res.status(500).json({
+          error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_TOKEN / TRAVELPAYOUTS_MARKER mangler)",
+        });
+      }
+      if (!tp?.realHost) {
+        // Ikke alltid påkrevd, men ofte nødvendig. Bedre feilmelding enn “upstream failed”.
+        return res.status(500).json({
+          error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
+        });
+      }
+
+      const body = req.body || {};
+      const segments = Array.isArray(body.segments) ? body.segments : [];
+
+      const directions = segments
+        .map((s) => ({
+          origin: String(s?.origin || "").trim().toUpperCase(),
+          destination: String(s?.destination || "").trim().toUpperCase(),
+          date: String(s?.date || "").trim(),
+        }))
+        .filter((d) => d.origin && d.destination && d.date);
+
+      if (!directions.length) {
+        return res.status(400).json({
+          error: "Minst ett segment kreves (origin, destination, date)",
+        });
+      }
+      if (directions.some((d) => d.origin === d.destination)) {
+        return res.status(400).json({
+          error: "origin og destination kan ikke være like",
+        });
+      }
+
+      const passengers = body.passengers || {};
+      const adults = Number(passengers.adults ?? 1);
+      const children = Number(passengers.children ?? 0);
+      const infants = Number(passengers.infants ?? 0);
+
+      if (!Number.isFinite(adults) || adults < 1 || infants > adults || children < 0 || infants < 0) {
+        return res.status(400).json({ error: "Ugyldig passasjer-oppsett" });
+      }
+
+      const payload = {
+        marker: tp.marker,
+        locale: body.locale || "no",
+        currency_code: body.currency || "NOK",
+        market_code: body.market_code || "NO",
+        search_params: {
+          trip_class: String(body.trip_class || "Y").toUpperCase(),
+          passengers: { adults, children, infants },
+          directions,
+        },
+      };
+
+      const signature = makeSignature(tp.token, tp.marker, payload);
+
+      const response = await axios.post(
+        TP_START_URL,
+        { ...payload, signature },
+        {
+          headers: makeHeaders(req, signature, tp),
+          timeout: 15000,
+        }
+      );
+
+      const searchId = response.data?.search_id;
+      const resultsUrl = response.data?.results_url;
+
+      if (!searchId || !resultsUrl) {
+        return res.status(502).json({
+          error: "Ugyldig svar fra Travelpayouts (mangler search_id/results_url)",
+          details: response.data || null,
+        });
+      }
+
+      flightSearchCache.set(String(searchId), {
+        results_url: String(resultsUrl).replace(/\/+$/, ""),
+        created_at: Date.now(),
       });
-    }
 
-    const body = req.body || {};
-    const segments = Array.isArray(body.segments) ? body.segments : [];
-
-    // Viktig: filtrer vekk tomme/ugyldige segments så directions ikke blir 0
-    const directions = segments
-      .map((s) => ({
-        origin: String(s?.origin || "").trim().toUpperCase(),
-        destination: String(s?.destination || "").trim().toUpperCase(),
-        date: String(s?.date || "").trim(),
-      }))
-      .filter((d) => d.origin && d.destination && d.date);
-
-    if (!directions.length) {
-      return res.status(400).json({
-        error: "Mangler segments/directions (må være minst 1 med origin/destination/date).",
+      return res.json({
+        ok: true,
+        search_id: String(searchId),
+        results_url: String(resultsUrl),
       });
-    }
-
-    if (directions.some((d) => d.origin === d.destination)) {
-      return res.status(400).json({ error: "origin og destination kan ikke være like." });
-    }
-
-    const payload = {
-      marker: TP_MARKER,
-      locale: body.locale || "no",
-      currency_code: body.currency || "NOK",
-      market_code: body.market_code || "NO", // anbefalt å sette eksplisitt
-      search_params: {
-        trip_class: (body.trip_class || "Y").toUpperCase(),
-        passengers: body.passengers || { adults: 1, children: 0, infants: 0 },
-        directions,
-      },
-    };
-
-    // ✅ Signatur: token + marker + alle verdier (uten signature)
-    const sig = makeSignature(TP_TOKEN, TP_MARKER, payload);
-
-    // Doc: for start må signature være i header OG body
-    const payloadWithSig = { ...payload, signature: sig };
-
-    const r = await axios.post(
-      "https://tickets-api.travelpayouts.com/search/affiliate/start",
-      payloadWithSig,
-      { headers: makeHeaders(req, sig), timeout: 15000 }
-    );
-
-    const search_id = r.data?.search_id;
-    const results_url = r.data?.results_url;
-
-    if (!search_id || !results_url) {
+    } catch (err) {
+      console.error("❌ /api/flights/start feilet:", err?.response?.data || err?.message || err);
       return res.status(502).json({
-        error: "Uventet svar fra Travelpayouts (mangler search_id/results_url).",
-        details: r.data || null,
+        error: "Upstream start failed",
+        details: err?.response?.data || null,
       });
     }
+  });
 
-    flightSearchCache.set(String(search_id), {
-      results_url: String(results_url).replace(/\/+$/, ""),
-      created_at: Date.now(),
-    });
+  // -------------------------
+  // RESULTS (polling)
+  // -------------------------
+  app.post("/api/flights/results", async (req, res) => {
+    try {
+      if (!tp?.token || !tp?.marker) {
+        return res.status(500).json({
+          error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_TOKEN / TRAVELPAYOUTS_MARKER mangler)",
+        });
+      }
+      if (!tp?.realHost) {
+        return res.status(500).json({
+          error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
+        });
+      }
 
-    return res.json({ ok: true, search_id, results_url });
-  } catch (e) {
-    console.error("❌ flights/start error:", e?.response?.data || e.message);
-    return res.status(502).json({
-      error: "Upstream start failed",
-      details: e?.response?.data || null,
-    });
-  }
-});
+      const { search_id, last_update_timestamp = 0 } = req.body || {};
+      const sid = String(search_id || "").trim();
+      if (!sid) return res.status(400).json({ error: "Mangler search_id" });
 
-app.post("/api/flights/results", async (req, res) => {
-  try {
-    if (!TP_TOKEN || !TP_MARKER) {
-      return res.status(500).json({ error: "TP_API_TOKEN/TP_MARKER mangler på server." });
+      const cached = flightSearchCache.get(sid);
+      if (!cached?.results_url) {
+        return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
+      }
+
+      const payload = {
+        marker: tp.marker,
+        search_id: sid,
+        last_update_timestamp: Number(last_update_timestamp) || 0,
+      };
+
+      const signature = makeSignature(tp.token, tp.marker, payload);
+
+      const base = String(cached.results_url).replace(/\/+$/, "");
+      const url = `${base}/search/affiliate/results`;
+
+      const r = await axios.post(
+        url,
+        { ...payload, signature },
+        {
+          headers: makeHeaders(req, signature, tp),
+          timeout: 20000,
+        }
+      );
+
+      return res.json({ ok: true, ...r.data });
+    } catch (e) {
+      console.error("❌ /api/flights/results feilet:", e?.response?.data || e?.message || e);
+      return res.status(502).json({
+        error: "Upstream results failed",
+        details: e?.response?.data || null,
+      });
     }
+  });
 
-    const { search_id, last_update_timestamp = 0 } = req.body || {};
-    const sid = String(search_id || "").trim();
-    if (!sid) return res.status(400).json({ error: "Mangler search_id" });
+  // -------------------------
+  // CLICK (proposal_id) – matcher mobilen din
+  // -------------------------
+  app.post("/api/flights/click", async (req, res) => {
+    try {
+      if (!tp?.token || !tp?.marker) {
+        return res.status(500).json({
+          error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_TOKEN / TRAVELPAYOUTS_MARKER mangler)",
+        });
+      }
+      if (!tp?.realHost) {
+        return res.status(500).json({
+          error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
+        });
+      }
 
-    const cached = flightSearchCache.get(sid);
-    if (!cached?.results_url) {
-      return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
+      const { search_id, proposal_id } = req.body || {};
+      const sid = String(search_id || "").trim();
+      const pid = String(proposal_id || "").trim();
+      if (!sid || !pid) {
+        return res.status(400).json({ error: "Mangler search_id eller proposal_id" });
+      }
+
+      const cached = flightSearchCache.get(sid);
+      if (!cached?.results_url) {
+        return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
+      }
+
+      const payload = { marker: tp.marker, search_id: sid, proposal_id: pid };
+      const signature = makeSignature(tp.token, tp.marker, payload);
+
+      const base = String(cached.results_url).replace(/\/+$/, "");
+      const url = `${base}/searches/${encodeURIComponent(sid)}/clicks/${encodeURIComponent(pid)}`;
+
+      const r = await axios.post(
+        url,
+        { ...payload, signature },
+        {
+          headers: makeHeaders(req, signature, tp),
+          timeout: 15000,
+        }
+      );
+
+      // Mange svarer med { url: "..." } eller lignende – vi bare videresender alt
+      return res.json({ ok: true, ...r.data });
+    } catch (e) {
+      console.error("❌ /api/flights/click feilet:", e?.response?.data || e?.message || e);
+      return res.status(502).json({
+        error: "Upstream click failed",
+        details: e?.response?.data || null,
+      });
     }
-
-    const payload = {
-      marker: TP_MARKER,
-      search_id: sid,
-      last_update_timestamp: Number(last_update_timestamp) || 0,
-    };
-
-    const sig = makeSignature(TP_TOKEN, payload);
-
-    // results-endepunktet ligger under results_url (API-doc beskriver at du poller results).  [oai_citation:8‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/30565016140434-Aviasales-Flights-Search-API-real-time-and-multi-city-search?utm_source=chatgpt.com)
-    const url = `${cached.results_url}/search/affiliate/results`;
-
-    const r = await axios.post(url, payload, {
-      headers: makeHeaders(req, sig),
-      timeout: 20000,
-    });
-
-    return res.json({ ok: true, ...r.data });
-  } catch (e) {
-    console.error("❌ flights/results error:", e?.response?.data || e.message);
-    return res.status(502).json({ error: "Upstream results failed" });
-  }
-});
-
-// -------------------------------------------------------
-//  3) CLICK: POST /api/flights/click
-//  Body: { "search_id":"...", "proposal_id":"..." }
-//
-//  Viktig: Buy-link skal lages først når bruker klikker "Bestill".  [oai_citation:9‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/30565016140434-Aviasales-Flights-Search-API-real-time-and-multi-city-search?utm_source=chatgpt.com)
-// -------------------------------------------------------
-app.post("/api/flights/click", async (req, res) => {
-  try {
-    if (!TP_TOKEN || !TP_MARKER) {
-      return res.status(500).json({ error: "TP_API_TOKEN/TP_MARKER mangler på server." });
-    }
-
-    const { search_id, proposal_id } = req.body || {};
-    const sid = String(search_id || "").trim();
-    const pid = String(proposal_id || "").trim();
-
-    if (!sid || !pid) {
-      return res.status(400).json({ error: "Mangler search_id eller proposal_id" });
-    }
-
-    const cached = flightSearchCache.get(sid);
-    if (!cached?.results_url) {
-      return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
-    }
-
-    // Noen integrasjoner trenger marker + proposal/search i signatur også her
-    const payload = { marker: TP_MARKER, search_id: sid, proposal_id: pid };
-    const sig = makeSignature(TP_TOKEN, payload);
-
-    // Click-URL: docs beskriver at man genererer lenke ved click på forslag.  [oai_citation:10‡support.travelpayouts.com](https://support.travelpayouts.com/hc/en-us/articles/30565016140434-Aviasales-Flights-Search-API-real-time-and-multi-city-search?utm_source=chatgpt.com)
-    const url = `${cached.results_url}/searches/${encodeURIComponent(sid)}/clicks/${encodeURIComponent(pid)}`;
-
-    const r = await axios.post(url, payload, {
-      headers: makeHeaders(req, sig),
-      timeout: 15000,
-    });
-
-    // Returner kjøpslenke til appen (ofte i r.data.url eller lignende)
-    return res.json({ ok: true, ...r.data });
-  } catch (e) {
-    console.error("❌ flights/click error:", e?.response?.data || e.message);
-    return res.status(502).json({ error: "Upstream click failed" });
-  }
-});
+  });
+}
 
 // -------------------------------------------------------
 //  FLIGHTS + LOCATIONS
