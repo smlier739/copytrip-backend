@@ -47,6 +47,10 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+app.get("/api/_ping", (req, res) => {
+  res.json({ ok: true, where: "index.js", ts: Date.now() });
+});
+
 // ---------- Filopplasting for galleri / virtuell reise ----------
 
 const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, "uploads");
@@ -116,8 +120,6 @@ if (process.env.DATABASE_URL) {
 }
 
 const JWT_SECRET = process.env.JWT_SECRET || "superhemmelig-dev-token";
-
-console.log("✅ ENTRY:", import.meta.url);
 
 // -------------------------------------------------------
 //  AVIASALES REAL-TIME FLIGHT SEARCH (Travelpayouts)
@@ -3958,6 +3960,11 @@ function sanitizeUrl(u) {
   }
 }
 
+app.use((req, res, next) => {
+  console.log("➡️", req.method, req.originalUrl);
+  next();
+});
+
 app.post("/api/trips", authMiddleware, async (req, res) => {
   try {
     let {
@@ -5530,8 +5537,6 @@ app.get("/api/locations/suggest", async (req, res) => {
     return res.status(502).json({ error: "Upstream autocomplete failed" });
   }
 });
-
-console.log("✅ FLIGHTS ROUTES REGISTERED");
 
 // -------------------------------------------------------
 //  GLOBAL FEILHANDLER (helt nederst)
