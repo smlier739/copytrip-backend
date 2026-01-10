@@ -117,6 +117,8 @@ if (process.env.DATABASE_URL) {
 
 const JWT_SECRET = process.env.JWT_SECRET || "superhemmelig-dev-token";
 
+console.log("✅ ENTRY:", import.meta.url);
+
 // -------------------------------------------------------
 //  AVIASALES REAL-TIME FLIGHT SEARCH (Travelpayouts)
 // -------------------------------------------------------
@@ -5529,6 +5531,7 @@ app.get("/api/locations/suggest", async (req, res) => {
   }
 });
 
+console.log("✅ FLIGHTS ROUTES REGISTERED");
 
 // -------------------------------------------------------
 //  GLOBAL FEILHANDLER (helt nederst)
