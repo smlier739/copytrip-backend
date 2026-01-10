@@ -47,10 +47,6 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-app.get("/api/_ping", (req, res) => {
-  res.json({ ok: true, where: "index.js", ts: Date.now() });
-});
-
 // ---------- Filopplasting for galleri / virtuell reise ----------
 
 const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, "uploads");
@@ -5567,6 +5563,23 @@ app.use((err, req, res, next) => {
 if (process.env.NODE_ENV === "production") {
   assertEnvOrThrow();
 }
+
+function listRoutes(app) {
+  const out = [];
+  const stack = app?._router?.stack || [];
+  for (const layer of stack) {
+    if (layer?.route?.path) {
+      const methods = Object.keys(layer.route.methods || {})
+        .filter((m) => layer.route.methods[m])
+        .map((m) => m.toUpperCase())
+        .join(",");
+      out.push(`${methods} ${layer.route.path}`);
+    }
+  }
+  return out.sort();
+}
+
+console.log("✅ ROUTES /api:", listRoutes(app).filter((r) => r.includes("/api/")));
 
 app.listen(PORT, () => {
   console.log(`🚀 Grenseløs Reise backend kjører på port ${PORT}`);
