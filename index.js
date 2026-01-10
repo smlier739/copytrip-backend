@@ -121,7 +121,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "superhemmelig-dev-token";
 //  AVIASALES REAL-TIME FLIGHT SEARCH (Travelpayouts)
 // -------------------------------------------------------
 
-import { makeSignature, makeHeaders, travelpayoutsConfig as tp } from "../src/config/travelpayouts.js";
+import { makeSignature, makeHeaders, travelpayoutsConfig as tp } from "./src/config/travelpayouts.js";
 
 if (!tp.token || !tp.marker || !tp.realHost) {
   console.warn("⚠️ Mangler TRAVELPAYOUTS/T P config. Flight Search API vil feile.", {
