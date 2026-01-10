@@ -5365,8 +5365,8 @@ app.post("/api/flights/start", async (req, res) => {
       },
     };
 
-    const signature = makeSignature(tp.token, tp.marker, payload);
-
+    const signature = makeSignature(tp.token, payload);
+      
     const response = await axios.post(
       TP_START_URL,
       { ...payload, signature },

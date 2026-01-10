@@ -1,5 +1,4 @@
 // src/config/travelpayouts.js
-// src/config/travelpayouts.js
 import crypto from "crypto";
 
 const env = (k) => (process.env[k] || "").trim();
@@ -13,7 +12,9 @@ export const travelpayoutsConfig = {
   lang: env("TRAVELPAYOUTS_LANG") || "en",
 };
 
-function collectValues(obj, out = []) {
+// ---- SIGNATURE (KORREKT iht. Travelpayouts) ----
+// Sorter keys i objekter. Ikke sorter arrays (behold rekkefølgen).
+function collectValuesInOrder(obj, out = []) {
   if (obj === null || obj === undefined) return out;
 
   if (obj instanceof Date) {
@@ -22,31 +23,32 @@ function collectValues(obj, out = []) {
   }
 
   if (Array.isArray(obj)) {
-    for (const v of obj) collectValues(v, out);
+    for (const v of obj) collectValuesInOrder(v, out);
     return out;
   }
 
   if (typeof obj === "object") {
-    const keys = Object.keys(obj).sort((a, b) => a.localeCompare(b, "en"));
-    for (const k of keys) {
-      if (k === "signature") continue;
-      collectValues(obj[k], out);
-    }
+    const keys = Object.keys(obj)
+      .filter((k) => k !== "signature")
+      .sort((a, b) => a.localeCompare(b, "en"));
+
+    for (const k of keys) collectValuesInOrder(obj[k], out);
     return out;
   }
 
-  const s = String(obj);
-  if (s !== "") out.push(s);
+  // primitive
+  out.push(String(obj));
   return out;
 }
 
-export function makeSignature(token, marker, bodyObj) {
-  const values = collectValues(bodyObj, []);
-  values.sort((a, b) => a.localeCompare(b, "en"));
-  const base = [String(token), String(marker), ...values].join(":");
+export function makeSignature(token, bodyObj) {
+  const values = collectValuesInOrder(bodyObj, []);
+  // IKKE sorter values her – rekkefølgen kommer fra sorterte keys i payload
+  const base = [String(token), ...values].join(":");
   return crypto.createHash("md5").update(base).digest("hex");
 }
 
+// ---- HEADERS ----
 function normalizeIp(ip) {
   if (!ip) return "";
   return String(ip).replace(/^::ffff:/, "");
@@ -55,8 +57,8 @@ function normalizeIp(ip) {
 function getUserIp(req) {
   if (!req) return "";
   const xff = req.headers?.["x-forwarded-for"];
-  if (xff) return normalizeIp(String(xff).split(",")[0].trim());
-  return normalizeIp(String(req.headers?.["x-real-ip"] || req.socket?.remoteAddress || ""));
+  if (xff) return String(xff).split(",")[0].trim();
+  return String(req.headers?.["x-real-ip"] || req.socket?.remoteAddress || "");
 }
 
 export function makeHeaders(req, signature, tp = travelpayoutsConfig) {
@@ -69,11 +71,10 @@ export function makeHeaders(req, signature, tp = travelpayoutsConfig) {
     Accept: "application/json",
     "x-affiliate-user-id": tp.token,
     "x-real-host": tp.realHost,
+    "x-signature": signature,
   };
 
-  if (signature) headers["x-signature"] = signature;
-
-  const ip = getUserIp(req);
+  const ip = normalizeIp(getUserIp(req));
   if (ip) headers["x-user-ip"] = ip;
 
   return headers;
