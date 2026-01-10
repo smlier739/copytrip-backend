@@ -1,12 +1,13 @@
 // src/config/travelpayouts.js
+// src/config/travelpayouts.js
 import crypto from "crypto";
 
 const env = (k) => (process.env[k] || "").trim();
 
 export const travelpayoutsConfig = {
-  token: env("TRAVELPAYOUTS_TOKEN")
-  marker: env("TRAVELPAYOUTS_MARKER")
-  realHost: (env("TRAVELPAYOUTS_REAL_HOST")
+  token: env("TRAVELPAYOUTS_TOKEN") || env("TP_API_TOKEN"),
+  marker: env("TRAVELPAYOUTS_MARKER") || env("TP_MARKER"),
+  realHost: (env("TRAVELPAYOUTS_REAL_HOST") || env("TP_REAL_HOST"))
     .replace(/^https?:\/\//i, "")
     .replace(/\/+$/, ""),
   lang: env("TRAVELPAYOUTS_LANG") || "en",
