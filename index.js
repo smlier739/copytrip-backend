@@ -5453,8 +5453,7 @@ app.post("/api/flights/results", async (req, res) => {
     }
     if (!tp?.realHost) {
       return res.status(500).json({
-        error:
-          "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
+        error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
       });
     }
 
@@ -5464,9 +5463,7 @@ app.post("/api/flights/results", async (req, res) => {
 
     const cached = flightSearchCache.get(sid);
     if (!cached?.results_url) {
-      return res.status(404).json({
-        error: "Ukjent search_id (start på nytt).",
-      });
+      return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
     }
 
     const payload = {
@@ -5478,7 +5475,6 @@ app.post("/api/flights/results", async (req, res) => {
     const signature = makeSignature(tp.token, tp.marker, payload);
 
     const base = normalizeAbsoluteUrl(cached.results_url);
-
     if (!base) {
       return res.status(502).json({
         error: "Cached results_url er ugyldig (mangler https:// eller er tom)",
@@ -5486,26 +5482,34 @@ app.post("/api/flights/results", async (req, res) => {
       });
     }
 
-    // robust URL-bygging selv om base har path
     const url = new URL("/search/affiliate/results", base).toString();
-      
-    console.log("🔎 TP results base/url:", { base, url, sid, last_update_timestamp });
-      
-    const r = await axios.post(
+
+    console.log("🔎 TP results base/url:", {
+      base,
       url,
-      { ...payload, signature },
-      {
-        headers: makeHeaders(req, signature, tp),
-        timeout: 20000,
-      }
-    );
+      sid,
+      last_update_timestamp: payload.last_update_timestamp,
+    });
+
+    const r = await axios.post(url, { ...payload, signature }, {
+      headers: makeHeaders(req, signature, tp),
+      timeout: 20000,
+      validateStatus: (status) => (status >= 200 && status < 300) || status === 304,
+    });
+
+    if (r.status === 304) {
+      return res.json({
+        ok: true,
+        is_over: false,
+        last_update_timestamp: payload.last_update_timestamp,
+        tickets: [],
+        proposals: [],
+      });
+    }
 
     return res.json({ ok: true, ...r.data });
   } catch (e) {
-    console.error(
-      "❌ /api/flights/results feilet:",
-      e?.response?.data || e?.message || e
-    );
+    console.error("❌ /api/flights/results feilet:", e?.response?.data || e?.message || e);
     return res.status(502).json({
       error: "Upstream results failed",
       details: e?.response?.data || null,
