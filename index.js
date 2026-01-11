@@ -5266,6 +5266,27 @@ app.delete("/api/community/posts/:id", authMiddleware, async (req, res) => {
 //  AVIASALES / TRAVELPAYOUTS – FLIGHTS + LOCATIONS (index.js)
 // -------------------------------------------------------
 
+function normalizeAbsoluteUrl(u) {
+  if (!u) return "";
+  let s = String(u).trim();
+
+  // fjern trailing slashes
+  s = s.replace(/\/+$/, "");
+
+  // allerede absolutt
+  if (/^https?:\/\//i.test(s)) return s;
+
+  // //example.com/...
+  if (s.startsWith("//")) return ("https:" + s).replace(/\/+$/, "");
+
+  // hvis den starter med / så er det en path – her vet vi ikke hosten sikkert,
+  // men Travelpayouts skal normalt gi en host. Vi lar den feile tydelig.
+  if (s.startsWith("/")) return "";
+
+  // host uten scheme -> legg på https://
+  return ("https://" + s).replace(/\/+$/, "");
+}
+
 import {
   travelpayoutsConfig as tp,
   makeSignature,
@@ -5387,11 +5408,20 @@ app.post("/api/flights/start", async (req, res) => {
       });
     }
 
+    const normalizedResultsUrl = normalizeAbsoluteUrl(resultsUrl);
+
+    if (!normalizedResultsUrl) {
+      return res.status(502).json({
+        error: "Ugyldig results_url fra Travelpayouts (ikke absolutt URL)",
+        details: { resultsUrl },
+      });
+    }
+
     flightSearchCache.set(String(searchId), {
-      results_url: String(resultsUrl).replace(/\/+$/, ""),
+      results_url: normalizedResultsUrl,
       created_at: Date.now(),
     });
-
+      
     return res.json({
       ok: true,
       search_id: String(searchId),
@@ -5447,9 +5477,20 @@ app.post("/api/flights/results", async (req, res) => {
 
     const signature = makeSignature(tp.token, tp.marker, payload);
 
-    const base = String(cached.results_url).replace(/\/+$/, "");
-    const url = `${base}/search/affiliate/results`;
+    const base = normalizeAbsoluteUrl(cached.results_url);
 
+    if (!base) {
+      return res.status(502).json({
+        error: "Cached results_url er ugyldig (mangler https:// eller er tom)",
+        details: { cached_results_url: cached.results_url },
+      });
+    }
+
+    // robust URL-bygging selv om base har path
+    const url = new URL("/search/affiliate/results", base).toString();
+      
+    console.log("🔎 TP results base/url:", { base, url, sid, last_update_timestamp });
+      
     const r = await axios.post(
       url,
       { ...payload, signature },
