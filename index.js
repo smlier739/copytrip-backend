@@ -5625,7 +5625,120 @@ app.get("/api/locations/suggest", async (req, res) => {
   }
 });
 
-console.log("✅ FLIGHTS ROUTES LOADED");
+const HOTEL_CREATE_URL =
+  "https://api.travelpayouts.com/hotellook_search/v1/create_search";
+
+function toQuery(obj) {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (v === undefined || v === null) continue;
+    p.set(k, String(v));
+  }
+  return p;
+}
+
+function withChildAges(params, childAges = []) {
+  const out = { ...params };
+  const ages = Array.isArray(childAges) ? childAges : [];
+  ages.forEach((age, idx) => {
+    out[`childAge${idx + 1}`] = Number(age) || 1;
+  });
+  return out;
+}
+
+app.post("/api/hotels/start", async (req, res) => {
+  try {
+    if (!tp?.token || !tp?.marker) {
+      return res.status(500).json({ error: "Mangler TRAVELPAYOUTS_TOKEN/TRAVELPAYOUTS_MARKER" });
+    }
+
+    const body = req.body || {};
+    const iata = String(body.iata || "").trim().toUpperCase();
+    const checkIn = String(body.checkIn || "").trim();   // YYYY-MM-DD
+    const checkOut = String(body.checkOut || "").trim(); // YYYY-MM-DD
+
+    if (!iata || !checkIn || !checkOut) {
+      return res.status(400).json({ error: "Mangler iata/checkIn/checkOut" });
+    }
+
+    const adultsCount = Number(body.adultsCount ?? 2);
+    const childrenCount = Number(body.childrenCount ?? 0);
+    const childAges = Array.isArray(body.childAges) ? body.childAges : [];
+
+    const baseParams = {
+      iata,
+      checkIn,
+      checkOut,
+      adultsCount,
+      childrenCount,
+      customerIP: normalizeIp(getUserIp(req)),
+      lang: body.lang || "no_NO",
+      currency: body.currency || "NOK",
+      waitForResult: body.waitForResult ? 1 : 0,
+      marker: tp.marker,
+    };
+
+    const params = withChildAges(baseParams, childAges);
+
+    const signature = makeSignature(tp.token, tp.marker, params);
+    params.signature = signature;
+
+    const url = `${HOTEL_CREATE_URL}?${toQuery(params).toString()}`;
+
+    const r = await axios.get(url, { timeout: 20000 });
+
+    const searchId =
+      r.data?.searchId ||
+      r.data?.search_id ||
+      r.data?.data?.searchId ||
+      r.data?.data?.search_id ||
+      null;
+
+    if (!searchId) {
+      return res.status(502).json({ error: "Ugyldig svar fra create_search", details: r.data || null });
+    }
+
+    return res.json({ ok: true, searchId: String(searchId) });
+  } catch (e) {
+    console.error("❌ /api/hotels/start feilet:", e?.response?.data || e?.message || e);
+    return res.status(502).json({ error: "Upstream hotels start failed", details: e?.response?.data || null });
+  }
+});
+
+const HOTEL_RESULT_URL =
+  "https://api.travelpayouts.com/hotellook_search/v1/result";
+
+app.post("/api/hotels/results", async (req, res) => {
+  try {
+    if (!tp?.token || !tp?.marker) {
+      return res.status(500).json({ error: "Mangler TRAVELPAYOUTS_TOKEN/TRAVELPAYOUTS_MARKER" });
+    }
+
+    const body = req.body || {};
+    const searchId = String(body.searchId || "").trim();
+    if (!searchId) return res.status(400).json({ error: "Mangler searchId" });
+
+    const params = {
+      searchId,
+      limit: Number(body.limit ?? 50),
+      offset: Number(body.offset ?? 0),
+      sortBy: body.sortBy || "popularity",
+      sortAsc: body.sortAsc === 0 ? 0 : 1,
+      marker: tp.marker,
+    };
+
+    const signature = makeSignature(tp.token, tp.marker, params);
+    params.signature = signature;
+
+    const url = `${HOTEL_RESULT_URL}?${toQuery(params).toString()}`;
+
+    const r = await axios.get(url, { timeout: 20000 });
+    return res.json({ ok: true, ...r.data });
+  } catch (e) {
+    console.error("❌ /api/hotels/results feilet:", e?.response?.data || e?.message || e);
+    return res.status(502).json({ error: "Upstream hotels results failed", details: e?.response?.data || null });
+  }
+});
 
 // -------------------------------------------------------
 //  GLOBAL FEILHANDLER (helt nederst)
