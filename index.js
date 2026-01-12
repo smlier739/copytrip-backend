@@ -5508,6 +5508,13 @@ app.post("/api/flights/results", async (req, res) => {
     }
 
     return res.json({ ok: true, ...r.data });
+    console.log("TP keys:", Object.keys(r.data || {}));
+    console.log("TP has:", {
+      proposals: Array.isArray(r.data?.proposals) ? r.data.proposals.length : 0,
+      tickets: Array.isArray(r.data?.tickets) ? r.data.tickets.length : 0,
+      segments: Array.isArray(r.data?.segments) ? r.data.segments.length : 0,
+      flight_info: Array.isArray(r.data?.flight_info) ? r.data.flight_info.length : 0,
+    });
   } catch (e) {
     console.error("❌ /api/flights/results feilet:", e?.response?.data || e?.message || e);
     return res.status(502).json({
