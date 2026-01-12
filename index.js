@@ -25,6 +25,8 @@ const APP_BASE_URL = (process.env.APP_BASE_URL || "").replace(/\/+$/, "");
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const RESEND_FROM = process.env.RESEND_FROM;
 
+const flightDebugLogged = new Set();
+
 // Init Resend
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
@@ -5443,12 +5445,12 @@ app.post("/api/flights/start", async (req, res) => {
 // RESULTS – /api/flights/results
 // Body: { search_id, last_update_timestamp }
 // -------------------------
+
 app.post("/api/flights/results", async (req, res) => {
   try {
     if (!tp?.token || !tp?.marker) {
       return res.status(500).json({
-        error:
-          "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_TOKEN / TRAVELPAYOUTS_MARKER mangler)",
+        error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_TOKEN / TRAVELPAYOUTS_MARKER mangler)",
       });
     }
     if (!tp?.realHost) {
@@ -5491,11 +5493,15 @@ app.post("/api/flights/results", async (req, res) => {
       last_update_timestamp: payload.last_update_timestamp,
     });
 
-    const r = await axios.post(url, { ...payload, signature }, {
-      headers: makeHeaders(req, signature, tp),
-      timeout: 20000,
-      validateStatus: (status) => (status >= 200 && status < 300) || status === 304,
-    });
+    const r = await axios.post(
+      url,
+      { ...payload, signature },
+      {
+        headers: makeHeaders(req, signature, tp),
+        timeout: 20000,
+        validateStatus: (status) => (status >= 200 && status < 300) || status === 304,
+      }
+    );
 
     if (r.status === 304) {
       return res.json({
@@ -5507,14 +5513,40 @@ app.post("/api/flights/results", async (req, res) => {
       });
     }
 
+    // ✅ LOGG HER (før return)
+    // Logg bare én gang per search_id for å unngå spam
+    if (!flightDebugLogged.has(sid)) {
+      flightDebugLogged.add(sid);
+
+      console.log("TP keys:", Object.keys(r.data || {}));
+      console.log("TP has:", {
+        proposals: Array.isArray(r.data?.proposals) ? r.data.proposals.length : 0,
+        tickets: Array.isArray(r.data?.tickets) ? r.data.tickets.length : 0,
+        segments: Array.isArray(r.data?.segments) ? r.data.segments.length : 0,
+        flight_info: Array.isArray(r.data?.flight_info) ? r.data.flight_info.length : 0,
+        flights: Array.isArray(r.data?.flights) ? r.data.flights.length : 0,
+        airports: Array.isArray(r.data?.airports) ? r.data.airports.length : 0,
+        airlines: Array.isArray(r.data?.airlines) ? r.data.airlines.length : 0,
+      });
+
+      // (valgfritt) logg et sample-proposal for å se om det har segment_ids osv.
+      const sample =
+        (Array.isArray(r.data?.proposals) && r.data.proposals[0]) ||
+        (Array.isArray(r.data?.tickets) && r.data.tickets[0]?.proposals?.[0]) ||
+        null;
+
+      if (sample) {
+        console.log("TP sample proposal keys:", Object.keys(sample));
+        console.log("TP sample proposal (short):", {
+          id: sample.id || sample.proposal_id,
+          segment_ids: sample.segment_ids || sample.segments_ids || sample.segmentIds,
+          gate: sample.gate || sample.provider || sample.agency,
+          hasSegmentsArray: Array.isArray(sample.segments) ? sample.segments.length : 0,
+        });
+      }
+    }
+
     return res.json({ ok: true, ...r.data });
-    console.log("TP keys:", Object.keys(r.data || {}));
-    console.log("TP has:", {
-      proposals: Array.isArray(r.data?.proposals) ? r.data.proposals.length : 0,
-      tickets: Array.isArray(r.data?.tickets) ? r.data.tickets.length : 0,
-      segments: Array.isArray(r.data?.segments) ? r.data.segments.length : 0,
-      flight_info: Array.isArray(r.data?.flight_info) ? r.data.flight_info.length : 0,
-    });
   } catch (e) {
     console.error("❌ /api/flights/results feilet:", e?.response?.data || e?.message || e);
     return res.status(502).json({
