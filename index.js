@@ -5701,7 +5701,6 @@ app.post("/api/flights/results", async (req, res) => {
     offers.sort((a, b) => (a.price ?? 1e18) - (b.price ?? 1e18));
 
     console.log("✅ TP keys:", Object.keys(data));
-    const tpTs = Number(data?.last_update_timestamp) || 0;
 
     console.log("✅ TP counts:", {
       tickets: tickets.length,
