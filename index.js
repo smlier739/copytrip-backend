@@ -5512,10 +5512,10 @@ app.post("/api/flights/results", async (req, res) => {
         ok: true,
         is_over: false,
         last_update_timestamp: tsIn,
-        offers: [],
+        offers: null, // 👈 viktig: ikke tom array
       });
     }
-
+      
     const data = r.data || {};
     const tickets = Array.isArray(data.tickets) ? data.tickets : [];
     const legsArr = Array.isArray(data.flight_legs) ? data.flight_legs : [];
@@ -5618,84 +5618,103 @@ app.post("/api/flights/results", async (req, res) => {
     // ---- bygg offers ----
     const offers = [];
 
-    for (let idx = 0; idx < tickets.length; idx++) {
-      const t = tickets[idx];
-
-      // ticket id (fallback: sid:idx)
-      const ticketIdRaw =
-        t?.id ?? t?.ticket_id ?? t?.uuid ?? t?.ticketId ?? t?.uid ?? null;
-      const ticketId = ticketIdRaw != null ? String(ticketIdRaw) : `${sid}:${idx}`;
-
-      // finn leg-ids (mange varianter)
-      const legIds =
-        (Array.isArray(t?.flight_leg_ids) && t.flight_leg_ids) ||
-        (Array.isArray(t?.flightLegIds) && t.flightLegIds) ||
-        (Array.isArray(t?.flight_legs_ids) && t.flight_legs_ids) ||
-        (Array.isArray(t?.leg_ids) && t.leg_ids) ||
-        (Array.isArray(t?.legs_ids) && t.legs_ids) ||
-        (Array.isArray(t?.segment_ids) && t.segment_ids) ||
-        (Array.isArray(t?.segments_ids) && t.segments_ids) ||
-        null;
-
-      // legs kan også ligge inline på ticket
-      let legs = [];
-      if (Array.isArray(t?.flight_legs) && t.flight_legs.length) {
-        legs = t.flight_legs;
-      } else if (Array.isArray(t?.legs) && t.legs.length) {
-        legs = t.legs;
-      } else if (Array.isArray(legIds) && legIds.length) {
-        legs = legIds.map((id) => legsById.get(String(id))).filter(Boolean);
-      }
-
-      // hvis vi fortsatt ikke finner legs: lag en minimal offer basert på route i ticket (om den finnes)
-      const first = legs[0] || t || {};
-      const last = legs[legs.length - 1] || t || {};
-
-      const origin = pick(first, ["origin", "from", "origin_iata", "airport_from", "departure_airport"]) || "";
-      const destination = pick(last, ["destination", "to", "destination_iata", "airport_to", "arrival_airport"]) || "";
-
-      const dep = pick(first, ["local_departure", "departure_at", "departure_time", "depart_time", "time_departure"]);
-      const arr = pick(last, ["local_arrival", "arrival_at", "arrival_time", "arrive_time", "time_arrival"]);
-
-      const durationMins =
-        Number(t?.duration) ||
-        Number(t?.total_duration) ||
-        Number(pick(t, ["travel_time", "trip_duration"])) ||
-        Number(pick(last, ["duration", "total_duration"])) ||
-        null;
-
-      const price = pickPrice(t);
-      const currency = pickCurrency(t);
-
-      const stops = legs.length ? Math.max(0, legs.length - 1) : null;
-      const stopsText = stops === null ? "" : stops === 0 ? "Direkte" : `${stops} stopp`;
-
-      const airlineCodes = uniq(
-        legs.map((leg) =>
-          toUpper(pick(leg, ["airline", "carrier", "marketing_carrier", "carrier_code", "airline_code"]))
-        )
-      );
-      const flightNos = uniq(
-        legs.map((leg) =>
-          toUpper(pick(leg, ["flight_number", "flight_no", "number", "flightNumber", "flight_num"]))
-        )
-      );
-
-      // NB: Hvis du senere vil mappe flyselskap-navn fra data.airlines, kan vi gjøre det – først må vi få legs ut.
-      offers.push({
-        proposal_id: ticketId,
-        price: Number.isFinite(price) ? price : null,
-        currency,
-        departure_time: fmtTimeHHMM(dep),
-        arrival_time: fmtTimeHHMM(arr),
-        duration: durationMins ? fmtDuration(durationMins) : "",
-        stopsText,
-        routeSummary: origin && destination ? `${toUpper(origin)} → ${toUpper(destination)}` : "",
-        airlinesText: airlineCodes.join(", "),
-        flightNosText: flightNos.join(", "),
-        legs_count: legs.length,
-      });
-    }
+      for (let idx = 0; idx < tickets.length; idx++) {
+          const t = tickets[idx];
+          
+          // ticket id (fallback: sid:idx)
+          const ticketIdRaw =
+          t?.id ?? t?.ticket_id ?? t?.uuid ?? t?.ticketId ?? t?.uid ?? null;
+          const ticketId = ticketIdRaw != null ? String(ticketIdRaw) : `${sid}:${idx}`;
+          
+          // finn leg-ids (mange varianter)
+          const legIds =
+          (Array.isArray(t?.flight_leg_ids) && t.flight_leg_ids) ||
+          (Array.isArray(t?.flightLegIds) && t.flightLegIds) ||
+          (Array.isArray(t?.flight_legs_ids) && t.flight_legs_ids) ||
+          (Array.isArray(t?.leg_ids) && t.leg_ids) ||
+          (Array.isArray(t?.legs_ids) && t.legs_ids) ||
+          (Array.isArray(t?.segment_ids) && t.segment_ids) ||
+          (Array.isArray(t?.segments_ids) && t.segments_ids) ||
+          null;
+          
+          // legs kan også ligge inline på ticket
+          let legs = [];
+          if (Array.isArray(t?.flight_legs) && t.flight_legs.length) {
+              legs = t.flight_legs;
+          } else if (Array.isArray(t?.legs) && t.legs.length) {
+              legs = t.legs;
+          } else if (Array.isArray(legIds) && legIds.length) {
+              legs = legIds.map((id) => legsById.get(String(id))).filter(Boolean);
+          }
+          
+          // hvis vi fortsatt ikke finner legs: lag en minimal offer basert på route i ticket (om den finnes)
+          const first = legs[0] || t || {};
+          const last = legs[legs.length - 1] || t || {};
+          
+          const origin = pick(first, ["origin", "from", "origin_iata", "airport_from", "departure_airport"]) || "";
+          const destination = pick(last, ["destination", "to", "destination_iata", "airport_to", "arrival_airport"]) || "";
+          
+          const dep = pick(first, ["local_departure", "departure_at", "departure_time", "depart_time", "time_departure"]);
+          const arr = pick(last, ["local_arrival", "arrival_at", "arrival_time", "arrive_time", "time_arrival"]);
+          
+          const durationMins =
+          Number(t?.duration) ||
+          Number(t?.total_duration) ||
+          Number(pick(t, ["travel_time", "trip_duration"])) ||
+          Number(pick(last, ["duration", "total_duration"])) ||
+          null;
+          
+          const price = pickPrice(t);
+          const currency = pickCurrency(t);
+          
+          const stops = legs.length ? Math.max(0, legs.length - 1) : null;
+          const stopsText = stops === null ? "" : stops === 0 ? "Direkte" : `${stops} stopp`;
+          
+          const airlineCodes = uniq(
+                                    legs.map((leg) =>
+                                             toUpper(pick(leg, ["airline", "carrier", "marketing_carrier", "carrier_code", "airline_code"]))
+                                             )
+                                    );
+          const flightNos = uniq(
+                                 legs.map((leg) =>
+                                          toUpper(pick(leg, ["flight_number", "flight_no", "number", "flightNumber", "flight_num"]))
+                                          )
+                                 );
+          
+          // NB: Hvis du senere vil mappe flyselskap-navn fra data.airlines, kan vi gjøre det – først må vi få legs ut.
+          const proposalId = ticketId;
+          const offerId = proposalId; // 👈 viktig
+          
+          const depTime = fmtTimeHHMM(dep);
+          const arrTime = fmtTimeHHMM(arr);
+          const durationText = durationMins ? fmtDuration(durationMins) : "";
+          const routeText = origin && destination ? `${toUpper(origin)} → ${toUpper(destination)}` : "";
+          const ticketSignature = t?.signature || null;
+          
+          offers.push({
+              // 👇 APP-FELT (det appen din bruker)
+              offer_id: offerId,
+              proposal_id: proposalId,
+              signature: ticketSignature,
+              price: Number.isFinite(price) ? price : null,
+              currency,
+              depTime,
+              arrTime,
+              durationText,
+              stopsText,
+              routeText,
+              airlinesText: airlineCodes.join(", "),
+              flightNosText: flightNos.join(", "),
+              agentText: "", // kan fylles senere fra agents/gates
+              
+              // 👇 behold gjerne “gamle” felter også (ufarlig)
+              departure_time: depTime,
+              arrival_time: arrTime,
+              duration: durationText,
+              routeSummary: routeText,
+              legs_count: legs.length,
+          });
+        }
 
     // sorter billigst først (null nederst)
     offers.sort((a, b) => (a.price ?? 1e18) - (b.price ?? 1e18));
@@ -5712,19 +5731,19 @@ app.post("/api/flights/results", async (req, res) => {
       tsOut: tpTs,
     });
       
-    if (offers.length) {
-      console.log("🧪 offer[0] keys:", Object.keys(offers[0] || {}));
-      console.log("🧪 offer[0] mini:", {
-        offer_id: offers[0]?.offer_id,
-        proposal_id: offers[0]?.proposal_id,
-        price: offers[0]?.price,
-        currency: offers[0]?.currency,
-        depTime: offers[0]?.depTime,
-        arrTime: offers[0]?.arrTime,
-        routeText: offers[0]?.routeText,
-      });
-    } else {
-      console.log("⚠️ offers is empty (normalization failed or no data yet)");
+      if (offers.length) {
+          console.log("🧪 offer[0] keys:", Object.keys(offers[0] || {}));
+          console.log("🧪 offer[0] mini:", {
+              offer_id: offers[0]?.offer_id,
+              proposal_id: offers[0]?.proposal_id,
+              price: offers[0]?.price,
+              currency: offers[0]?.currency,
+              depTime: offers[0]?.depTime,
+              arrTime: offers[0]?.arrTime,
+              routeText: offers[0]?.routeText,
+          });
+      } else {
+        console.log("⚠️ offers is empty (normalization failed or no data yet)");
     }
       
     return res.json({
@@ -5749,6 +5768,8 @@ app.post("/api/flights/results", async (req, res) => {
 // - flightSearchCache (Map) fra /start
 // - flightClickCache (Map) fra /results (sid -> Map(offer_id -> click_id))
 
+// POST /api/flights/click
+// POST /api/flights/click
 app.post("/api/flights/click", async (req, res) => {
   try {
     if (!tp?.token || !tp?.marker) {
@@ -5763,126 +5784,211 @@ app.post("/api/flights/click", async (req, res) => {
       });
     }
 
-    const body = req.body || {};
-    const sid = String(body.search_id || "").trim();
+    const { search_id, offer_id, proposal_id } = req.body || {};
+    const sid = String(search_id || "").trim();
+    const clientOfferId = String(offer_id || proposal_id || "").trim(); // støtt begge
 
-    // ✅ Vi støtter både offer_id (ny) og proposal_id (gammel)
-    const offerId = String(body.offer_id || body.proposal_id || "").trim();
+    console.log("➡️ /api/flights/click called", { sid, clientOfferId });
 
-    if (!sid || !offerId) {
-      return res.status(400).json({ error: "Mangler search_id eller offer_id" });
-    }
+    if (!sid) return res.status(400).json({ error: "Mangler search_id" });
+    if (!clientOfferId) return res.status(400).json({ error: "Mangler offer_id/proposal_id" });
 
-    // Må finnes i cache fra /start, så vi vet base host
     const cached = flightSearchCache.get(sid);
     if (!cached?.results_url) {
       return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
     }
 
-    // ✅ click_id kommer fra /results-utmatingen (expanded_tickets[*].click_id)
-    const sidMap = flightClickCache?.get(sid);
-    const clickId =
-      (sidMap && sidMap.get(String(offerId))) ||
-      null;
+    const normalizeBase = (u) => normalizeAbsoluteUrl(u);
 
-    if (!clickId) {
+    const pickUrlFromObj = (o) =>
+      (o && (o.url || o.deep_link || o.deeplink || o.redirect_url || o.redirectUrl || o.link)) || null;
+
+    // ---- 1) hent fersk "full dump" av results (ts=0) for click ----
+    async function fetchFullResults() {
+      const payload = {
+        marker: tp.marker,
+        search_id: sid,
+        last_update_timestamp: 0,
+      };
+      const signature = makeSignature(tp.token, tp.marker, payload);
+
+      const base = normalizeBase(cached.results_url);
+      if (!base) {
+        return { ok: false, status: 502, error: "Cached results_url er ugyldig", details: { cached_results_url: cached.results_url } };
+      }
+
+      const url = new URL("/search/affiliate/results", base).toString();
+      console.log("🔎 TP fetch results for click:", { url, sid });
+
+      const r = await axios.post(
+        url,
+        { ...payload, signature },
+        {
+          headers: makeHeaders(req, signature, tp),
+          timeout: 20000,
+          validateStatus: (status) => (status >= 200 && status < 300) || status === 304,
+        }
+      );
+
+      if (r.status === 304) {
+        // 304 betyr "ingen nye data" – men vi trenger data for click.
+        // Dersom du ikke cacher tpData, må vi be brukeren søke på nytt.
+        return { ok: false, status: 409, error: "TP returnerte 304 på click-fetch og vi har ingen cached body. Start søket på nytt." };
+      }
+
+      return { ok: true, data: r.data || {} };
+    }
+
+    const full = await fetchFullResults();
+    if (!full.ok) {
+      return res.status(full.status || 502).json({ error: full.error, details: full.details || null });
+    }
+
+    const data = full.data;
+    const tickets = Array.isArray(data?.tickets) ? data.tickets : [];
+
+    // ---- 2) Finn riktig ticket basert på offer_id ----
+    // A) hvis offer_id er "sid:idx" -> plukk tickets[idx]
+    let ticket = null;
+    let ticketIndex = null;
+
+    const m = clientOfferId.match(/^(.+):(\d+)$/);
+    if (m && m[1] === sid) {
+      const idx = Number(m[2]);
+      if (Number.isInteger(idx) && idx >= 0 && idx < tickets.length) {
+        ticket = tickets[idx];
+        ticketIndex = idx;
+      }
+    }
+
+    // B) ellers: prøv å matche mot ekte ticket-id felter (om de finnes)
+    if (!ticket) {
+      for (let i = 0; i < tickets.length; i++) {
+        const t = tickets[i];
+        const tid =
+          t?.id ?? t?.ticket_id ?? t?.uuid ?? t?.ticketId ?? t?.uid ?? null;
+        if (tid != null && String(tid) === clientOfferId) {
+          ticket = t;
+          ticketIndex = i;
+          break;
+        }
+      }
+    }
+
+    if (!ticket) {
       return res.status(404).json({
-        error: "Fant ikke click_id for offer_id. Kjør /api/flights/results igjen først.",
-        details: { search_id: sid, offer_id: offerId },
+        error: "Fant ikke ticket for offer_id",
+        details: { sid, clientOfferId, ticketsCount: tickets.length },
       });
     }
 
-    // Travelpayouts click payload
-    const payload = {
-      marker: tp.marker,
-      search_id: sid,
-      offer_id: offerId,
-      click_id: clickId,
+    // ---- 3) Velg en proposal å klikke (vanligvis billigste/ første) ----
+    const proposals = Array.isArray(ticket?.proposals) ? ticket.proposals : [];
+    if (!proposals.length) {
+      return res.status(409).json({
+        error: "Ticket har ingen proposals (kan ikke klikke)",
+        details: { sid, clientOfferId, ticketIndex, ticketKeys: Object.keys(ticket || {}) },
+      });
+    }
+
+    // velg "beste" proposal: prøv billigst hvis pris finnes
+    const pickPriceNum = (p) => {
+      const c = p?.unified_price ?? p?.price ?? p?.total_price ?? p?.amount ?? null;
+      if (typeof c === "number" && Number.isFinite(c)) return c;
+      if (typeof c === "string" && c.trim()) {
+        const n = Number(c.replace(",", "."));
+        return Number.isFinite(n) ? n : null;
+      }
+      if (c && typeof c === "object") {
+        const v = c.amount ?? c.value ?? c.price ?? c.total ?? null;
+        const n = Number(String(v ?? "").replace(",", "."));
+        return Number.isFinite(n) ? n : null;
+      }
+      return null;
     };
 
-    const signature = makeSignature(tp.token, tp.marker, payload);
+    let chosen = proposals[0];
+    let best = pickPriceNum(chosen);
+    for (const p of proposals) {
+      const n = pickPriceNum(p);
+      if (n != null && (best == null || n < best)) {
+        best = n;
+        chosen = p;
+      }
+    }
 
-    // Bygg base fra results_url (samme region-host som results)
-    const base = normalizeAbsoluteUrl(cached.results_url);
+    // hvis TP allerede har url på proposal/ticket, bruk den direkte
+    const directUrl = pickUrlFromObj(chosen) || pickUrlFromObj(ticket);
+    if (directUrl) {
+      console.log("✅ click uses direct url", { sid, clientOfferId, ticketIndex });
+      return res.json({ ok: true, url: directUrl, source: "direct_url" });
+    }
+
+    // TP proposal-id/click-id
+    const tpProposalId =
+      chosen?.id ??
+      chosen?.proposal_id ??
+      chosen?.uuid ??
+      chosen?.proposalId ??
+      chosen?.click_id ??
+      chosen?.clickId ??
+      null;
+
+    if (!tpProposalId) {
+      return res.status(409).json({
+        error: "Mangler TP proposal_id/click_id på valgt proposal",
+        details: { sid, clientOfferId, ticketIndex, proposalKeys: Object.keys(chosen || {}) },
+      });
+    }
+
+    // ---- 4) Call TP click ----
+    const base = normalizeBase(cached.results_url);
     if (!base) {
       return res.status(502).json({
-        error: "Cached results_url er ugyldig (mangler https:// eller er tom)",
+        error: "Cached results_url er ugyldig",
         details: { cached_results_url: cached.results_url },
       });
     }
 
-    // ✅ Click-endpoint varierer litt mellom dokumentasjon/regioner.
-    // Vi prøver en robust primær-URL + fallback.
-    const primaryUrl = new URL("/search/affiliate/click", base).toString();
-    const fallbackUrl = new URL(`/searches/${encodeURIComponent(sid)}/clicks/${encodeURIComponent(clickId)}`, base).toString();
+    const clickUrl = new URL("/search/affiliate/click", base).toString();
 
-    console.log("🖱️ TP click attempt:", {
+    const clickPayload = {
+      marker: tp.marker,
+      search_id: sid,
+      proposal_id: String(tpProposalId),
+    };
+
+    const clickSignature = makeSignature(tp.token, tp.marker, clickPayload);
+
+    console.log("🖱️ TP click:", {
+      clickUrl,
       sid,
-      offerId,
-      clickId,
-      primaryUrl,
-      fallbackUrl,
+      clientOfferId,
+      ticketIndex,
+      tp_proposal_id: String(tpProposalId),
     });
 
-    // --- forsøk 1: primary ---
-    let r;
-    try {
-      r = await axios.post(
-        primaryUrl,
-        { ...payload, signature },
-        {
-          headers: makeHeaders(req, signature, tp),
-          timeout: 20000,
-          validateStatus: (status) => status >= 200 && status < 300,
-        }
-      );
-    } catch (e) {
-      const status = e?.response?.status;
-      const details = e?.response?.data || e?.message || e;
-      console.warn("⚠️ TP click primary failed:", status, details);
+    const cr = await axios.post(
+      clickUrl,
+      { ...clickPayload, signature: clickSignature },
+      {
+        headers: makeHeaders(req, clickSignature, tp),
+        timeout: 20000,
+        validateStatus: (status) => status >= 200 && status < 400,
+      }
+    );
 
-      // --- forsøk 2: fallback ---
-      r = await axios.post(
-        fallbackUrl,
-        { ...payload, signature },
-        {
-          headers: makeHeaders(req, signature, tp),
-          timeout: 20000,
-          validateStatus: (status2) => status2 >= 200 && status2 < 300,
-        }
-      );
-    }
-
-    const data = r?.data || {};
-
-    // Travelpayouts kan returnere url i ulike felter – normaliser
-    const url =
-      data.url ||
-      data.deep_link ||
-      data.deeplink ||
-      data.redirect_url ||
-      data.redirectUrl ||
-      data.link ||
-      null;
-
-    console.log("✅ TP click ok:", {
-      status: r?.status,
-      hasUrl: !!url,
-      keys: Object.keys(data || {}),
-    });
+    const url = pickUrlFromObj(cr?.data) || pickUrlFromObj(cr) || null;
 
     if (!url) {
+      console.log("⚠️ TP click response had no url", { keys: Object.keys(cr?.data || {}) });
       return res.status(502).json({
-        error: "Mangler booking-url fra Travelpayouts",
-        details: data,
+        error: "TP click manglet url",
+        details: { responseKeys: Object.keys(cr?.data || {}) },
       });
     }
 
-    return res.json({
-      ok: true,
-      url: String(url),
-      raw: data,
-    });
+    return res.json({ ok: true, url, source: "tp_click", ticketIndex });
   } catch (e) {
     console.error("❌ /api/flights/click feilet:", e?.response?.data || e?.message || e);
     return res.status(502).json({
