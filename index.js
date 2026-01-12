@@ -5454,7 +5454,7 @@ app.post("/api/flights/results", async (req, res) => {
     const sid = String(search_id || "").trim();
     const tsIn = Number(last_update_timestamp) || 0;
 
-    console.log("➡️ /api/flights/results called", { sid, last_update_timestamp: tsIn });
+    console.log("➡️ /api/flights/results called", { sid, tsIn });
 
     if (!tp?.token || !tp?.marker) {
       return res.status(500).json({
@@ -5491,7 +5491,6 @@ app.post("/api/flights/results", async (req, res) => {
     }
 
     const url = new URL("/search/affiliate/results", base).toString();
-
     console.log("🔎 TP results base/url:", { base, url, sid, ts: tsIn });
 
     const r = await axios.post(
@@ -5506,7 +5505,7 @@ app.post("/api/flights/results", async (req, res) => {
 
     console.log("✅ TP status:", r.status);
 
-    // 304: ingen body -> behold tsIn og returner tomt (frontend skal IKKE “resette”)
+    // 304: ingen body
     if (r.status === 304) {
       console.log("ℹ️ TP 304 (no new data)", { sid, tsIn });
       return res.json({
@@ -5518,44 +5517,34 @@ app.post("/api/flights/results", async (req, res) => {
     }
 
     const data = r.data || {};
-    const tpTs =
-      typeof data.last_update_timestamp === "number"
-        ? data.last_update_timestamp
-        : typeof data.last_update_timestamp === "string"
-          ? Number(data.last_update_timestamp) || tsIn
-          : tsIn;
-
-    const isOver = !!data.is_over;
-
     const tickets = Array.isArray(data.tickets) ? data.tickets : [];
     const legsArr = Array.isArray(data.flight_legs) ? data.flight_legs : [];
 
-    // index legs by id
+    // ---- timestamp: aldri la den “gå bakover” til 0 hvis tsIn allerede er høy ----
+    const tpRawTs =
+      typeof data.last_update_timestamp === "number"
+        ? data.last_update_timestamp
+        : typeof data.last_update_timestamp === "string"
+          ? Number(data.last_update_timestamp) || 0
+          : 0;
+
+    const tpTs = Math.max(tsIn, tpRawTs || 0);
+    const isOver = !!data.is_over;
+
+    // ---- index legs by id (prøv flere id-felt) ----
     const legsById = new Map();
     for (const leg of legsArr) {
-      const id = leg?.id ?? leg?._id ?? leg?.uuid;
+      const id =
+        leg?.id ??
+        leg?._id ??
+        leg?.uuid ??
+        leg?.leg_id ??
+        leg?.flight_leg_id ??
+        null;
       if (id != null) legsById.set(String(id), leg);
     }
 
-    // airlines dict (ofte objekt/map, men kan være array)
-    const airlinesDict = data.airlines;
-
-    const toAirlineName = (code) => {
-      const c = String(code || "").toUpperCase();
-      if (!c) return "";
-      // hvis airlines er objekt: { "SK": {name:"SAS"} }
-      if (airlinesDict && !Array.isArray(airlinesDict) && typeof airlinesDict === "object") {
-        const hit = airlinesDict[c];
-        return hit?.name || hit?.title || "";
-      }
-      // hvis array: [{ code:"SK", name:"SAS" }]
-      if (Array.isArray(airlinesDict)) {
-        const hit = airlinesDict.find((a) => String(a?.code || a?.iata || "").toUpperCase() === c);
-        return hit?.name || hit?.title || "";
-      }
-      return "";
-    };
-
+    // ---- små helpers ----
     const pick = (obj, keys) => {
       for (const k of keys) {
         const v = obj?.[k];
@@ -5567,9 +5556,7 @@ app.post("/api/flights/results", async (req, res) => {
     const fmtTimeHHMM = (v) => {
       if (!v) return "";
       const s = String(v);
-      // ISO
       if (s.includes("T")) return s.split("T")[1]?.slice(0, 5) || "";
-      // "YYYY-MM-DD HH:MM"
       if (s.includes(" ")) return s.split(" ")[1]?.slice(0, 5) || "";
       return s.slice(0, 5);
     };
@@ -5584,25 +5571,85 @@ app.post("/api/flights/results", async (req, res) => {
 
     const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
 
+    const toUpper = (v) => String(v || "").toUpperCase().trim();
+
+    const pickPrice = (t) => {
+      const c = t?.unified_price ?? t?.price ?? t?.total_price ?? t?.amount ?? null;
+      if (typeof c === "number" && Number.isFinite(c)) return c;
+      if (typeof c === "string" && c.trim()) {
+        const n = Number(c.replace(",", "."));
+        return Number.isFinite(n) ? n : null;
+      }
+      if (c && typeof c === "object") {
+        const v = c.amount ?? c.value ?? c.price ?? c.total ?? null;
+        const n = Number(String(v ?? "").replace(",", "."));
+        return Number.isFinite(n) ? n : null;
+      }
+      return null;
+    };
+
+    const pickCurrency = (t) => {
+      const c =
+        (typeof t?.unified_price === "object" ? t.unified_price?.currency : null) ||
+        (typeof t?.price === "object" ? t.price?.currency : null) ||
+        t?.currency ||
+        data?.search_params?.currency_code ||
+        data?.search_params?.currency ||
+        "NOK";
+      return toUpper(c || "NOK");
+    };
+
+    // ---- DEBUG: logg én sample ticket keys + id-felt (kun én gang per kall) ----
+    if (tickets[0]) {
+      const t0 = tickets[0];
+      console.log("🧪 sample ticket keys:", Object.keys(t0 || {}));
+      console.log("🧪 sample ticket id fields:", {
+        id: t0?.id,
+        ticket_id: t0?.ticket_id,
+        uuid: t0?.uuid,
+        flight_leg_ids: Array.isArray(t0?.flight_leg_ids) ? t0.flight_leg_ids.length : null,
+        flightLegIds: Array.isArray(t0?.flightLegIds) ? t0.flightLegIds.length : null,
+        leg_ids: Array.isArray(t0?.leg_ids) ? t0.leg_ids.length : null,
+        legs_ids: Array.isArray(t0?.legs_ids) ? t0.legs_ids.length : null,
+        flight_legs_inline: Array.isArray(t0?.flight_legs) ? t0.flight_legs.length : null,
+      });
+    }
+
+    // ---- bygg offers ----
     const offers = [];
 
-    for (const t of tickets) {
-      // ticket-id som click key
-      const ticketId = String(t?.id ?? t?.ticket_id ?? t?.uuid ?? "").trim();
-      if (!ticketId) continue;
+    for (let idx = 0; idx < tickets.length; idx++) {
+      const t = tickets[idx];
 
-      // finn leg-ids
+      // ticket id (fallback: sid:idx)
+      const ticketIdRaw =
+        t?.id ?? t?.ticket_id ?? t?.uuid ?? t?.ticketId ?? t?.uid ?? null;
+      const ticketId = ticketIdRaw != null ? String(ticketIdRaw) : `${sid}:${idx}`;
+
+      // finn leg-ids (mange varianter)
       const legIds =
-        Array.isArray(t?.flight_leg_ids) ? t.flight_leg_ids :
-        Array.isArray(t?.flight_legs_ids) ? t.flight_legs_ids :
-        Array.isArray(t?.leg_ids) ? t.leg_ids :
-        Array.isArray(t?.segment_ids) ? t.segment_ids :
-        [];
+        (Array.isArray(t?.flight_leg_ids) && t.flight_leg_ids) ||
+        (Array.isArray(t?.flightLegIds) && t.flightLegIds) ||
+        (Array.isArray(t?.flight_legs_ids) && t.flight_legs_ids) ||
+        (Array.isArray(t?.leg_ids) && t.leg_ids) ||
+        (Array.isArray(t?.legs_ids) && t.legs_ids) ||
+        (Array.isArray(t?.segment_ids) && t.segment_ids) ||
+        (Array.isArray(t?.segments_ids) && t.segments_ids) ||
+        null;
 
-      const legs = (legIds || []).map((id) => legsById.get(String(id))).filter(Boolean);
+      // legs kan også ligge inline på ticket
+      let legs = [];
+      if (Array.isArray(t?.flight_legs) && t.flight_legs.length) {
+        legs = t.flight_legs;
+      } else if (Array.isArray(t?.legs) && t.legs.length) {
+        legs = t.legs;
+      } else if (Array.isArray(legIds) && legIds.length) {
+        legs = legIds.map((id) => legsById.get(String(id))).filter(Boolean);
+      }
 
-      const first = legs[0] || {};
-      const last = legs[legs.length - 1] || {};
+      // hvis vi fortsatt ikke finner legs: lag en minimal offer basert på route i ticket (om den finnes)
+      const first = legs[0] || t || {};
+      const last = legs[legs.length - 1] || t || {};
 
       const origin = pick(first, ["origin", "from", "origin_iata", "airport_from", "departure_airport"]) || "";
       const destination = pick(last, ["destination", "to", "destination_iata", "airport_to", "arrival_airport"]) || "";
@@ -5610,62 +5657,47 @@ app.post("/api/flights/results", async (req, res) => {
       const dep = pick(first, ["local_departure", "departure_at", "departure_time", "depart_time", "time_departure"]);
       const arr = pick(last, ["local_arrival", "arrival_at", "arrival_time", "arrive_time", "time_arrival"]);
 
-      // pris: varierer litt
-      const priceObj = t?.unified_price || t?.price || t?.total_price || t?.amount || null;
-      const price =
-        typeof priceObj === "number"
-          ? priceObj
-          : typeof priceObj === "string"
-            ? Number(priceObj)
-            : typeof priceObj === "object"
-              ? Number(priceObj?.amount ?? priceObj?.value ?? priceObj?.price ?? priceObj?.total)
-              : null;
-
-      const currency =
-        String(
-          (typeof priceObj === "object" ? priceObj?.currency : null) ||
-            t?.currency ||
-            data?.search_params?.currency_code ||
-            "NOK"
-        ).toUpperCase();
-
       const durationMins =
         Number(t?.duration) ||
         Number(t?.total_duration) ||
+        Number(pick(t, ["travel_time", "trip_duration"])) ||
         Number(pick(last, ["duration", "total_duration"])) ||
         null;
+
+      const price = pickPrice(t);
+      const currency = pickCurrency(t);
 
       const stops = legs.length ? Math.max(0, legs.length - 1) : null;
       const stopsText = stops === null ? "" : stops === 0 ? "Direkte" : `${stops} stopp`;
 
       const airlineCodes = uniq(
-        legs.map((leg) => String(pick(leg, ["airline", "carrier", "marketing_carrier", "carrier_code"]) || "").toUpperCase())
+        legs.map((leg) =>
+          toUpper(pick(leg, ["airline", "carrier", "marketing_carrier", "carrier_code", "airline_code"]))
+        )
       );
-
-      const airlineNames = uniq(airlineCodes.map(toAirlineName)).filter(Boolean);
-
       const flightNos = uniq(
-        legs.map((leg) => String(pick(leg, ["flight_number", "flight_no", "number", "flightNumber"]) || "").toUpperCase())
+        legs.map((leg) =>
+          toUpper(pick(leg, ["flight_number", "flight_no", "number", "flightNumber", "flight_num"]))
+        )
       );
 
-      const routeSummary = origin && destination ? `${origin} → ${destination}` : "";
-
+      // NB: Hvis du senere vil mappe flyselskap-navn fra data.airlines, kan vi gjøre det – først må vi få legs ut.
       offers.push({
-        proposal_id: ticketId, // 👈 appen bruker dette i /click
+        proposal_id: ticketId,
         price: Number.isFinite(price) ? price : null,
         currency,
         departure_time: fmtTimeHHMM(dep),
         arrival_time: fmtTimeHHMM(arr),
         duration: durationMins ? fmtDuration(durationMins) : "",
         stopsText,
-        routeSummary,
-        airlinesText: airlineNames.length ? airlineNames.join(", ") : airlineCodes.join(", "),
+        routeSummary: origin && destination ? `${toUpper(origin)} → ${toUpper(destination)}` : "",
+        airlinesText: airlineCodes.join(", "),
         flightNosText: flightNos.join(", "),
         legs_count: legs.length,
       });
     }
 
-    // sorter billigst først
+    // sorter billigst først (null nederst)
     offers.sort((a, b) => (a.price ?? 1e18) - (b.price ?? 1e18));
 
     console.log("✅ TP keys:", Object.keys(data));
@@ -5674,7 +5706,9 @@ app.post("/api/flights/results", async (req, res) => {
       flight_legs: legsArr.length,
       offers: offers.length,
       is_over: isOver,
-      last_update_timestamp: tpTs,
+      tpRawTs,
+      tsIn,
+      tsOut: tpTs,
     });
 
     return res.json({
@@ -5682,8 +5716,6 @@ app.post("/api/flights/results", async (req, res) => {
       is_over: isOver,
       last_update_timestamp: tpTs,
       offers,
-      // (valgfritt) send med raw om du trenger mer senere
-      // raw: data,
     });
   } catch (e) {
     console.error("❌ /api/flights/results feilet:", e?.response?.data || e?.message || e);
