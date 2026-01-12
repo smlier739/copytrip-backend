@@ -5701,16 +5701,33 @@ app.post("/api/flights/results", async (req, res) => {
     offers.sort((a, b) => (a.price ?? 1e18) - (b.price ?? 1e18));
 
     console.log("✅ TP keys:", Object.keys(data));
+    const tpTs = Number(data?.last_update_timestamp) || 0;
+
     console.log("✅ TP counts:", {
       tickets: tickets.length,
       flight_legs: legsArr.length,
       offers: offers.length,
       is_over: isOver,
-      tpRawTs,
+      tpRawTs: data?.last_update_timestamp,
       tsIn,
       tsOut: tpTs,
     });
-
+      
+    if (offers.length) {
+      console.log("🧪 offer[0] keys:", Object.keys(offers[0] || {}));
+      console.log("🧪 offer[0] mini:", {
+        offer_id: offers[0]?.offer_id,
+        proposal_id: offers[0]?.proposal_id,
+        price: offers[0]?.price,
+        currency: offers[0]?.currency,
+        depTime: offers[0]?.depTime,
+        arrTime: offers[0]?.arrTime,
+        routeText: offers[0]?.routeText,
+      });
+    } else {
+      console.log("⚠️ offers is empty (normalization failed or no data yet)");
+    }
+      
     return res.json({
       ok: true,
       is_over: isOver,
