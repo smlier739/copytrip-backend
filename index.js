@@ -5545,6 +5545,54 @@ app.post("/api/flights/results", async (req, res) => {
       console.log("⚠️ TP sample proposal: none found");
     }
 
+    function indexById(arr) {
+      const m = new Map();
+      for (const x of Array.isArray(arr) ? arr : []) {
+        const id = x?.id ?? x?._id ?? x?.uuid;
+        if (id) m.set(String(id), x);
+      }
+      return m;
+    }
+
+    function expandProposal(p, dicts) {
+      if (!p || typeof p !== "object") return p;
+
+      const segmentIds =
+        p.segment_ids || p.segments_ids || p.segmentIds || p.segmentsIds || null;
+
+      if (!Array.isArray(segmentIds) || !segmentIds.length) return p;
+
+      const segments = segmentIds
+        .map((id) => dicts.segments.get(String(id)))
+        .filter(Boolean);
+
+      return { ...p, segments };
+    }
+
+    // ... etter axios-kallet:
+    const data = r.data || {};
+    const dicts = {
+      segments: indexById(data.segments),
+      airports: indexById(data.airports),
+      airlines: indexById(data.airlines),
+    };
+
+    const proposals = Array.isArray(data.proposals) ? data.proposals : [];
+    const expanded_proposals = proposals.map((p) => expandProposal(p, dicts));
+
+    console.error("✅ TP expand:", {
+      proposals: proposals.length,
+      expandedSegmentsFirst:
+        expanded_proposals?.[0]?.segments?.length || 0,
+      keys: Object.keys(data),
+    });
+
+    return res.json({
+      ok: true,
+      ...data,
+      expanded_proposals, // 👈 bruk denne i appen
+    });
+      
     return res.json({ ok: true, ...r.data });
   } catch (e) {
     console.error("❌ /api/flights/results feilet:", e?.response?.data || e?.message || e);
