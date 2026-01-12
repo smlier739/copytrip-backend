@@ -5726,6 +5726,43 @@ app.post("/api/flights/results", async (req, res) => {
       is_over: !!data.is_over,
     });
 
+    // 🔁 Bygg mapping fra "offer-id i app" -> "click-id hos TP"
+    const offerToClickId = new Map();
+
+    for (const t of tickets) {
+      const ticketId = t?.id ?? t?.ticket_id ?? null;
+
+      // Kandidater for hva TP faktisk forventer som "proposal_id" i clicks-endpoint:
+      const fromTicket = t?.proposal_id ?? null;
+
+      const fromEmbeddedProposal =
+        (Array.isArray(t?.proposals) && t.proposals[0] && (t.proposals[0].id || t.proposals[0].proposal_id)) ||
+        null;
+
+      // fallback: noen ganger bruker TP ticket.id som click-id (varierer)
+      const clickId = fromTicket || fromEmbeddedProposal || ticketId;
+
+      if (ticketId && clickId) {
+        offerToClickId.set(String(ticketId), String(clickId));
+      }
+
+      // Hvis du i frontend lagrer offer.proposal_id = ticket.id, er dette viktig:
+      // map også "offer.proposal_id" (som kan være ticketId) -> clickId
+      if (t?.proposal_id && clickId) {
+        offerToClickId.set(String(t.proposal_id), String(clickId));
+      }
+    }
+
+    // legg i cache så click-endpoint kan slå opp
+    const cache = flightSearchCache.get(String(sid));
+    if (cache) {
+      cache.offer_to_click_id = Object.fromEntries(offerToClickId.entries());
+      cache.last_results_at = Date.now();
+      flightSearchCache.set(String(sid), cache);
+    }
+
+    console.log("🧠 offer_to_click_id size:", offerToClickId.size);
+      
     // Returner originalt + expanded_tickets
     return res.json({
       ok: true,
@@ -5755,51 +5792,71 @@ app.post("/api/flights/click", async (req, res) => {
     }
     if (!tp?.realHost) {
       return res.status(500).json({
-        error:
-          "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
+        error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
       });
     }
 
-    const { search_id, proposal_id } = req.body || {};
-    const sid = String(search_id || "").trim();
-    const pid = String(proposal_id || "").trim();
+    const { search_id, proposal_id, ticket_id, offer_id } = req.body || {};
 
-    if (!sid || !pid) {
-      return res.status(400).json({
-        error: "Mangler search_id eller proposal_id",
-      });
+    const sid = String(search_id || "").trim();
+    const incomingId = String(proposal_id || ticket_id || offer_id || "").trim();
+
+    console.log("➡️ /api/flights/click called", { sid, incomingId });
+
+    if (!sid || !incomingId) {
+      return res.status(400).json({ error: "Mangler search_id og proposal_id/ticket_id/offer_id" });
     }
 
     const cached = flightSearchCache.get(sid);
     if (!cached?.results_url) {
-      return res.status(404).json({
-        error: "Ukjent search_id (start på nytt).",
+      return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
+    }
+
+    // 🔁 Forsøk å oversette "app-id" -> "TP click-id"
+    const mapObj = cached.offer_to_click_id || {};
+    const mapped = mapObj[incomingId] ? String(mapObj[incomingId]).trim() : "";
+
+    // Hvilken ID vi faktisk sender til TP:
+    const clickId = mapped || incomingId;
+
+    console.log("🧩 click id resolved", { incomingId, mapped: mapped || null, clickId });
+
+    const payload = {
+      marker: tp.marker,
+      search_id: sid,
+      proposal_id: clickId, // TP forventer "proposal_id" i payload
+    };
+
+    const signature = makeSignature(tp.token, tp.marker, payload);
+
+    const base = normalizeAbsoluteUrl(cached.results_url);
+    if (!base) {
+      return res.status(502).json({
+        error: "Cached results_url er ugyldig (mangler https:// eller er tom)",
+        details: { cached_results_url: cached.results_url },
       });
     }
 
-    const payload = { marker: tp.marker, search_id: sid, proposal_id: pid };
-    const signature = makeSignature(tp.token, tp.marker, payload);
-
-    const base = String(cached.results_url).replace(/\/+$/, "");
-    const url = `${base}/searches/${encodeURIComponent(
+    // Click-endpoint slik du allerede bruker:
+    const url = `${String(base).replace(/\/+$/, "")}/searches/${encodeURIComponent(
       sid
-    )}/clicks/${encodeURIComponent(pid)}`;
+    )}/clicks/${encodeURIComponent(clickId)}`;
+
+    console.log("🔎 TP click url:", url);
 
     const r = await axios.post(
       url,
       { ...payload, signature },
       {
         headers: makeHeaders(req, signature, tp),
-        timeout: 15000,
+        timeout: 20000,
       }
     );
 
-    return res.json({ ok: true, ...r.data });
+    // TP kan returnere {url:"..."} / {redirect_url:"..."} etc — send alt videre
+    return res.json({ ok: true, ...r.data, _resolved: { incomingId, mapped: mapped || null, clickId } });
   } catch (e) {
-    console.error(
-      "❌ /api/flights/click feilet:",
-      e?.response?.data || e?.message || e
-    );
+    console.error("❌ /api/flights/click feilet:", e?.response?.data || e?.message || e);
     return res.status(502).json({
       error: "Upstream click failed",
       details: e?.response?.data || null,
