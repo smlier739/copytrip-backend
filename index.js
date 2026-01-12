@@ -5448,6 +5448,12 @@ app.post("/api/flights/start", async (req, res) => {
 
 app.post("/api/flights/results", async (req, res) => {
   try {
+    const { search_id, last_update_timestamp = 0 } = req.body || {};
+    const sid = String(search_id || "").trim();
+
+    // 👇 Bekreft at handleren faktisk kjører
+    console.log("➡️ /api/flights/results called", { sid, last_update_timestamp });
+
     if (!tp?.token || !tp?.marker) {
       return res.status(500).json({
         error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_TOKEN / TRAVELPAYOUTS_MARKER mangler)",
@@ -5459,8 +5465,6 @@ app.post("/api/flights/results", async (req, res) => {
       });
     }
 
-    const { search_id, last_update_timestamp = 0 } = req.body || {};
-    const sid = String(search_id || "").trim();
     if (!sid) return res.status(400).json({ error: "Mangler search_id" });
 
     const cached = flightSearchCache.get(sid);
@@ -5486,12 +5490,7 @@ app.post("/api/flights/results", async (req, res) => {
 
     const url = new URL("/search/affiliate/results", base).toString();
 
-    console.log("🔎 TP results base/url:", {
-      base,
-      url,
-      sid,
-      last_update_timestamp: payload.last_update_timestamp,
-    });
+    console.log("🔎 TP results base/url:", { base, url, sid, ts: payload.last_update_timestamp });
 
     const r = await axios.post(
       url,
@@ -5503,7 +5502,22 @@ app.post("/api/flights/results", async (req, res) => {
       }
     );
 
+    // ✅ ALLTID logg status + top keys (så du ser om det er 304/200)
+    console.log("✅ TP status:", r.status);
+    console.log("✅ TP keys:", Object.keys(r.data || {}));
+
+    // ✅ Logg “shape”
+    console.log("✅ TP counts:", {
+      proposals: Array.isArray(r.data?.proposals) ? r.data.proposals.length : 0,
+      tickets: Array.isArray(r.data?.tickets) ? r.data.tickets.length : 0,
+      segments: Array.isArray(r.data?.segments) ? r.data.segments.length : 0,
+      flight_info: Array.isArray(r.data?.flight_info) ? r.data.flight_info.length : 0,
+      airlines: Array.isArray(r.data?.airlines) ? r.data.airlines.length : 0,
+      airports: Array.isArray(r.data?.airports) ? r.data.airports.length : 0,
+    });
+
     if (r.status === 304) {
+      console.log("ℹ️ TP returned 304 (no new data for timestamp)", payload.last_update_timestamp);
       return res.json({
         ok: true,
         is_over: false,
@@ -5513,37 +5527,22 @@ app.post("/api/flights/results", async (req, res) => {
       });
     }
 
-    // ✅ LOGG HER (før return)
-    // Logg bare én gang per search_id for å unngå spam
-    if (!flightDebugLogged.has(sid)) {
-      flightDebugLogged.add(sid);
+    // ✅ (valgfritt) sample-proposal (kort)
+    const sample =
+      (Array.isArray(r.data?.proposals) && r.data.proposals[0]) ||
+      (Array.isArray(r.data?.tickets) && r.data.tickets[0]?.proposals?.[0]) ||
+      null;
 
-      console.log("TP keys:", Object.keys(r.data || {}));
-      console.log("TP has:", {
-        proposals: Array.isArray(r.data?.proposals) ? r.data.proposals.length : 0,
-        tickets: Array.isArray(r.data?.tickets) ? r.data.tickets.length : 0,
-        segments: Array.isArray(r.data?.segments) ? r.data.segments.length : 0,
-        flight_info: Array.isArray(r.data?.flight_info) ? r.data.flight_info.length : 0,
-        flights: Array.isArray(r.data?.flights) ? r.data.flights.length : 0,
-        airports: Array.isArray(r.data?.airports) ? r.data.airports.length : 0,
-        airlines: Array.isArray(r.data?.airlines) ? r.data.airlines.length : 0,
+    if (sample) {
+      console.log("✅ TP sample proposal keys:", Object.keys(sample));
+      console.log("✅ TP sample proposal short:", {
+        id: sample.id || sample.proposal_id,
+        hasSegmentsArray: Array.isArray(sample.segments) ? sample.segments.length : 0,
+        segment_ids: sample.segment_ids || sample.segments_ids || sample.segmentIds,
+        gate: sample.gate || sample.provider || sample.agency,
       });
-
-      // (valgfritt) logg et sample-proposal for å se om det har segment_ids osv.
-      const sample =
-        (Array.isArray(r.data?.proposals) && r.data.proposals[0]) ||
-        (Array.isArray(r.data?.tickets) && r.data.tickets[0]?.proposals?.[0]) ||
-        null;
-
-      if (sample) {
-        console.log("TP sample proposal keys:", Object.keys(sample));
-        console.log("TP sample proposal (short):", {
-          id: sample.id || sample.proposal_id,
-          segment_ids: sample.segment_ids || sample.segments_ids || sample.segmentIds,
-          gate: sample.gate || sample.provider || sample.agency,
-          hasSegmentsArray: Array.isArray(sample.segments) ? sample.segments.length : 0,
-        });
-      }
+    } else {
+      console.log("⚠️ TP sample proposal: none found");
     }
 
     return res.json({ ok: true, ...r.data });
