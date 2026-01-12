@@ -5450,13 +5450,15 @@ app.post("/api/flights/results", async (req, res) => {
   try {
     const { search_id, last_update_timestamp = 0 } = req.body || {};
     const sid = String(search_id || "").trim();
+    const tsIn = Number(last_update_timestamp) || 0;
 
-    // 👇 Bekreft at handleren faktisk kjører
-    console.log("➡️ /api/flights/results called", { sid, last_update_timestamp });
+    // Bekreft at handler kjører
+    console.log("➡️ POST /api/flights/results", { sid, ts: tsIn });
 
     if (!tp?.token || !tp?.marker) {
       return res.status(500).json({
-        error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_TOKEN / TRAVELPAYOUTS_MARKER mangler)",
+        error:
+          "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_TOKEN / TRAVELPAYOUTS_MARKER mangler)",
       });
     }
     if (!tp?.realHost) {
@@ -5464,7 +5466,6 @@ app.post("/api/flights/results", async (req, res) => {
         error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
       });
     }
-
     if (!sid) return res.status(400).json({ error: "Mangler search_id" });
 
     const cached = flightSearchCache.get(sid);
@@ -5475,7 +5476,7 @@ app.post("/api/flights/results", async (req, res) => {
     const payload = {
       marker: tp.marker,
       search_id: sid,
-      last_update_timestamp: Number(last_update_timestamp) || 0,
+      last_update_timestamp: tsIn,
     };
 
     const signature = makeSignature(tp.token, tp.marker, payload);
@@ -5490,7 +5491,7 @@ app.post("/api/flights/results", async (req, res) => {
 
     const url = new URL("/search/affiliate/results", base).toString();
 
-    console.log("🔎 TP results base/url:", { base, url, sid, ts: payload.last_update_timestamp });
+    console.log("🔎 TP results base/url:", { base, url, sid, ts: tsIn });
 
     const r = await axios.post(
       url,
@@ -5502,98 +5503,146 @@ app.post("/api/flights/results", async (req, res) => {
       }
     );
 
-    // ✅ ALLTID logg status + top keys (så du ser om det er 304/200)
     console.log("✅ TP status:", r.status);
-    console.log("✅ TP keys:", Object.keys(r.data || {}));
 
-    // ✅ Logg “shape”
-    console.log("✅ TP counts:", {
-      proposals: Array.isArray(r.data?.proposals) ? r.data.proposals.length : 0,
-      tickets: Array.isArray(r.data?.tickets) ? r.data.tickets.length : 0,
-      segments: Array.isArray(r.data?.segments) ? r.data.segments.length : 0,
-      flight_info: Array.isArray(r.data?.flight_info) ? r.data.flight_info.length : 0,
-      airlines: Array.isArray(r.data?.airlines) ? r.data.airlines.length : 0,
-      airports: Array.isArray(r.data?.airports) ? r.data.airports.length : 0,
-    });
-
+    // 304 = ingen nye data siden timestamp
     if (r.status === 304) {
-      console.log("ℹ️ TP returned 304 (no new data for timestamp)", payload.last_update_timestamp);
+      console.log("ℹ️ TP 304 (no new data) for ts", tsIn);
       return res.json({
         ok: true,
         is_over: false,
-        last_update_timestamp: payload.last_update_timestamp,
+        last_update_timestamp: tsIn,
         tickets: [],
-        proposals: [],
+        expanded_tickets: [],
       });
     }
 
-    // ✅ (valgfritt) sample-proposal (kort)
-    const sample =
-      (Array.isArray(r.data?.proposals) && r.data.proposals[0]) ||
-      (Array.isArray(r.data?.tickets) && r.data.tickets[0]?.proposals?.[0]) ||
-      null;
+    const data = r.data && typeof r.data === "object" ? r.data : {};
+    const keys = Object.keys(data);
+    console.log("✅ TP keys:", keys);
 
-    if (sample) {
-      console.log("✅ TP sample proposal keys:", Object.keys(sample));
-      console.log("✅ TP sample proposal short:", {
-        id: sample.id || sample.proposal_id,
-        hasSegmentsArray: Array.isArray(sample.segments) ? sample.segments.length : 0,
-        segment_ids: sample.segment_ids || sample.segments_ids || sample.segmentIds,
-        gate: sample.gate || sample.provider || sample.agency,
-      });
-    } else {
-      console.log("⚠️ TP sample proposal: none found");
+    const tickets = Array.isArray(data.tickets) ? data.tickets : [];
+    const flightLegsArr = Array.isArray(data.flight_legs) ? data.flight_legs : [];
+
+    // airlines kan være object-map (vanlig), eller array (sjeldnere)
+    const airlinesRaw = data.airlines;
+    const airlinesIsArray = Array.isArray(airlinesRaw);
+    const airlinesMap =
+      airlinesRaw && typeof airlinesRaw === "object" && !airlinesIsArray ? airlinesRaw : {};
+
+    const counts = {
+      tickets: tickets.length,
+      flight_legs: flightLegsArr.length,
+      proposals: Array.isArray(data.proposals) ? data.proposals.length : 0,
+      airlines:
+        airlinesIsArray
+          ? airlinesRaw.length
+          : airlinesRaw && typeof airlinesRaw === "object"
+            ? Object.keys(airlinesRaw).length
+            : 0,
+      agents: Array.isArray(data.agents) ? data.agents.length : 0,
+      boundaries: Array.isArray(data.boundaries) ? data.boundaries.length : 0,
+      flight_info: Array.isArray(data.flight_info) ? data.flight_info.length : 0,
+      airports: Array.isArray(data.airports) ? data.airports.length : 0,
+      segments: Array.isArray(data.segments) ? data.segments.length : 0,
+    };
+    console.log("✅ TP counts:", counts);
+
+    // sample-ticket og sample-leg (for å se felt)
+    if (tickets[0]) {
+      console.log("✅ TP sample ticket keys:", Object.keys(tickets[0]));
+      console.log(
+        "✅ TP sample ticket short:",
+        JSON.stringify(
+          {
+            id: tickets[0].id || tickets[0].proposal_id || tickets[0].ticket_id,
+            price: tickets[0].price || tickets[0].unified_price,
+            flight_leg_ids: tickets[0].flight_leg_ids,
+            legs: tickets[0].legs,
+            flight_legs: tickets[0].flight_legs,
+            gate: tickets[0].gate,
+            agent: tickets[0].agent,
+          },
+          null,
+          2
+        ).slice(0, 2200)
+      );
+    }
+    if (flightLegsArr[0]) {
+      console.log("✅ TP flight_legs[0] keys:", Object.keys(flightLegsArr[0]));
+      console.log(
+        "✅ TP flight_legs[0] short:",
+        JSON.stringify(flightLegsArr[0], null, 2).slice(0, 2200)
+      );
     }
 
-    function indexById(arr) {
-      const m = new Map();
-      for (const x of Array.isArray(arr) ? arr : []) {
-        const id = x?.id ?? x?._id ?? x?.uuid;
-        if (id) m.set(String(id), x);
+    // index flight_legs by id
+    const legById = new Map();
+    for (const leg of flightLegsArr) {
+      const id = leg?.id ?? leg?.flight_leg_id ?? leg?.uuid ?? null;
+      if (id) legById.set(String(id), leg);
+    }
+
+    const pickLegIds = (t) => {
+      if (!t || typeof t !== "object") return [];
+      const candidates = [
+        t.flight_leg_ids,
+        t.flight_legs_ids,
+        t.flightLegIds,
+        t.leg_ids,
+        t.legs_ids,
+        t.legs,
+        t.flight_legs, // kan være ids eller objects
+      ];
+
+      for (const c of candidates) {
+        if (Array.isArray(c) && c.length) return c;
       }
-      return m;
-    }
-
-    function expandProposal(p, dicts) {
-      if (!p || typeof p !== "object") return p;
-
-      const segmentIds =
-        p.segment_ids || p.segments_ids || p.segmentIds || p.segmentsIds || null;
-
-      if (!Array.isArray(segmentIds) || !segmentIds.length) return p;
-
-      const segments = segmentIds
-        .map((id) => dicts.segments.get(String(id)))
-        .filter(Boolean);
-
-      return { ...p, segments };
-    }
-
-    // ... etter axios-kallet:
-    const data = r.data || {};
-    const dicts = {
-      segments: indexById(data.segments),
-      airports: indexById(data.airports),
-      airlines: indexById(data.airlines),
+      return [];
     };
 
-    const proposals = Array.isArray(data.proposals) ? data.proposals : [];
-    const expanded_proposals = proposals.map((p) => expandProposal(p, dicts));
+    const toLegObject = (x) => {
+      if (!x) return null;
+      // hvis allerede object
+      if (typeof x === "object" && !Array.isArray(x)) return x;
+      // hvis id
+      const id = String(x);
+      return legById.get(id) || null;
+    };
 
-    console.error("✅ TP expand:", {
-      proposals: proposals.length,
-      expandedSegmentsFirst:
-        expanded_proposals?.[0]?.segments?.length || 0,
-      keys: Object.keys(data),
+    const expanded_tickets = tickets.map((t) => {
+      const rawLegs = pickLegIds(t);
+      const legs = rawLegs.map(toLegObject).filter(Boolean);
+
+      // legg på airline-name hvis vi kan
+      const legs_with_airlines = legs.map((leg) => {
+        const code =
+          (leg?.airline || leg?.carrier || leg?.marketing_carrier || leg?.carrier_code || "")
+            .toString()
+            .toUpperCase();
+
+        const a = airlinesMap && code ? airlinesMap[code] : null;
+        const airline_name =
+          typeof a === "string" ? a : a && typeof a === "object" ? (a.name || a.title || null) : null;
+
+        return airline_name ? { ...leg, airline_name } : leg;
+      });
+
+      return {
+        ...t,
+        legs: legs_with_airlines,
+      };
     });
 
     return res.json({
       ok: true,
       ...data,
-      expanded_proposals, // 👈 bruk denne i appen
+      expanded_tickets,
+      _debug: {
+        counts,
+        airlines_is_map: !!(airlinesRaw && typeof airlinesRaw === "object" && !Array.isArray(airlinesRaw)),
+      },
     });
-      
-    return res.json({ ok: true, ...r.data });
   } catch (e) {
     console.error("❌ /api/flights/results feilet:", e?.response?.data || e?.message || e);
     return res.status(502).json({
