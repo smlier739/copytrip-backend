@@ -1619,9 +1619,11 @@ KRAV FOR PACKING_LIST:
     4) "Annet"
 - Kategorinavnene må være akkurat disse.
 - Hver kategori SKAL ha en "items"-liste med 3–10 KONKRETE ting.
+- De KONKRETE tingene skal velges basert på innholdet i Grenseløs-episode.
+- Hvis Johnny nevner konkret utstyr i Grenseløs-episode, som vannfilter, etc, skal det alltid med i "packing_list".
 
 KRAV FOR STOPS:
-- 3–10 stopp.
+- 5–10 stopp.
 - Hvert stopp SKAL ha "day", "name" og "description".
 - Hvis du ikke vet koordinater, sett "lat" og "lng" til null.
 
