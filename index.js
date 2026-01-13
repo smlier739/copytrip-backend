@@ -5445,11 +5445,11 @@ app.post("/api/flights/start", async (req, res) => {
 const flightClickCache = global.flightClickCache || (global.flightClickCache = new Map());
 
 // ==============================
-// ✅ /api/flights/results (RETTET)
+// ✅ /api/flights/results (NY - RIKTIG)
+// - kaller TP /search/affiliate/results (polling)
+// - 304 => offers: null (app overskriver ikke)
 // - bygger offers fra tickets[].proposals[] + tickets[].segments[]
-// - 304 returnerer offers: null (så appen ikke “overskriver”)
-// - hvert offer får: offer_id, price, depTime, arrTime, routeText, tp_proposal_id (for click)
-// - FIX: fjernet clickUrl/clickPayload/clickSignature/axios-click som ved en feil lå i /results
+// - hvert offer får tp_proposal_id (proposals[].id) som appen sender til /click
 // ==============================
 app.post("/api/flights/results", async (req, res) => {
   try {
@@ -5467,21 +5467,15 @@ app.post("/api/flights/results", async (req, res) => {
     }
     if (!tp?.realHost) {
       return res.status(500).json({
-        error:
-          "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
+        error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
       });
     }
     if (!sid) return res.status(400).json({ error: "Mangler search_id" });
 
     const cached = flightSearchCache.get(sid);
     if (!cached?.results_url) {
-      return res
-        .status(404)
-        .json({ error: "Ukjent search_id (start på nytt)." });
+      return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
     }
-
-    const payload = { marker: tp.marker, search_id: sid, last_update_timestamp: tsIn };
-    const signature = makeSignature(tp.token, tp.marker, payload);
 
     const base = normalizeAbsoluteUrl(cached.results_url);
     if (!base) {
@@ -5492,7 +5486,11 @@ app.post("/api/flights/results", async (req, res) => {
     }
 
     const resultsUrl = new URL("/search/affiliate/results", base).toString();
-    console.log("🔎 TP results base/url:", { base, resultsUrl, sid, ts: tsIn });
+
+    const payload = { marker: tp.marker, search_id: sid, last_update_timestamp: tsIn };
+    const signature = makeSignature(tp.token, tp.marker, payload);
+
+    console.log("🔎 TP results:", { resultsUrl, sid, tsIn });
 
     const r = await axios.post(
       resultsUrl,
@@ -5506,26 +5504,25 @@ app.post("/api/flights/results", async (req, res) => {
 
     console.log("✅ TP status:", r.status);
 
-    // 304: ingen body -> IKKE overskriv offers i app
     if (r.status === 304) {
       console.log("ℹ️ TP 304 (no new data)", { sid, tsIn });
       return res.json({
         ok: true,
         is_over: false,
         last_update_timestamp: tsIn,
-        offers: null, // viktig: null = “ikke oppdater”
+        offers: null, // 👈 null = app skal IKKE overskrive
       });
     }
 
     const data = r.data || {};
-    const tickets = Array.isArray(data.tickets) ? data.tickets : [];
+    const tickets = Array.isArray(data?.tickets) ? data.tickets : [];
 
     const tpRawTs =
       typeof data.last_update_timestamp === "number"
         ? data.last_update_timestamp
         : typeof data.last_update_timestamp === "string"
-        ? Number(data.last_update_timestamp) || 0
-        : 0;
+          ? Number(data.last_update_timestamp) || 0
+          : 0;
 
     const tpTs = Math.max(tsIn, tpRawTs || 0);
     const isOver = !!data.is_over;
@@ -5559,7 +5556,8 @@ app.post("/api/flights/results", async (req, res) => {
     };
 
     const pickPriceFromProposal = (p) => {
-      const c = p?.unified_price ?? p?.price ?? p?.total_price ?? p?.amount ?? null;
+      // Ny API: proposals[].price er objekt {currency, amount}
+      const c = p?.price ?? p?.unified_price ?? p?.total_price ?? p?.amount ?? null;
       if (typeof c === "number" && Number.isFinite(c)) return c;
       if (typeof c === "string") return num(c);
       if (c && typeof c === "object") return num(c.amount ?? c.value ?? c.price ?? c.total);
@@ -5568,8 +5566,9 @@ app.post("/api/flights/results", async (req, res) => {
 
     const pickCurrency = (p, t) => {
       const c =
-        (typeof p?.unified_price === "object" ? p.unified_price?.currency : null) ||
         (typeof p?.price === "object" ? p.price?.currency : null) ||
+        (typeof p?.unified_price === "object" ? p.unified_price?.currency : null) ||
+        (typeof p?.price_per_person === "object" ? p.price_per_person?.currency : null) ||
         p?.currency ||
         t?.currency ||
         data?.search_params?.currency_code ||
@@ -5578,13 +5577,12 @@ app.post("/api/flights/results", async (req, res) => {
       return toUpper(c || "NOK");
     };
 
-    // build offers PER proposal
+    // build offers PER proposal (samme counter-logikk som fallback click, hvis du vil)
     const offers = [];
     let counter = 0;
 
     for (const t of tickets) {
       const proposals = Array.isArray(t?.proposals) ? t.proposals : [];
-
       const seg0 = Array.isArray(t?.segments) ? t.segments[0] : null;
       const segLast = Array.isArray(t?.segments) ? t.segments[t.segments.length - 1] : null;
 
@@ -5594,9 +5592,20 @@ app.post("/api/flights/results", async (req, res) => {
         segLast?.destination || segLast?.to || segLast?.destination_iata || segLast?.arrival_airport || t?.destination || "";
 
       const dep =
-        seg0?.departure_at || seg0?.local_departure || seg0?.departure_time || t?.departure_at || null;
+        seg0?.local_departure_date_time ||
+        seg0?.departure_at ||
+        seg0?.local_departure ||
+        seg0?.departure_time ||
+        t?.departure_at ||
+        null;
+
       const arr =
-        segLast?.arrival_at || segLast?.local_arrival || segLast?.arrival_time || t?.arrival_at || null;
+        segLast?.local_arrival_date_time ||
+        segLast?.arrival_at ||
+        segLast?.local_arrival ||
+        segLast?.arrival_time ||
+        t?.arrival_at ||
+        null;
 
       const durationMins =
         num(seg0?.duration) ??
@@ -5666,11 +5675,9 @@ app.post("/api/flights/results", async (req, res) => {
       });
     }
 
-    // cache map (offer_id -> tp_proposal_id) for fallback click
+    // (valgfritt) cache mapping offer_id -> tp_proposal_id
     const map = {};
-    for (const o of offers) {
-      if (o.offer_id && o.tp_proposal_id) map[o.offer_id] = o.tp_proposal_id;
-    }
+    for (const o of offers) if (o.offer_id && o.tp_proposal_id) map[o.offer_id] = o.tp_proposal_id;
     flightSearchCache.set(sid, { ...cached, offer_to_tp_proposal: map });
 
     return res.json({
@@ -5690,11 +5697,12 @@ app.post("/api/flights/results", async (req, res) => {
 
 
 // ==============================
-// ✅ /api/flights/click (RETTET)
-// - foretrekker tp_proposal_id fra appen (best)
-// - fallback 1: slå opp cached offer_to_tp_proposal fra /results (raskt, ingen TP-kall)
-// - fallback 2: hvis kun offer_id "sid:n" og ingen cache: fetch results(ts=0) og finn n'te proposal i samme rekkefølge
-// - FIX: håndterer 204/3xx ved å hente URL fra Location-header (maxRedirects=0)
+// ✅ /api/flights/click (NY - RIKTIG)
+// - bruker NYTT TP-click-endpoint:
+//   https://[results_url]/searches/[search_id]/clicks/[proposal_id]
+// - marker i header (påkrevd)
+// - foretrekker tp_proposal_id fra appen
+// - fallback: resolve proposal via offer_id "sid:n" ved å hente full results(ts=0)
 // ==============================
 app.post("/api/flights/click", async (req, res) => {
   try {
@@ -5706,8 +5714,7 @@ app.post("/api/flights/click", async (req, res) => {
     }
     if (!tp?.realHost) {
       return res.status(500).json({
-        error:
-          "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
+        error: "Travelpayouts er ikke konfigurert (TRAVELPAYOUTS_REAL_HOST mangler)",
       });
     }
 
@@ -5721,9 +5728,7 @@ app.post("/api/flights/click", async (req, res) => {
 
     if (!sid) return res.status(400).json({ error: "Mangler search_id" });
     if (!clientTpProposalId && !clientOfferId) {
-      return res.status(400).json({
-        error: "Mangler tp_proposal_id eller offer_id/proposal_id",
-      });
+      return res.status(400).json({ error: "Mangler tp_proposal_id eller offer_id/proposal_id" });
     }
 
     const cached = flightSearchCache.get(sid);
@@ -5731,7 +5736,13 @@ app.post("/api/flights/click", async (req, res) => {
       return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
     }
 
-    const normalizeBase = (u) => normalizeAbsoluteUrl(u);
+    const base = normalizeAbsoluteUrl(cached.results_url);
+    if (!base) {
+      return res.status(502).json({
+        error: "Cached results_url er ugyldig",
+        details: { cached_results_url: cached.results_url },
+      });
+    }
 
     const pickUrlFromObj = (o) =>
       (o &&
@@ -5748,110 +5759,57 @@ app.post("/api/flights/click", async (req, res) => {
           o.resultUrl)) ||
       null;
 
-    // ---------- Helper: call TP click (supports 3xx + 204 via Location) ----------
-    async function doTpClick(tpProposalId, sourceLabel) {
-      const base = normalizeBase(cached.results_url);
-      if (!base) {
-        return {
-          ok: false,
-          status: 502,
-          error: "Cached results_url er ugyldig",
-          details: { cached_results_url: cached.results_url },
-        };
-      }
+    // ---- call NEW click endpoint ----
+    async function doTpClickNewEndpoint(tpProposalId, sourceLabel) {
+      const clickUrl = new URL(`/searches/${encodeURIComponent(sid)}/clicks/${encodeURIComponent(String(tpProposalId))}`, base).toString();
 
-      const clickUrl = new URL("/search/affiliate/click", base).toString();
-
-      const clickPayload = {
+      // marker i header (påkrevd)
+      const headers = {
+        ...(makeHeaders?.(req, "", tp) || {}),
+        "X-Affiliate-Marker": tp.marker,
+        "X-Marker": tp.marker,
         marker: tp.marker,
-        search_id: sid,
-        proposal_id: String(tpProposalId),
       };
 
-      const clickSignature = makeSignature(tp.token, tp.marker, clickPayload);
+      console.log(`🖱️ TP click NEW (${sourceLabel}):`, { clickUrl, sid, proposal_id: String(tpProposalId) });
 
-      console.log(`🖱️ TP click (${sourceLabel}):`, {
-        clickUrl,
-        sid,
-        proposal_id: String(tpProposalId),
+      const cr = await axios.get(clickUrl, {
+        headers,
+        timeout: 20000,
+        validateStatus: (status) => status >= 200 && status < 400,
+        maxRedirects: 0,
       });
 
-      const cr = await axios.post(
-        clickUrl,
-        { ...clickPayload, signature: clickSignature },
-        {
-          headers: makeHeaders(req, clickSignature, tp),
-          timeout: 20000,
-          maxRedirects: 0, // ⬅️ viktig for å fange Location
-          validateStatus: (status) => status >= 200 && status < 400, // inkluder 3xx + 204
-        }
-      );
+      const url = pickUrlFromObj(cr?.data);
 
-      // 1) body-url
-      let resolvedUrl = pickUrlFromObj(cr?.data);
+      if (!url) {
+        console.log("🧪 TP click NEW status:", cr.status);
+        console.log("🧪 TP click NEW headers:", cr.headers || {});
+        console.log("🧪 TP click NEW data:", JSON.stringify(cr.data || {}, null, 2));
 
-      // 2) Location-header (Axios lowercase i Node)
-      if (!resolvedUrl) {
-        const loc =
-          cr?.headers?.location ||
-          cr?.headers?.Location ||
-          cr?.headers?.["x-redirect-url"] ||
-          cr?.headers?.["x-final-url"] ||
-          null;
-
-        if (loc) resolvedUrl = String(loc);
-      }
-
-      if (!resolvedUrl) {
         return {
           ok: false,
           status: 502,
-          error: "TP click manglet url (hverken body eller Location-header)",
-          details: {
-            status: cr.status,
-            headers: cr.headers || null,
-            data: cr.data || null,
-            sent: clickPayload,
-          },
+          error: "TP click manglet url (uventet respons)",
+          details: { status: cr.status, headers: cr.headers || null, data: cr.data || null },
         };
       }
 
-      return { ok: true, url: resolvedUrl, source: sourceLabel, status: cr.status };
+      return { ok: true, url, source: sourceLabel, tp_click: cr.data || null };
     }
 
-    // ---- 1) Hvis vi fikk tp_proposal_id direkte: klikk med en gang ----
+    // ---- 1) direkte tp_proposal_id (best) ----
     if (clientTpProposalId) {
-      const r = await doTpClick(clientTpProposalId, "tp_click_direct");
+      const r = await doTpClickNewEndpoint(clientTpProposalId, "tp_click_direct");
       if (!r.ok) return res.status(r.status || 502).json({ error: r.error, details: r.details || null });
-      return res.json({ ok: true, url: r.url, source: r.source, status: r.status });
+      return res.json({ ok: true, url: r.url, source: r.source });
     }
 
-    // ---- 2) Fallback (rask): bruk cache fra /results hvis den finnes ----
-    const cachedMap = cached?.offer_to_tp_proposal || null;
-    if (cachedMap && typeof cachedMap === "object" && cachedMap[clientOfferId]) {
-      const tpId = String(cachedMap[clientOfferId]);
-      const r = await doTpClick(tpId, "tp_click_cached_map");
-      if (!r.ok) return res.status(r.status || 502).json({ error: r.error, details: r.details || null });
-      return res.json({ ok: true, url: r.url, source: r.source, status: r.status });
-    }
-
-    // ---- 3) Fallback: resolve tp_proposal_id fra offer_id "sid:n" ved å hente full results(ts=0) ----
+    // ---- 2) fallback: offer_id -> finn n'te proposal i samme rekkefølge ----
     async function fetchFullResults() {
+      const resultsUrl = new URL("/search/affiliate/results", base).toString();
       const payload = { marker: tp.marker, search_id: sid, last_update_timestamp: 0 };
       const signature = makeSignature(tp.token, tp.marker, payload);
-
-      const base = normalizeBase(cached.results_url);
-      if (!base) {
-        return {
-          ok: false,
-          status: 502,
-          error: "Cached results_url er ugyldig",
-          details: { cached_results_url: cached.results_url },
-        };
-      }
-
-      const resultsUrl = new URL("/search/affiliate/results", base).toString();
-      console.log("🔎 TP fetch results for click:", { resultsUrl, sid });
 
       const rr = await axios.post(
         resultsUrl,
@@ -5867,21 +5825,12 @@ app.post("/api/flights/click", async (req, res) => {
         return {
           ok: false,
           status: 409,
-          error:
-            "TP returnerte 304 på click-fetch og vi har ingen cached body. Start søket på nytt.",
+          error: "TP returnerte 304 på click-fetch og vi har ingen cached body. Start søket på nytt.",
         };
       }
 
       return { ok: true, data: rr.data || {} };
     }
-
-    const full = await fetchFullResults();
-    if (!full.ok) {
-      return res.status(full.status || 502).json({ error: full.error, details: full.details || null });
-    }
-
-    const data = full.data;
-    const tickets = Array.isArray(data?.tickets) ? data.tickets : [];
 
     const m = clientOfferId.match(/^(.+):(\d+)$/);
     if (!m || m[1] !== sid) {
@@ -5893,11 +5842,21 @@ app.post("/api/flights/click", async (req, res) => {
 
     const wantedCounter = Number(m[2]);
     if (!Number.isInteger(wantedCounter) || wantedCounter < 0) {
-      return res.status(400).json({
-        error: "Ugyldig offer_id counter",
-        details: { clientOfferId },
-      });
+      return res.status(400).json({ error: "Ugyldig offer_id counter", details: { clientOfferId } });
     }
+
+    // hvis vi har cached mapping, bruk den først
+    const cachedProposal = cached?.offer_to_tp_proposal?.[clientOfferId];
+    if (cachedProposal) {
+      const r = await doTpClickNewEndpoint(cachedProposal, "tp_click_cached_map");
+      if (!r.ok) return res.status(r.status || 502).json({ error: r.error, details: r.details || null });
+      return res.json({ ok: true, url: r.url, source: r.source });
+    }
+
+    const full = await fetchFullResults();
+    if (!full.ok) return res.status(full.status || 502).json({ error: full.error, details: full.details || null });
+
+    const tickets = Array.isArray(full.data?.tickets) ? full.data.tickets : [];
 
     let counter = 0;
     let foundProposal = null;
@@ -5930,30 +5889,20 @@ app.post("/api/flights/click", async (req, res) => {
       foundProposal?.clickId ??
       null;
 
-    const directUrl = pickUrlFromObj(foundProposal);
-    if (directUrl) {
-      return res.json({ ok: true, url: directUrl, source: "direct_url" });
-    }
-
     if (!tpProposalId) {
       return res.status(409).json({
-        error: "Mangler TP proposal_id/click_id på valgt proposal",
-        details: { clientOfferId, proposalKeys: Object.keys(foundProposal || {}) },
+        error: "Mangler TP proposal_id på valgt proposal",
+        details: { proposalKeys: Object.keys(foundProposal || {}) },
       });
     }
 
-    const clicked = await doTpClick(tpProposalId, "tp_click_fallback");
-    if (!clicked.ok) {
-      return res.status(clicked.status || 502).json({ error: clicked.error, details: clicked.details || null });
-    }
+    const clicked = await doTpClickNewEndpoint(tpProposalId, "tp_click_fallback");
+    if (!clicked.ok) return res.status(clicked.status || 502).json({ error: clicked.error, details: clicked.details || null });
 
-    return res.json({ ok: true, url: clicked.url, source: clicked.source, status: clicked.status });
+    return res.json({ ok: true, url: clicked.url, source: clicked.source });
   } catch (e) {
     console.error("❌ /api/flights/click feilet:", e?.response?.data || e?.message || e);
-    return res.status(502).json({
-      error: "Upstream click failed",
-      details: e?.response?.data || null,
-    });
+    return res.status(502).json({ error: "Upstream click failed", details: e?.response?.data || null });
   }
 });
 
