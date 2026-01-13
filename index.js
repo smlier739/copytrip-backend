@@ -5445,8 +5445,10 @@ app.post("/api/flights/start", async (req, res) => {
 const flightClickCache = global.flightClickCache || (global.flightClickCache = new Map());
 
 // ==============================
-// ✅ /api/flights/results (FIX: segments[].flights -> flight_legs lookup)
-// - tickets[].segments[].flights er id-liste -> slå opp i data.flight_legs
+// ✅ /api/flights/results (FIX v2: segments[].flights -> flight_legs lookup)
+// - segments[].flights kan være ELLER:
+//    A) "id" (string/uuid) som må slås opp i legsById
+//    B) "index" (number) inn i data.flight_legs[]  ✅ (dette ser du hos deg: [82,83,84])
 // - fyller depTime/arrTime/routeText/durationText/stopsText/airlinesText/flightNosText
 // - 304 returnerer offers:null
 // ==============================
@@ -5521,8 +5523,8 @@ app.post("/api/flights/results", async (req, res) => {
       typeof data.last_update_timestamp === "number"
         ? data.last_update_timestamp
         : typeof data.last_update_timestamp === "string"
-          ? Number(data.last_update_timestamp) || 0
-          : 0;
+        ? Number(data.last_update_timestamp) || 0
+        : 0;
 
     const tpTs = Math.max(tsIn, tpRawTs || 0);
     const isOver = !!data.is_over;
@@ -5587,7 +5589,7 @@ app.post("/api/flights/results", async (req, res) => {
       return toUpper(c || "NOK");
     };
 
-    // ---------------- build legsById ----------------
+    // ---------------- build legsById + resolveLeg ----------------
     const legsById = new Map();
     for (const leg of legsArr) {
       const id =
@@ -5601,28 +5603,60 @@ app.post("/api/flights/results", async (req, res) => {
       if (id != null) legsById.set(String(id), leg);
     }
 
-    // plukk felter fra et leg-objekt
+    // ✅ viktig: flights[] kan være indeks ELLER id
+    const resolveLeg = (ref) => {
+      if (ref == null) return null;
+      if (typeof ref === "object") return ref;
+
+      // 1) id-lookup
+      const byId = legsById.get(String(ref));
+      if (byId) return byId;
+
+      // 2) index-lookup (vanlig når flights = [82,83,84])
+      const idx = typeof ref === "number" ? ref : Number(ref);
+      if (Number.isInteger(idx) && idx >= 0 && idx < legsArr.length) return legsArr[idx];
+
+      return null;
+    };
+
+    // plukk felter fra et leg-objekt (flere varianter)
     const legOrigin = (leg) =>
       pick(leg, ["origin", "from", "origin_iata", "origin_code", "departure_airport", "airport_from"]);
     const legDest = (leg) =>
       pick(leg, ["destination", "to", "destination_iata", "destination_code", "arrival_airport", "airport_to"]);
 
     const legDep = (leg) =>
-      pick(leg, ["local_departure", "departure_at", "departure_time", "depart_at", "departure_datetime"]);
+      pick(leg, [
+        "local_departure_date_time",
+        "departure_at",
+        "local_departure",
+        "departure_time",
+        "depart_at",
+        "departure_datetime",
+        "time_departure",
+      ]);
     const legArr = (leg) =>
-      pick(leg, ["local_arrival", "arrival_at", "arrival_time", "arrive_at", "arrival_datetime"]);
+      pick(leg, [
+        "local_arrival_date_time",
+        "arrival_at",
+        "local_arrival",
+        "arrival_time",
+        "arrive_at",
+        "arrival_datetime",
+        "time_arrival",
+      ]);
 
     const legDurationMins = (leg) => {
-      const raw =
-        pick(leg, ["duration", "duration_mins", "duration_minutes", "travel_time", "flight_time"]) ?? null;
+      const raw = pick(leg, ["duration", "duration_mins", "duration_minutes", "travel_time", "flight_time"]);
       const n = Number(raw);
       if (!Number.isFinite(n)) return null;
-      // hvis sekunder -> minutter
-      return n > 10000 ? Math.round(n / 60) : n;
+      return n > 10000 ? Math.round(n / 60) : n; // sek -> min hvis det ser stort ut
     };
 
     const legAirline = (leg) =>
-      toUpper(pick(leg, ["airline", "carrier", "marketing_carrier", "carrier_code", "airline_code", "airline_iata"]) || "");
+      toUpper(
+        pick(leg, ["airline", "carrier", "marketing_carrier", "carrier_code", "airline_code", "airline_iata"]) || ""
+      );
 
     const legFlightNo = (leg) =>
       toUpper(pick(leg, ["flight_number", "flight_no", "number", "flightNumber", "flight_num"]) || "");
@@ -5636,9 +5670,8 @@ app.post("/api/flights/results", async (req, res) => {
       const segs = Array.isArray(t?.segments) ? t.segments : [];
       const seg0 = segs[0] || null;
 
-      // ✅ NYTT: segmentet har flights: [id,id,...]
-      const flightIds = Array.isArray(seg0?.flights) ? seg0.flights : [];
-      const legs = flightIds.map((id) => legsById.get(String(id))).filter(Boolean);
+      const flightRefs = Array.isArray(seg0?.flights) ? seg0.flights : [];
+      const legs = flightRefs.map(resolveLeg).filter(Boolean);
 
       const firstLeg = legs[0] || null;
       const lastLeg = legs[legs.length - 1] || null;
@@ -5653,8 +5686,15 @@ app.post("/api/flights/results", async (req, res) => {
         pick(t, ["destination", "to", "destination_iata", "destination_code"]) ||
         "";
 
-      const dep = firstLeg ? legDep(firstLeg) : pick(t, ["departure_at", "local_departure", "departure_time"]);
-      const arr = lastLeg ? legArr(lastLeg) : pick(t, ["arrival_at", "local_arrival", "arrival_time"]);
+      const dep =
+        (firstLeg && legDep(firstLeg)) ||
+        pick(t, ["local_departure_date_time", "departure_at", "local_departure", "departure_time"]) ||
+        null;
+
+      const arr =
+        (lastLeg && legArr(lastLeg)) ||
+        pick(t, ["local_arrival_date_time", "arrival_at", "local_arrival", "arrival_time"]) ||
+        null;
 
       const durationSum =
         legs.length > 0
@@ -5666,16 +5706,15 @@ app.post("/api/flights/results", async (req, res) => {
       const durationText = durationSum != null ? fmtDurationMins(durationSum) : "";
       const routeText = origin && destination ? `${toUpper(origin)} → ${toUpper(destination)}` : "";
 
-      // stops: flights-1 (hvis legs finnes). Ellers prøv transfers.
+      // stops: legs-1, ellers transfers
       const stops =
         legs.length > 0
           ? Math.max(0, legs.length - 1)
           : Array.isArray(seg0?.transfers)
-            ? seg0.transfers.length
-            : null;
+          ? seg0.transfers.length
+          : null;
 
-      const stopsText =
-        stops == null ? "" : stops === 0 ? "Direkte" : `${stops} stopp`;
+      const stopsText = stops == null ? "" : stops === 0 ? "Direkte" : `${stops} stopp`;
 
       const airlinesText = legs.length ? uniq(legs.map(legAirline)).filter(Boolean).join(", ") : "";
       const flightNosText = legs.length ? uniq(legs.map(legFlightNo)).filter(Boolean).join(", ") : "";
@@ -5725,10 +5764,13 @@ app.post("/api/flights/results", async (req, res) => {
       tsOut: tpTs,
     });
 
+    // --- DEBUG: bekreft resolveLeg virker ---
     if (tickets[0]) {
-      const seg0 = Array.isArray(tickets[0]?.segments) ? tickets[0].segments[0] : null;
-      console.log("🧪 seg[0] keys:", Object.keys(seg0 || {}));
-      console.log("🧪 seg[0] flights:", Array.isArray(seg0?.flights) ? seg0.flights.length : null);
+      const s0 = Array.isArray(tickets[0]?.segments) ? tickets[0].segments[0] : null;
+      const firstRef = Array.isArray(s0?.flights) ? s0.flights[0] : null;
+      const leg0 = resolveLeg(firstRef);
+      console.log("🧪 seg0.flights[0]:", firstRef);
+      console.log("🧪 resolveLeg(first) keys:", Object.keys(leg0 || {}));
     }
 
     if (offers[0]) {
