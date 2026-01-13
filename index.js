@@ -5489,16 +5489,54 @@ app.post("/api/flights/results", async (req, res) => {
     const url = new URL("/search/affiliate/results", base).toString();
     console.log("🔎 TP results base/url:", { base, url, sid, ts: tsIn });
 
-    const r = await axios.post(
-      url,
-      { ...payload, signature },
+    const cr = await axios.post(
+      clickUrl,
+      { ...clickPayload, signature: clickSignature },
       {
-        headers: makeHeaders(req, signature, tp),
+        headers: makeHeaders(req, clickSignature, tp),
         timeout: 20000,
-        validateStatus: (status) => (status >= 200 && status < 300) || status === 304,
+        // VIKTIG: tillat 3xx også (redirect), 204 osv.
+        validateStatus: (status) => status >= 200 && status < 400,
+        // VIKTIG: ikke la axios auto-følge redirect, vi vil fange Location
+        maxRedirects: 0,
       }
     );
 
+    // 1) prøv body først (noen ganger finnes det)
+    let resolvedUrl = pickUrlFromObj(cr?.data);
+
+    // 2) hvis 204 eller ingen body-url: prøv Location-header
+    if (!resolvedUrl) {
+      const loc =
+        cr?.headers?.location ||
+        cr?.headers?.Location ||
+        cr?.headers?.['x-redirect-url'] ||
+        cr?.headers?.['x-final-url'] ||
+        null;
+
+      if (loc) resolvedUrl = String(loc);
+    }
+
+    if (!resolvedUrl) {
+      console.log("🧪 TP click status:", cr.status);
+      console.log("🧪 TP click headers:", cr.headers || {});
+      console.log("🧪 TP click data:", JSON.stringify(cr.data || {}, null, 2));
+
+      return {
+        ok: false,
+        status: 502,
+        error: "TP click manglet url (hverken body eller Location-header)",
+        details: {
+          status: cr.status,
+          headers: cr.headers || null,
+          data: cr.data || null,
+          sent: clickPayload,
+        },
+      };
+    }
+
+    return { ok: true, url: resolvedUrl, source: sourceLabel };
+      
     console.log("✅ TP status:", r.status);
 
     // 304: ingen body
