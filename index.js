@@ -5445,11 +5445,12 @@ app.post("/api/flights/start", async (req, res) => {
 const flightClickCache = global.flightClickCache || (global.flightClickCache = new Map());
 
 // ==============================
-// ✅ /api/flights/results (NY - RIKTIG)
-// - kaller TP /search/affiliate/results (polling)
-// - 304 => offers: null (app overskriver ikke)
+// ✅ /api/flights/results (OPPDATERT)
+// - Robust segment-plukking (flere feltnavn)
+// - Robust duration (sekunder -> minutter ved behov)
+// - 304 returnerer offers: null (så appen ikke “overskriver”)
 // - bygger offers fra tickets[].proposals[] + tickets[].segments[]
-// - hvert offer får tp_proposal_id (proposals[].id) som appen sender til /click
+// - hvert offer får: offer_id, price, depTime, arrTime, routeText, tp_proposal_id
 // ==============================
 app.post("/api/flights/results", async (req, res) => {
   try {
@@ -5527,7 +5528,15 @@ app.post("/api/flights/results", async (req, res) => {
     const tpTs = Math.max(tsIn, tpRawTs || 0);
     const isOver = !!data.is_over;
 
-    // helpers
+    // ---------------- helpers ----------------
+    const pick = (obj, keys) => {
+      for (const k of keys) {
+        const v = obj?.[k];
+        if (v != null && v !== "") return v;
+      }
+      return null;
+    };
+
     const toUpper = (v) => String(v || "").toUpperCase().trim();
 
     const num = (v) => {
@@ -5556,7 +5565,7 @@ app.post("/api/flights/results", async (req, res) => {
     };
 
     const pickPriceFromProposal = (p) => {
-      // Ny API: proposals[].price er objekt {currency, amount}
+      // Ny API: proposals[].price er ofte objekt {currency, amount}
       const c = p?.price ?? p?.unified_price ?? p?.total_price ?? p?.amount ?? null;
       if (typeof c === "number" && Number.isFinite(c)) return c;
       if (typeof c === "string") return num(c);
@@ -5577,47 +5586,98 @@ app.post("/api/flights/results", async (req, res) => {
       return toUpper(c || "NOK");
     };
 
-    // build offers PER proposal (samme counter-logikk som fallback click, hvis du vil)
+    // ---------------- DEBUG (valgfritt) ----------------
+    if (tickets[0]) {
+      const t0 = tickets[0];
+      const segs = Array.isArray(t0?.segments) ? t0.segments : [];
+      console.log("🧪 ticket[0] keys:", Object.keys(t0 || {}));
+      console.log("🧪 segments count:", segs.length);
+      if (segs[0]) console.log("🧪 seg[0] keys:", Object.keys(segs[0] || {}));
+      if (segs[segs.length - 1]) console.log("🧪 seg[last] keys:", Object.keys(segs[segs.length - 1] || {}));
+      console.log("🧪 seg[0] sample:", JSON.stringify(segs[0] || {}, null, 2).slice(0, 1200));
+    }
+
+    // ---------------- build offers PER proposal ----------------
     const offers = [];
     let counter = 0;
 
     for (const t of tickets) {
       const proposals = Array.isArray(t?.proposals) ? t.proposals : [];
-      const seg0 = Array.isArray(t?.segments) ? t.segments[0] : null;
-      const segLast = Array.isArray(t?.segments) ? t.segments[t.segments.length - 1] : null;
+      const segs = Array.isArray(t?.segments) ? t.segments : [];
+      const seg0 = segs[0] || null;
+      const segLast = segs[segs.length - 1] || null;
 
+      // Origin / destination (mange varianter)
       const origin =
-        seg0?.origin || seg0?.from || seg0?.origin_iata || seg0?.departure_airport || t?.origin || "";
-      const destination =
-        segLast?.destination || segLast?.to || segLast?.destination_iata || segLast?.arrival_airport || t?.destination || "";
+        pick(seg0, [
+          "origin",
+          "from",
+          "origin_iata",
+          "origin_code",
+          "origin_airport",
+          "departure_airport",
+          "departure_airport_code",
+          "departure_airport_iata",
+        ]) ||
+        pick(t, ["origin", "from", "origin_iata", "origin_code"]) ||
+        "";
 
+      const destination =
+        pick(segLast, [
+          "destination",
+          "to",
+          "destination_iata",
+          "destination_code",
+          "destination_airport",
+          "arrival_airport",
+          "arrival_airport_code",
+          "arrival_airport_iata",
+        ]) ||
+        pick(t, ["destination", "to", "destination_iata", "destination_code"]) ||
+        "";
+
+      // Departure / arrival datetime (varierer mellom regioner/versjoner)
       const dep =
-        seg0?.local_departure_date_time ||
-        seg0?.departure_at ||
-        seg0?.local_departure ||
-        seg0?.departure_time ||
-        t?.departure_at ||
+        pick(seg0, [
+          "local_departure_date_time",
+          "departure_at",
+          "local_departure",
+          "departure_time",
+          "depart_at",
+          "departure_datetime",
+          "departureDateTime",
+        ]) ||
+        pick(t, ["departure_at", "local_departure", "departure_time"]) ||
         null;
 
       const arr =
-        segLast?.local_arrival_date_time ||
-        segLast?.arrival_at ||
-        segLast?.local_arrival ||
-        segLast?.arrival_time ||
-        t?.arrival_at ||
+        pick(segLast, [
+          "local_arrival_date_time",
+          "arrival_at",
+          "local_arrival",
+          "arrival_time",
+          "arrive_at",
+          "arrival_datetime",
+          "arrivalDateTime",
+        ]) ||
+        pick(t, ["arrival_at", "local_arrival", "arrival_time"]) ||
         null;
 
-      const durationMins =
-        num(seg0?.duration) ??
-        num(t?.duration) ??
-        num(t?.total_duration) ??
-        num(t?.travel_time) ??
-        null;
+      // duration: kan være minutter eller sekunder
+      const durationRaw =
+        pick(seg0, ["duration", "duration_minutes", "duration_mins"]) ??
+        pick(t, ["duration", "total_duration", "travel_time"]);
+
+      const durationNum = (() => {
+        const n = Number(durationRaw);
+        if (!Number.isFinite(n)) return null;
+        return n > 10000 ? Math.round(n / 60) : n; // sekunder -> minutter
+      })();
 
       const routeText = origin && destination ? `${toUpper(origin)} → ${toUpper(destination)}` : "";
       const depTime = fmtTimeHHMM(dep);
       const arrTime = fmtTimeHHMM(arr);
-      const durationText = durationMins != null ? fmtDurationMins(durationMins) : "";
+      const durationText = durationNum != null ? fmtDurationMins(durationNum) : "";
 
       for (const p of proposals) {
         const offer_id = `${sid}:${counter}`;
@@ -5694,7 +5754,6 @@ app.post("/api/flights/results", async (req, res) => {
     });
   }
 });
-
 
 // ==============================
 // ✅ /api/flights/click (NY - RIKTIG)
