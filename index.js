@@ -5445,10 +5445,10 @@ app.post("/api/flights/start", async (req, res) => {
 const flightClickCache = global.flightClickCache || (global.flightClickCache = new Map());
 
 // ==============================
-// ✅ /api/flights/results (FIX v2: segments[].flights -> flight_legs lookup)
-// - segments[].flights kan være ELLER:
-//    A) "id" (string/uuid) som må slås opp i legsById
-//    B) "index" (number) inn i data.flight_legs[]  ✅ (dette ser du hos deg: [82,83,84])
+// ✅ /api/flights/results (FIX v2 + airline/flightno robust)
+// - segments[].flights kan være:
+//    A) id/uuid -> legsById
+//    B) index (number) -> data.flight_legs[idx]  ✅ (hos deg: [82,83,84])
 // - fyller depTime/arrTime/routeText/durationText/stopsText/airlinesText/flightNosText
 // - 304 returnerer offers:null
 // ==============================
@@ -5603,7 +5603,7 @@ app.post("/api/flights/results", async (req, res) => {
       if (id != null) legsById.set(String(id), leg);
     }
 
-    // ✅ viktig: flights[] kan være indeks ELLER id
+    // ✅ flights[] kan være indeks ELLER id
     const resolveLeg = (ref) => {
       if (ref == null) return null;
       if (typeof ref === "object") return ref;
@@ -5653,13 +5653,53 @@ app.post("/api/flights/results", async (req, res) => {
       return n > 10000 ? Math.round(n / 60) : n; // sek -> min hvis det ser stort ut
     };
 
-    const legAirline = (leg) =>
-      toUpper(
-        pick(leg, ["airline", "carrier", "marketing_carrier", "carrier_code", "airline_code", "airline_iata"]) || ""
-      );
+    // ---- robust object helper ----
+    const pickObj = (v, keys) => {
+      if (!v) return null;
+      if (typeof v === "string") return v;
+      if (typeof v === "object") {
+        for (const k of keys) {
+          const x = v?.[k];
+          if (x != null && x !== "") return x;
+        }
+      }
+      return null;
+    };
 
-    const legFlightNo = (leg) =>
-      toUpper(pick(leg, ["flight_number", "flight_no", "number", "flightNumber", "flight_num"]) || "");
+    // ---- robust airline + flight number ----
+    const legAirline = (leg) => {
+      const direct = pick(leg, [
+        "airline",
+        "carrier",
+        "marketing_carrier",
+        "operating_carrier",
+        "airline_code",
+        "carrier_code",
+        "airline_iata",
+      ]);
+      if (direct && typeof direct === "string") return toUpper(direct);
+
+      const obj =
+        leg?.airline ||
+        leg?.carrier ||
+        leg?.marketing_carrier ||
+        leg?.operating_carrier ||
+        null;
+
+      const code = pickObj(obj, ["iata", "iata_code", "code", "id", "carrier_code", "airline_code"]);
+      return toUpper(code || "");
+    };
+
+    const legFlightNo = (leg) => {
+      const direct = pick(leg, ["flight_number", "flight_no", "flightNumber", "flight_num", "number"]);
+      if (direct != null && direct !== "") return toUpper(String(direct));
+
+      const obj = leg?.flight || leg?.flight_number_obj || null;
+      const n = pickObj(obj, ["number", "flight_number", "flightNo", "no"]);
+      if (n != null && n !== "") return toUpper(String(n));
+
+      return "";
+    };
 
     // ---------------- build offers PER proposal ----------------
     const offers = [];
@@ -5764,13 +5804,17 @@ app.post("/api/flights/results", async (req, res) => {
       tsOut: tpTs,
     });
 
-    // --- DEBUG: bekreft resolveLeg virker ---
+    // --- DEBUG: bekreft resolveLeg + airline/flight_no ---
     if (tickets[0]) {
       const s0 = Array.isArray(tickets[0]?.segments) ? tickets[0].segments[0] : null;
       const firstRef = Array.isArray(s0?.flights) ? s0.flights[0] : null;
       const leg0 = resolveLeg(firstRef);
       console.log("🧪 seg0.flights[0]:", firstRef);
       console.log("🧪 resolveLeg(first) keys:", Object.keys(leg0 || {}));
+      console.log("🧪 resolveLeg(first) airline/flight:", {
+        airline: legAirline(leg0 || {}),
+        flightNo: legFlightNo(leg0 || {}),
+      });
     }
 
     if (offers[0]) {
