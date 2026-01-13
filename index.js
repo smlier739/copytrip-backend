@@ -5788,17 +5788,42 @@ app.post("/api/flights/click", async (req, res) => {
           validateStatus: (status) => status >= 200 && status < 400,
         }
       );
+        
+      console.log("🧪 TP click status:", cr.status);
+      console.log("🧪 TP click keys:", Object.keys(cr.data || {}));
+      console.log("🧪 TP click data:", JSON.stringify(cr.data || {}, null, 2));
+
+      const pickUrlFromObj = (o) =>
+        (o && (
+          o.url ||
+          o.click_url ||
+          o.clickUrl ||
+          o.redirect_url ||
+          o.redirectUrl ||
+          o.deeplink ||
+          o.deep_link ||
+          o.deepLink ||
+          o.link ||
+          o.result_url ||
+          o.resultUrl
+        )) || null;
 
       const url = pickUrlFromObj(cr?.data) || null;
-      if (!url) {
-        return res.status(502).json({
-          error: "TP click manglet url",
-          details: { responseKeys: Object.keys(cr?.data || {}) },
-        });
-      }
       return res.json({ ok: true, url, source: "tp_click_direct" });
     }
 
+    if (!url) {
+      return res.status(502).json({
+        error: "TP click manglet url",
+        details: {
+          status: cr.status,
+          keys: Object.keys(cr.data || {}),
+          data: cr.data || null,
+          sent: clickPayload,
+        },
+      });
+    }
+      
     // ---- 2) Fallback: resolve tp_proposal_id fra offer_id "sid:n" ved å hente full results(ts=0) ----
     async function fetchFullResults() {
       const payload = { marker: tp.marker, search_id: sid, last_update_timestamp: 0 };
