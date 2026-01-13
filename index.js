@@ -5445,12 +5445,10 @@ app.post("/api/flights/start", async (req, res) => {
 const flightClickCache = global.flightClickCache || (global.flightClickCache = new Map());
 
 // ==============================
-// ✅ /api/flights/results (OPPDATERT)
-// - Robust segment-plukking (flere feltnavn)
-// - Robust duration (sekunder -> minutter ved behov)
-// - 304 returnerer offers: null (så appen ikke “overskriver”)
-// - bygger offers fra tickets[].proposals[] + tickets[].segments[]
-// - hvert offer får: offer_id, price, depTime, arrTime, routeText, tp_proposal_id
+// ✅ /api/flights/results (FIX: segments[].flights -> flight_legs lookup)
+// - tickets[].segments[].flights er id-liste -> slå opp i data.flight_legs
+// - fyller depTime/arrTime/routeText/durationText/stopsText/airlinesText/flightNosText
+// - 304 returnerer offers:null
 // ==============================
 app.post("/api/flights/results", async (req, res) => {
   try {
@@ -5511,12 +5509,13 @@ app.post("/api/flights/results", async (req, res) => {
         ok: true,
         is_over: false,
         last_update_timestamp: tsIn,
-        offers: null, // 👈 null = app skal IKKE overskrive
+        offers: null, // 👈 viktig: ikke overskriv i app
       });
     }
 
     const data = r.data || {};
     const tickets = Array.isArray(data?.tickets) ? data.tickets : [];
+    const legsArr = Array.isArray(data?.flight_legs) ? data.flight_legs : [];
 
     const tpRawTs =
       typeof data.last_update_timestamp === "number"
@@ -5564,8 +5563,10 @@ app.post("/api/flights/results", async (req, res) => {
       return h > 0 ? `${h}t ${m}m` : `${m}m`;
     };
 
+    const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
+
+    // proposals: price kan være objekt {currency, amount}
     const pickPriceFromProposal = (p) => {
-      // Ny API: proposals[].price er ofte objekt {currency, amount}
       const c = p?.price ?? p?.unified_price ?? p?.total_price ?? p?.amount ?? null;
       if (typeof c === "number" && Number.isFinite(c)) return c;
       if (typeof c === "string") return num(c);
@@ -5586,16 +5587,45 @@ app.post("/api/flights/results", async (req, res) => {
       return toUpper(c || "NOK");
     };
 
-    // ---------------- DEBUG (valgfritt) ----------------
-    if (tickets[0]) {
-      const t0 = tickets[0];
-      const segs = Array.isArray(t0?.segments) ? t0.segments : [];
-      console.log("🧪 ticket[0] keys:", Object.keys(t0 || {}));
-      console.log("🧪 segments count:", segs.length);
-      if (segs[0]) console.log("🧪 seg[0] keys:", Object.keys(segs[0] || {}));
-      if (segs[segs.length - 1]) console.log("🧪 seg[last] keys:", Object.keys(segs[segs.length - 1] || {}));
-      console.log("🧪 seg[0] sample:", JSON.stringify(segs[0] || {}, null, 2).slice(0, 1200));
+    // ---------------- build legsById ----------------
+    const legsById = new Map();
+    for (const leg of legsArr) {
+      const id =
+        leg?.id ??
+        leg?._id ??
+        leg?.uuid ??
+        leg?.leg_id ??
+        leg?.flight_leg_id ??
+        leg?.flight_id ??
+        null;
+      if (id != null) legsById.set(String(id), leg);
     }
+
+    // plukk felter fra et leg-objekt
+    const legOrigin = (leg) =>
+      pick(leg, ["origin", "from", "origin_iata", "origin_code", "departure_airport", "airport_from"]);
+    const legDest = (leg) =>
+      pick(leg, ["destination", "to", "destination_iata", "destination_code", "arrival_airport", "airport_to"]);
+
+    const legDep = (leg) =>
+      pick(leg, ["local_departure", "departure_at", "departure_time", "depart_at", "departure_datetime"]);
+    const legArr = (leg) =>
+      pick(leg, ["local_arrival", "arrival_at", "arrival_time", "arrive_at", "arrival_datetime"]);
+
+    const legDurationMins = (leg) => {
+      const raw =
+        pick(leg, ["duration", "duration_mins", "duration_minutes", "travel_time", "flight_time"]) ?? null;
+      const n = Number(raw);
+      if (!Number.isFinite(n)) return null;
+      // hvis sekunder -> minutter
+      return n > 10000 ? Math.round(n / 60) : n;
+    };
+
+    const legAirline = (leg) =>
+      toUpper(pick(leg, ["airline", "carrier", "marketing_carrier", "carrier_code", "airline_code", "airline_iata"]) || "");
+
+    const legFlightNo = (leg) =>
+      toUpper(pick(leg, ["flight_number", "flight_no", "number", "flightNumber", "flight_num"]) || "");
 
     // ---------------- build offers PER proposal ----------------
     const offers = [];
@@ -5605,79 +5635,50 @@ app.post("/api/flights/results", async (req, res) => {
       const proposals = Array.isArray(t?.proposals) ? t.proposals : [];
       const segs = Array.isArray(t?.segments) ? t.segments : [];
       const seg0 = segs[0] || null;
-      const segLast = segs[segs.length - 1] || null;
 
-      // Origin / destination (mange varianter)
+      // ✅ NYTT: segmentet har flights: [id,id,...]
+      const flightIds = Array.isArray(seg0?.flights) ? seg0.flights : [];
+      const legs = flightIds.map((id) => legsById.get(String(id))).filter(Boolean);
+
+      const firstLeg = legs[0] || null;
+      const lastLeg = legs[legs.length - 1] || null;
+
       const origin =
-        pick(seg0, [
-          "origin",
-          "from",
-          "origin_iata",
-          "origin_code",
-          "origin_airport",
-          "departure_airport",
-          "departure_airport_code",
-          "departure_airport_iata",
-        ]) ||
+        (firstLeg && legOrigin(firstLeg)) ||
         pick(t, ["origin", "from", "origin_iata", "origin_code"]) ||
         "";
 
       const destination =
-        pick(segLast, [
-          "destination",
-          "to",
-          "destination_iata",
-          "destination_code",
-          "destination_airport",
-          "arrival_airport",
-          "arrival_airport_code",
-          "arrival_airport_iata",
-        ]) ||
+        (lastLeg && legDest(lastLeg)) ||
         pick(t, ["destination", "to", "destination_iata", "destination_code"]) ||
         "";
 
-      // Departure / arrival datetime (varierer mellom regioner/versjoner)
-      const dep =
-        pick(seg0, [
-          "local_departure_date_time",
-          "departure_at",
-          "local_departure",
-          "departure_time",
-          "depart_at",
-          "departure_datetime",
-          "departureDateTime",
-        ]) ||
-        pick(t, ["departure_at", "local_departure", "departure_time"]) ||
-        null;
+      const dep = firstLeg ? legDep(firstLeg) : pick(t, ["departure_at", "local_departure", "departure_time"]);
+      const arr = lastLeg ? legArr(lastLeg) : pick(t, ["arrival_at", "local_arrival", "arrival_time"]);
 
-      const arr =
-        pick(segLast, [
-          "local_arrival_date_time",
-          "arrival_at",
-          "local_arrival",
-          "arrival_time",
-          "arrive_at",
-          "arrival_datetime",
-          "arrivalDateTime",
-        ]) ||
-        pick(t, ["arrival_at", "local_arrival", "arrival_time"]) ||
-        null;
+      const durationSum =
+        legs.length > 0
+          ? legs.reduce((acc, leg) => acc + (legDurationMins(leg) || 0), 0)
+          : (num(t?.duration) ?? num(t?.total_duration) ?? num(t?.travel_time) ?? null);
 
-      // duration: kan være minutter eller sekunder
-      const durationRaw =
-        pick(seg0, ["duration", "duration_minutes", "duration_mins"]) ??
-        pick(t, ["duration", "total_duration", "travel_time"]);
-
-      const durationNum = (() => {
-        const n = Number(durationRaw);
-        if (!Number.isFinite(n)) return null;
-        return n > 10000 ? Math.round(n / 60) : n; // sekunder -> minutter
-      })();
-
-      const routeText = origin && destination ? `${toUpper(origin)} → ${toUpper(destination)}` : "";
       const depTime = fmtTimeHHMM(dep);
       const arrTime = fmtTimeHHMM(arr);
-      const durationText = durationNum != null ? fmtDurationMins(durationNum) : "";
+      const durationText = durationSum != null ? fmtDurationMins(durationSum) : "";
+      const routeText = origin && destination ? `${toUpper(origin)} → ${toUpper(destination)}` : "";
+
+      // stops: flights-1 (hvis legs finnes). Ellers prøv transfers.
+      const stops =
+        legs.length > 0
+          ? Math.max(0, legs.length - 1)
+          : Array.isArray(seg0?.transfers)
+            ? seg0.transfers.length
+            : null;
+
+      const stopsText =
+        stops == null ? "" : stops === 0 ? "Direkte" : `${stops} stopp`;
+
+      const airlinesText = legs.length ? uniq(legs.map(legAirline)).filter(Boolean).join(", ") : "";
+      const flightNosText = legs.length ? uniq(legs.map(legFlightNo)).filter(Boolean).join(", ") : "";
 
       for (const p of proposals) {
         const offer_id = `${sid}:${counter}`;
@@ -5701,10 +5702,10 @@ app.post("/api/flights/results", async (req, res) => {
           durationText,
 
           routeText,
-          stopsText: "",
+          stopsText,
 
-          airlinesText: "",
-          flightNosText: "",
+          airlinesText,
+          flightNosText,
           agentText: "",
 
           signature: t?.signature || null,
@@ -5716,12 +5717,19 @@ app.post("/api/flights/results", async (req, res) => {
 
     console.log("✅ TP counts:", {
       tickets: tickets.length,
+      flight_legs: legsArr.length,
       offers: offers.length,
       is_over: isOver,
       tpRawTs: data?.last_update_timestamp,
       tsIn,
       tsOut: tpTs,
     });
+
+    if (tickets[0]) {
+      const seg0 = Array.isArray(tickets[0]?.segments) ? tickets[0].segments[0] : null;
+      console.log("🧪 seg[0] keys:", Object.keys(seg0 || {}));
+      console.log("🧪 seg[0] flights:", Array.isArray(seg0?.flights) ? seg0.flights.length : null);
+    }
 
     if (offers[0]) {
       console.log("🧪 offer[0] mini:", {
@@ -5732,10 +5740,13 @@ app.post("/api/flights/results", async (req, res) => {
         depTime: offers[0].depTime,
         arrTime: offers[0].arrTime,
         routeText: offers[0].routeText,
+        airlinesText: offers[0].airlinesText,
+        flightNosText: offers[0].flightNosText,
+        stopsText: offers[0].stopsText,
       });
     }
 
-    // (valgfritt) cache mapping offer_id -> tp_proposal_id
+    // cache mapping offer_id -> tp_proposal_id (til click fallback)
     const map = {};
     for (const o of offers) if (o.offer_id && o.tp_proposal_id) map[o.offer_id] = o.tp_proposal_id;
     flightSearchCache.set(sid, { ...cached, offer_to_tp_proposal: map });
