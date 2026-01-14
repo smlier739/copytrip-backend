@@ -15,6 +15,9 @@ import { fileURLToPath } from "url";
 import { Resend } from "resend";
 import fetch from "node-fetch";
 import crypto from "crypto";
+import adminRoutes from "./routes/admin.js";
+
+app.use("/api/admin", adminRoutes);
 
 dotenv.config({ override: true });
 
