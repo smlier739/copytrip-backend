@@ -6,12 +6,14 @@ dotenv.config({ override: true });
 
 const { Pool } = pkg;
 
-const useUrl = !!process.env.DATABASE_URL;
-
-const pool = useUrl
+// Bruk DATABASE_URL hvis satt (Render / hosted),
+// ellers lokal Postgres-konfig
+const pool = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false }, // Render/hosted Postgres
+      ssl: {
+        rejectUnauthorized: false, // nødvendig for Render / managed Postgres
+      },
     })
   : new Pool({
       host: process.env.DB_HOST || "localhost",
@@ -21,8 +23,9 @@ const pool = useUrl
       database: process.env.DB_NAME || "copytrip",
     });
 
+// Global error handler for pool
 pool.on("error", (err) => {
-  console.error("Postgres pool error:", err);
+  console.error("❌ Postgres pool error:", err);
 });
 
 export default pool;
