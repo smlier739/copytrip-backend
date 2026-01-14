@@ -1544,6 +1544,27 @@ async function generateTripFromEpisode({
       .filter((e) => e.name);
   };
 
+  function cleanEpisodeDescription(text) {
+    const s = (text || "").toString();
+
+    // Fjern typiske Acast/annonse-linjer
+    const lines = s.split("\n").map(l => l.trim());
+    const filtered = lines.filter(l => {
+      const low = l.toLowerCase();
+      if (!l) return false;
+      if (low.includes("vil du annonsere")) return false;
+      if (low.includes("hosted on acast")) return false;
+      if (low.includes("acast.com/privacy")) return false;
+      if (low.includes("ta kontakt med vår salgspartner")) return false;
+      if (low.includes("send epost til")) return false;
+      return true;
+    });
+
+    return filtered.join("\n").trim();
+}
+    
+    const cleanedDescription = cleanEpisodeDescription(description);
+    
   // -------------------------
   // Prompt (oppdatert)
   // -------------------------
