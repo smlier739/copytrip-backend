@@ -102,8 +102,6 @@ export const upload = multer({
   limits: { fileSize: 12 * 1024 * 1024 },
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || "superhemmelig-dev-token";
-
 function normalizeIp(ip) {
   if (!ip) return "";
   return String(ip).replace(/^::ffff:/, "");
