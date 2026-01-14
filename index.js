@@ -1447,6 +1447,7 @@ ${profileText}
 
 // -------------------------------------------------------
 //  KI: EPISODE-BASERT TRIP (PERSONLIG + TILPASNING)
+//  - Oppdatert: mer spesifikk pakkeliste basert på episode/Johnny/sted
 // -------------------------------------------------------
 async function generateTripFromEpisode({
   episodeId,
@@ -1514,9 +1515,8 @@ async function generateTripFromEpisode({
           (typeof x.external_url === "string" && x.external_url.trim()) ||
           null;
 
-        const url = rawUrl
-          ? (isHttpUrl(rawUrl) ? rawUrl.trim() : null)
-          : makeTicketSearchUrl(name, location);
+        // Kun behold hvis den er en ekte http(s)-url. Ellers null (ikke google-søk her).
+        const url = rawUrl && isHttpUrl(rawUrl) ? rawUrl.trim() : null;
 
         const day = typeof x.day === "number" ? x.day : null;
 
@@ -1545,20 +1545,21 @@ async function generateTripFromEpisode({
   };
 
   // -------------------------
-  // Prompt
+  // Prompt (oppdatert)
   // -------------------------
   const systemPrompt = `
-Du er en erfaren reiseplanlegger som lager konkrete reiseforslag basert på
-Grenseløs-episoder OG brukerens ønsker.
+Du er en erfaren ekspedisjons- og reiseplanlegger for podkasten Grenseløs.
+Du lager konkrete reiseforslag basert på episodebeskrivelsen (og implisitte detaljer i den),
+samt brukerens ønsker og profil.
 
 Du MÅ ALLTID svare med gyldig JSON, uten forklaringstekst rundt.
 
 Returner strukturert JSON med “title”, “description”, “stops”, “packing_list”, “hotels” og “experiences”.
 
-“experiences” er en array av opplevelser/aktiviteter som ofte krever billett/booking.
-Hver experience må ha: title, location, description, og helst booking_url (hvis du er sikker), ellers null.
+“experiences” er en array av opplevelser/aktiviteter.
+Hver experience må ha: title, location, description, og booking_url (kun hvis du er 100% sikker), ellers null.
 
-Output-format (MÅ MATCHES):
+OUTPUT-FORMAT (MÅ MATCHES NØYAKTIG):
 
 {
   "title": "Kort og konkret tittel på reisen",
@@ -1575,19 +1576,19 @@ Output-format (MÅ MATCHES):
   "packing_list": [
     {
       "category": "Klær",
-      "items": [ "Vind- og regnjakke", "Gode joggesko" ]
+      "items": [ "Vind- og regnjakke (pga vær/terreng)", "Gode fjellsko (stein/sti)" ]
     },
     {
       "category": "Toalettsaker",
-      "items": [ "Tannbørste og tannkrem", "Solkrem" ]
+      "items": [ "Våtsservietter (dårlig tilgang på vann)", "Myggmiddel (hvis relevant)" ]
     },
     {
       "category": "Elektronikk",
-      "items": [ "Mobil og lader", "Powerbank" ]
+      "items": [ "Offline-kart (dekning ustabil)", "Powerbank 20 000 mAh (lange dager)" ]
     },
     {
       "category": "Annet",
-      "items": [ "Pass/ID-kort", "Reiseforsikringsbevis" ]
+      "items": [ "Vannfilter (nevnt/anbefalt av Johnny eller typisk for turen)", "Førstehjelpspakke (kutt/gnagsår)" ]
     }
   ],
   "hotels": [
@@ -1610,7 +1611,7 @@ Output-format (MÅ MATCHES):
   ]
 }
 
-KRAV FOR PACKING_LIST:
+KRAV FOR PACKING_LIST (VIKTIG – SKAL VÆRE SPESIFIKK):
 - "packing_list" SKAL ALLTID være en liste med NØYAKTIG 4 elementer.
 - De 4 elementene SKAL ha "category" lik:
     1) "Klær"
@@ -1618,8 +1619,21 @@ KRAV FOR PACKING_LIST:
     3) "Elektronikk"
     4) "Annet"
 - Kategorinavnene må være akkurat disse.
-- Hver kategori SKAL ha en "items"-liste med 3–10 KONKRETE ting.
-- Hvis Johnny nevner konkret utstyr i Grenseløs-episode, som vannfilter, etc, skal det alltid med i "packing_list".
+- Hver kategori SKAL ha 6–10 items (ikke færre).
+- Hvert item SKAL være konkret og situasjonsbestemt, og bør inneholde en kort parentesforklaring
+  som knytter det til episoden/Johnny-reisetips/typiske forhold på stedet.
+  Eksempel: "Vanntett pakkpose 10L (Johnny: alt må tåle vann)".
+- Hvis episodebeskrivelsen antyder klima/terreng (kulde, regn, varme, høyde, ørken, jungel, båt, motorsykkel, safari, by, langtransport),
+  må pakkelisten reflektere dette med riktig utstyr (lag-på-lag, sol, mygg, støv, vann, høyde, sikkerhet, etc.).
+- Hvis Johnny nevner eller sannsynligvis anbefaler spesifikt utstyr (typisk Grenseløs),
+  må du prioritere:
+  1) utstyr til trygg ferdsel (fottøy, hodelykt, førstehjelp, kart/kompass/offline kart),
+  2) vær/eksponering (regn, vind, sol, kulde),
+  3) logistikk (vann, mat, hygieneløsninger),
+  4) dokumenter/økonomi (ID, forsikring, betalingsmidler),
+  5) opptak/foto hvis relevant (ekstra batteri, minnekort).
+- Du må IKKE finne på ville detaljer. Dersom episoden ikke eksplisitt sier f.eks. "jungel", "arktisk", osv.,
+  bruk konservative antagelser basert på stedsnavn og beskrivelse. Men pakkelisten skal fortsatt være konkret.
 
 KRAV FOR STOPS:
 - 5–10 stopp.
@@ -1651,6 +1665,10 @@ ${userPreferences && userPreferences.trim()
 
 BRUKERPROFIL (hvis tilgjengelig):
 ${profileText}
+
+VIKTIG FOR PACKING_LIST:
+- Lag pakkelisten som om du skal gi rådene direkte til en lytter av Grenseløs.
+- Bruk det som fremgår/antydes i beskrivelsen til å gjøre listen sted- og turspesifikk.
 `.trim();
 
   const completion = await openai.chat.completions.create({
@@ -1659,7 +1677,8 @@ ${profileText}
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt }
     ],
-    temperature: 0.7
+    // Lavere temp gir ofte bedre "krav-tro" JSON når vi er strenge på format.
+    temperature: 0.4
   });
 
   const aiText = completion.choices?.[0]?.message?.content?.trim() || "";
@@ -1679,8 +1698,7 @@ ${profileText}
     };
   }
 
-  // ✅ Experiences: normaliser + fallback url
-  // Støtter både trip.experiences og parsed.experiences, siden normalizeTripStructure kan flytte rundt.
+  // ✅ Experiences: normaliser (ingen google-søk fallback her – håndteres i VirtualTripScreen)
   const rawExperiences =
     Array.isArray(trip.experiences) ? trip.experiences :
     Array.isArray(parsed?.experiences) ? parsed.experiences :
@@ -1688,7 +1706,7 @@ ${profileText}
 
   trip.experiences = normalizeExperiencesArray(rawExperiences);
 
-  // ✅ Hvis modellen ga 0 experiences, legg inn en liten fallback basert på første stopp
+  // ✅ Hvis modellen ga 0 experiences, legg inn en liten fallback uten url
   if (trip.experiences.length === 0) {
     const firstStop = Array.isArray(trip.stops) && trip.stops[0] ? trip.stops[0] : null;
     const loc = (firstStop?.name || "").toString().trim();
@@ -1698,7 +1716,7 @@ ${profileText}
         name: "Guidet opplevelse / byvandring",
         location: loc,
         description: "Sjekk tilgjengelige turer og billetter i området.",
-        url: makeTicketSearchUrl("Guidet tur", loc),
+        url: null,
         day: typeof firstStop?.day === "number" ? firstStop.day : 1,
         price_per_person: null,
         currency: "NOK"
@@ -1708,7 +1726,7 @@ ${profileText}
         name: "Museum / attraksjon",
         location: loc,
         description: "Et trygt valg på reisedager – sjekk åpningstider og billetter.",
-        url: makeTicketSearchUrl("Museum", loc),
+        url: null,
         day: typeof firstStop?.day === "number" ? firstStop.day : 1,
         price_per_person: null,
         currency: "NOK"
