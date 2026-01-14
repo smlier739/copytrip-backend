@@ -18,7 +18,7 @@ import fetch from "node-fetch";
 import crypto from "crypto";
 
 import adminRoutes from "./routes/admin.js";
-import pool from "./src/db.js"; // ✅ ÉN kilde til DB (ikke re-deklarer pool i index.js)
+import pool from "./db.js"; // ✅ ÉN kilde til DB (ikke re-deklarer pool i index.js)
 
 // -------------------------
 // ESM-vennlig __dirname
