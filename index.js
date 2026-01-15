@@ -4353,83 +4353,6 @@ app.post(
 );
 
 // -------------------------------------------------------
-//  VIPPS: OPPRETT BETALING (MVP-ENDPOINT)
-// -------------------------------------------------------
-
-// Disse legger du inn i .env etter hvert som du får dem fra Vipps
-// VIPPS_CLIENT_ID=...
-// VIPPS_CLIENT_SECRET=...
-// VIPPS_MERCHANT_SERIAL=...
-// VIPPS_SUBSCRIPTION_KEY=...
-// VIPPS_BASE_URL=https://apitest.vipps.no   # testmiljø
-// VIPPS_TEST_REDIRECT_URL=https://vipps.no  # midlertidig, til du har ekte checkout-url
-
-// Enkel helper som på sikt kan kalle Vipps-API.
-// Nå returnerer vi en "fake" URL slik at appen din kan testes med ekte flyt.
-async function createVippsSessionForUser(userId, { amount, description }) {
-  console.log('🧾 Oppretter Vipps-session for bruker', userId, 'beløp', amount);
-
-  // TODO: Her kan du senere:
-  //  1. Hente access token fra Vipps
-  //  2. Opprette en payment i Vipps eCom API
-  //  3. Lagre orderId i databasen hvis du vil
-  //  4. Returnere redirectUrl fra Vipps
-
-  const testUrl =
-    process.env.VIPPS_TEST_REDIRECT_URL ||
-    'https://vipps.no'; // midlertidig
-
-  const fakeOrderId = `order_${userId}_${Date.now()}`;
-
-  return {
-    url: testUrl,
-    orderId: fakeOrderId,
-    amount,
-    description
-  };
-}
-
-// Brukes av appen når bruker trykker "Betal med Vipps"
-app.post(
-  "/api/billing/vipps/create-session",
-  authMiddleware,
-  async (req, res) => {
-    try {
-      const userId = req.user?.id;
-      if (!userId) {
-        return res.status(401).json({ error: "Ikke innlogget." });
-      }
-
-      // Du kan senere støtte flere planer / priser
-      const { plan } = req.body || {};
-      const amount = plan === 'yearly' ? 79900 : 7900; // i øre, f.eks. 79,00 kr
-      const description =
-        plan === 'yearly'
-          ? 'Grenseløs Reise · Årsabonnement'
-          : 'Grenseløs Reise · Månedlig abonnement';
-
-      const session = await createVippsSessionForUser(userId, {
-        amount,
-        description
-      });
-
-      // Her kan du også logge til DB at orderId tilhører userId
-      console.log('✅ Vipps-session opprettet:', session);
-
-      res.json({
-        ok: true,
-        ...session
-      });
-    } catch (e) {
-      console.error("/api/billing/vipps/create-session-feil:", e);
-      res.status(500).json({
-        error: "Kunne ikke opprette Vipps-betaling. Prøv igjen senere."
-      });
-    }
-  }
-);
-
-// -------------------------------------------------------
 //  TEMPLATES (JA)
 // -------------------------------------------------------
 
@@ -4666,7 +4589,7 @@ app.post(
             `
             SELECT full_name, home_city, home_country, birth_year, travel_style, budget_per_day, experience_level
             FROM users
-            WHERE user_id = $1
+            WHERE id = $1
             LIMIT 1
             `,
             [req.user.id]
