@@ -973,14 +973,49 @@ Gi kortfattede, konkrete reiseråd for dette landet.
 
 async function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || "";
-  const [, token] = auth.split(" ");
+  const parts = auth.split(" ");
+  const scheme = (parts[0] || "").trim();
+  const token = (parts[1] || "").trim();
 
-  if (!token) {
+  // liten helper for konsistent logging
+  const reqMeta = {
+    method: req.method,
+    path: req.originalUrl || req.url,
+    ip: req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip,
+    ua: req.headers["user-agent"],
+    requestId:
+      req.headers["x-request-id"] ||
+      req.headers["x-amzn-trace-id"] ||
+      req.headers["cf-ray"] ||
+      null,
+  };
+
+  if (!auth) {
+    console.warn("[auth] Missing Authorization header", reqMeta);
     return res.status(401).json({ error: "Manglende Authorization header." });
   }
 
+  if (scheme.toLowerCase() !== "bearer" || !token) {
+    console.warn("[auth] Malformed Authorization header", {
+      ...reqMeta,
+      scheme: scheme || null,
+      hasToken: !!token,
+      authPrefix: auth.slice(0, 20), // bare litt, ikke hele
+    });
+    return res.status(401).json({ error: "Manglende eller ugyldig Authorization header." });
+  }
+
   try {
+    // NB: ikke logg tokenet
     const decoded = jwt.verify(token, JWT_SECRET);
+
+    if (!decoded?.userId) {
+      console.warn("[auth] Token decoded but missing userId", {
+        ...reqMeta,
+        decodedKeys: Object.keys(decoded || {}),
+      });
+      return res.status(401).json({ error: "Ugyldig token (mangler userId)." });
+    }
 
     // Hent bruker fra DB slik at vi alltid har is_admin + navn tilgjengelig
     const u = await query(
@@ -989,22 +1024,49 @@ async function authMiddleware(req, res, next) {
     );
 
     if (u.rowCount === 0) {
+      console.warn("[auth] User not found for token userId", {
+        ...reqMeta,
+        userId: decoded.userId,
+      });
       return res.status(401).json({ error: "Bruker ikke funnet." });
     }
 
     const user = u.rows[0];
+
     req.user = {
       id: user.id,
       email: user.email,
       full_name: user.full_name,
       is_admin: !!user.is_admin,
-      is_premium: !!user.is_premium
+      is_premium: !!user.is_premium,
     };
+
+    // valgfritt: debug på suksess (kan bli mye støy i prod)
+    // console.log("[auth] OK", { ...reqMeta, userId: user.id, is_admin: !!user.is_admin });
 
     next();
   } catch (err) {
-    console.warn("JWT-feil:", err.message);
-    res.status(401).json({ error: "Ugyldig eller utløpt token." });
+    const name = err?.name || "Error";
+    const message = err?.message || String(err);
+
+    // Skille typiske JWT-feil
+    const reason =
+      name === "TokenExpiredError"
+        ? "expired"
+        : name === "JsonWebTokenError"
+          ? "invalid"
+          : name === "NotBeforeError"
+            ? "not-active-yet"
+            : "verify-failed";
+
+    console.warn("[auth] JWT verify failed", {
+      ...reqMeta,
+      reason,
+      jwtErrorName: name,
+      jwtErrorMessage: message,
+    });
+
+    return res.status(401).json({ error: "Ugyldig eller utløpt token." });
   }
 }
 
