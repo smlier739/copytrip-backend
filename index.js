@@ -22,7 +22,7 @@ import pool from "./db.js"; // ✅ ÉN kilde til DB (ikke re-deklarer pool i ind
 
 import johnnysTipsRouter from "./routes/johnnysTips.js";
 app.use("/api/johnnys-tips", johnnysTipsRouter);
-import authMiddleware from "../middleware/authMiddleware.js";
+import authMiddleware from "./middleware/authMiddleware.js";
 
 // -------------------------
 // ESM-vennlig __dirname
