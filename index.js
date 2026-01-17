@@ -20,6 +20,9 @@ import crypto from "crypto";
 import adminRoutes from "./routes/admin.js";
 import pool from "./db.js"; // ✅ ÉN kilde til DB (ikke re-deklarer pool i index.js)
 
+import johnnysTipsRouter from "./routes/johnnysTips.js";
+app.use("/api/johnnys-tips", johnnysTipsRouter);
+
 // -------------------------
 // ESM-vennlig __dirname
 // -------------------------
