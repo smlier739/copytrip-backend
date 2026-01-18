@@ -6853,6 +6853,65 @@ app.get("/api/trips/:id/car-rentals", authMiddleware, async (req, res) => {
   }
 });
 
+// backend: rute for å hente destinasjon (stopp 1) + evt. providers
+app.get("/api/trips/:id/bike-rentals", authMiddleware, async (req, res) => {
+  try {
+    const tripId = req.params.id;
+
+    const tripRes = await query(
+      `SELECT id, user_id, source_episode_id, source_type, stops
+       FROM trips
+       WHERE id = $1 AND user_id = $2
+       LIMIT 1`,
+      [tripId, req.user.id]
+    );
+
+    if (tripRes.rows.length === 0) {
+      return res.status(404).json({ error: "Fant ikke denne reisen." });
+    }
+
+    const row = tripRes.rows[0];
+
+    // canonical stops for episode-trips (hvis du ønsker det)
+    let stops = parseJsonArray(row.stops);
+    if (row.source_episode_id) {
+      const canonRes = await query(
+        `
+        SELECT stops
+        FROM trips
+        WHERE source_type = 'grenselos_episode'
+          AND source_episode_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [row.source_episode_id]
+      );
+      if (canonRes.rows?.[0]) stops = parseJsonArray(canonRes.rows[0].stops);
+    }
+
+    const stop1 = Array.isArray(stops) && stops.length ? stops[0] : null;
+
+    // Normaliser litt (ikke anta feltnavn – bruk det du har i stops)
+    const destination = stop1
+      ? {
+          name: stop1.name || stop1.title || stop1.place || null,
+          city: stop1.city || stop1.locality || null,
+          country_code: stop1.country_code || stop1.countryCode || stop1.country || null,
+          lat: stop1.lat ?? null,
+          lng: stop1.lng ?? null,
+          raw: stop1,
+        }
+      : null;
+
+    // Hvis du har en egen providers-liste/affiliate kan du returnere her.
+    // Foreløpig tom, screenen har alltid "Søk i området".
+    return res.json({ ok: true, tripId, destination, providers: [] });
+  } catch (e) {
+    console.error("/api/trips/:id/bike-rentals feil:", e);
+    return res.status(500).json({ error: "Kunne ikke hente sykkelutleie-destinasjon." });
+  }
+});
+
 // -------------------------------------------------------
 //  GLOBAL FEILHANDLER (helt nederst)
 // -------------------------------------------------------
