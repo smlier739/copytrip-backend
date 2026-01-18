@@ -1,7 +1,8 @@
-// routes/admin.js
+// routes/admin.js (ESM)
 import express from "express";
-import { requireAdmin } from "../middleware/requireAdmin.js";
-import pool from "../db.js"; // pg Pool (default export)
+import authMiddleware from "../middleware/authMiddleware.js";
+import requireAdmin from "../middleware/requireAdmin.js";
+import pool from "../db.js";
 
 const router = express.Router();
 
@@ -10,21 +11,31 @@ function toIntOrDefault(v, def) {
   return Number.isFinite(n) ? n : def;
 }
 
+// Viktig rekkefølge:
+router.use(authMiddleware);
+router.use(requireAdmin);
+
 // 1) KPI summary (1 rad)
-router.get("/dashboard-summary", requireAdmin, async (req, res) => {
+router.get("/dashboard-summary", async (req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT * FROM v_admin_dashboard_summary LIMIT 1`);
-    res.json({ data: rows[0] || null });
+    const { rows } = await pool.query(
+      `SELECT * FROM v_admin_dashboard_summary LIMIT 1`
+    );
+    return res.json({ data: rows[0] || null });
   } catch (e) {
-    console.error("[admin] /dashboard-summary error:", e?.message || e);
-    res.status(500).json({ error: "Kunne ikke hente dashboard summary." });
+    console.error("[admin] /dashboard-summary error:", {
+      msg: e?.message || String(e),
+      requestId: req.requestId,
+      userId: req.user?.id,
+    });
+    return res.status(500).json({ error: "Kunne ikke hente dashboard summary." });
   }
 });
 
 // 2) Timeseries (unified: hour+day)
-router.get("/timeseries", requireAdmin, async (req, res) => {
+router.get("/timeseries", async (req, res) => {
   try {
-    const grainRaw = (req.query.grain || "all").toString().toLowerCase();
+    const grainRaw = String(req.query.grain || "all").toLowerCase();
     const grain = ["hour", "day", "all"].includes(grainRaw) ? grainRaw : "all";
 
     const limit = Math.min(Math.max(toIntOrDefault(req.query.limit, 200), 1), 2000);
@@ -37,7 +48,6 @@ router.get("/timeseries", requireAdmin, async (req, res) => {
       whereSql = `WHERE grain = $${params.length}`;
     }
 
-    // parameterisert LIMIT
     params.push(limit);
     const limitSql = `LIMIT $${params.length}`;
 
@@ -50,31 +60,44 @@ router.get("/timeseries", requireAdmin, async (req, res) => {
     `;
 
     const { rows } = await pool.query(q, params);
-    res.json({ data: rows });
+    return res.json({ data: rows });
   } catch (e) {
-    console.error("[admin] /timeseries error:", e?.message || e);
-    res.status(500).json({ error: "Kunne ikke hente timeseries." });
+    console.error("[admin] /timeseries error:", {
+      msg: e?.message || String(e),
+      requestId: req.requestId,
+      userId: req.user?.id,
+      query: req.query,
+    });
+    return res.status(500).json({ error: "Kunne ikke hente timeseries." });
   }
 });
 
-// 3) Top posts (hvis du har disse viewene)
-router.get("/top-posts-7d", requireAdmin, async (req, res) => {
+// 3) Top posts
+router.get("/top-posts-7d", async (req, res) => {
   try {
     const { rows } = await pool.query(`SELECT * FROM v_admin_top_posts_7d`);
-    res.json({ data: rows });
+    return res.json({ data: rows });
   } catch (e) {
-    console.error("[admin] /top-posts-7d error:", e?.message || e);
-    res.status(500).json({ error: "Kunne ikke hente top posts (7d)." });
+    console.error("[admin] /top-posts-7d error:", {
+      msg: e?.message || String(e),
+      requestId: req.requestId,
+      userId: req.user?.id,
+    });
+    return res.status(500).json({ error: "Kunne ikke hente top posts (7d)." });
   }
 });
 
-router.get("/top-posts-30d", requireAdmin, async (req, res) => {
+router.get("/top-posts-30d", async (req, res) => {
   try {
     const { rows } = await pool.query(`SELECT * FROM v_admin_top_posts_30d`);
-    res.json({ data: rows });
+    return res.json({ data: rows });
   } catch (e) {
-    console.error("[admin] /top-posts-30d error:", e?.message || e);
-    res.status(500).json({ error: "Kunne ikke hente top posts (30d)." });
+    console.error("[admin] /top-posts-30d error:", {
+      msg: e?.message || String(e),
+      requestId: req.requestId,
+      userId: req.user?.id,
+    });
+    return res.status(500).json({ error: "Kunne ikke hente top posts (30d)." });
   }
 });
 
