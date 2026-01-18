@@ -4984,15 +4984,98 @@ app.post("/api/community/posts", authMiddleware, async (req, res) => {
   }
 });
 
-app.get("/api/trips/:id/hotels", authMiddleware, requirePro, async (req, res) => {
+// ✅ Updated: /api/trips/:id/hotels
+// - Datoer legges inn av bruker i appen (ikke i DB)
+// - Destinasjon kommer fra stops[0] (stopp 1)
+// - Gratis: preview (uten url). Pro: full + url
+// - Episode-trips: canonical hotels fra siste trips-row med source_type='grenselos_episode'
+
+function asArrayJsonb(v) {
+  if (Array.isArray(v)) return v;
+  if (!v) return [];
+  // pg kan gi jsonb som objekt/string avhengig av client/oppsett
+  if (typeof v === "string") {
+    try {
+      const p = JSON.parse(v);
+      return Array.isArray(p) ? p : [];
+    } catch {
+      return [];
+    }
+  }
+  // jsonb-objekt
+  return Array.isArray(v) ? v : [];
+}
+
+// Forsøk å hente en "destinasjon" fra stop 1 på tvers av mulige stop-skjema
+function extractDestinationFromStop1(stops) {
+  const arr = asArrayJsonb(stops);
+  const s0 = arr[0];
+  if (!s0 || typeof s0 !== "object") return null;
+
+  // typiske felter jeg har sett i slike stops:
+  const name =
+    s0.name ||
+    s0.title ||
+    s0.place_name ||
+    s0.placeName ||
+    s0.label ||
+    s0.city ||
+    s0.locationName ||
+    null;
+
+  const country = s0.country || s0.countryName || null;
+
+  // iata kan ligge flere steder
+  const iata =
+    s0.iata ||
+    s0.city_iata ||
+    s0.destination_iata ||
+    s0.airport_iata ||
+    s0.airportIata ||
+    (s0.airport && (s0.airport.iata || s0.airport.IATA)) ||
+    null;
+
+  const lat =
+    (typeof s0.lat === "number" && s0.lat) ||
+    (typeof s0.latitude === "number" && s0.latitude) ||
+    (typeof s0.coords?.lat === "number" && s0.coords.lat) ||
+    (typeof s0.coordinate?.latitude === "number" && s0.coordinate.latitude) ||
+    null;
+
+  const lng =
+    (typeof s0.lng === "number" && s0.lng) ||
+    (typeof s0.lon === "number" && s0.lon) ||
+    (typeof s0.longitude === "number" && s0.longitude) ||
+    (typeof s0.coords?.lng === "number" && s0.coords.lng) ||
+    (typeof s0.coords?.lon === "number" && s0.coords.lon) ||
+    (typeof s0.coordinate?.longitude === "number" && s0.coordinate.longitude) ||
+    null;
+
+  return {
+    name: name ? String(name) : null,
+    country: country ? String(country) : null,
+    iata: iata ? String(iata).trim().toUpperCase() : null,
+    lat,
+    lng,
+    raw: s0, // nyttig for debugging i admin, kan fjernes
+  };
+}
+
+app.get("/api/trips/:id/hotels", authMiddleware, async (req, res) => {
   try {
     const tripId = req.params.id;
 
+    const ent = await getUserEntitlements(req.user.id);
+    const isPro = !!ent?.isPro;
+
+    // 1) Hent trip (kun eier)
     const tripRes = await query(
-      `SELECT id, source_episode_id, source_type, hotels
-       FROM trips
-       WHERE id = $1 AND user_id = $2
-       LIMIT 1`,
+      `
+      SELECT id, user_id, title, stops, hotels, source_type, source_episode_id, episode_url
+      FROM trips
+      WHERE id = $1 AND user_id = $2
+      LIMIT 1
+      `,
       [tripId, req.user.id]
     );
 
@@ -5001,9 +5084,11 @@ app.get("/api/trips/:id/hotels", authMiddleware, requirePro, async (req, res) =>
     }
 
     const row = tripRes.rows[0];
+
+    // 2) Start med tripens egne hoteller
     let hotels = parseJsonArray(row.hotels);
 
-    // episode-trip: hent canonical hotels
+    // 3) episode-trip: canonical hotels fra SYSTEM (grenselos_episode)
     if (row.source_episode_id) {
       const canonRes = await query(
         `
@@ -5021,11 +5106,37 @@ app.get("/api/trips/:id/hotels", authMiddleware, requirePro, async (req, res) =>
       }
     }
 
+    // 4) Normaliser + url kun for Pro
     const hotelsFull = (hotels || [])
       .filter((h) => h && typeof h === "object")
-      .map((h) => ({ ...h, url: makeHotelUrl(h) }));
+      .map((h) => ({
+        ...h,
+        url: isPro ? makeHotelUrl(h) : undefined,
+      }));
 
-    return res.json({ ok: true, tripId, hotels: hotelsFull });
+    const hotelsPreview = hotelsFull.slice(0, 10).map((h) => ({
+      name: h?.name || h?.title || "Hotell",
+      location: h?.location || h?.city || h?.area || null,
+      // url skal ikke være med i preview
+    }));
+
+    // 5) Destinasjon fra stop 1
+    const destination = extractDestinationFromStop1(row.stops);
+
+    return res.json({
+      ok: true,
+      tripId,
+      destination, // { name, country, iata, lat, lng, raw }
+      hotels: isPro ? hotelsFull : hotelsPreview,
+      entitlements: { isPro, locked: { hotels: !isPro } },
+      counts: { hotels: hotelsFull.length },
+      // valgfritt: for klient-debug
+      source: {
+        source_type: row.source_type || null,
+        source_episode_id: row.source_episode_id || null,
+        episode_url: row.episode_url || null,
+      },
+    });
   } catch (e) {
     console.error("/api/trips/:id/hotels-feil:", e);
     return res.status(500).json({ error: "Kunne ikke hente hoteller." });
