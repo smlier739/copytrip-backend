@@ -3534,6 +3534,208 @@ function normalizePackingForClient(rawPacking) {
   return [];
 }
 
+// GET: én reise (med canonical override for episode-turer + entitlements + destination_text)
+app.get("/api/trips/:id", authMiddleware, async (req, res) => {
+  try {
+    const tripId = req.params.id;
+
+    const ent = await getUserEntitlements(req.user.id);
+    const isPro = !!ent?.isPro;
+
+    const tripRes = await query(
+      `
+      SELECT
+        id,
+        user_id,
+        title,
+        description,
+        stops,
+        gallery,
+        hotels,
+        packing_list,
+        experiences,
+        source_type,
+        source_episode_id,
+        episode_url,
+        created_at,
+        updated_at
+      FROM trips
+      WHERE id = $1 AND user_id = $2
+      LIMIT 1
+      `,
+      [tripId, req.user.id]
+    );
+
+    if (tripRes.rows.length === 0) {
+      return res.status(404).json({ error: "Fant ikke denne reisen." });
+    }
+
+    const row = tripRes.rows[0];
+
+    // --- helpers ---
+    const toArray = (v) => {
+      if (!v) return [];
+      if (Array.isArray(v)) return v;
+      if (typeof v === "string") {
+        try {
+          const x = JSON.parse(v);
+          return Array.isArray(x) ? x : [];
+        } catch {
+          return [];
+        }
+      }
+      // jsonb kommer ofte som object/array allerede, men håndter object -> []
+      return Array.isArray(v) ? v : [];
+    };
+
+    const toJson = (v, fallback) => {
+      if (v === null || v === undefined) return fallback;
+      if (typeof v === "string") {
+        try {
+          return JSON.parse(v);
+        } catch {
+          return fallback;
+        }
+      }
+      return v;
+    };
+
+    const pickDestinationTextFromStops = (stops) => {
+      try {
+        const s = Array.isArray(stops) ? stops : [];
+        const s1 = s[0];
+        if (!s1 || typeof s1 !== "object") return null;
+
+        const name =
+          s1.name ||
+          s1.title ||
+          s1.place ||
+          s1.city ||
+          s1.location ||
+          s1.destination ||
+          null;
+
+        const country = s1.country || s1.countryName || null;
+
+        const parts = [name, country].filter(Boolean).map((x) => String(x).trim()).filter(Boolean);
+        return parts.length ? parts.join(", ") : null;
+      } catch {
+        return null;
+      }
+    };
+
+    // --- parse base ---
+    let stops = toArray(row.stops);
+    let gallery = toArray(row.gallery);
+    let hotels = toArray(row.hotels);
+    let experiences = toArray(row.experiences);
+    let packing = toJson(row.packing_list, []);
+
+    // --- canonical override for episode-trip ---
+    // Hvis dette er en tur som peker på en episode, bruk siste "grenselos_episode" som canonical kilde
+    if (row.source_episode_id) {
+      const canonRes = await query(
+        `
+        SELECT
+          gallery,
+          hotels,
+          packing_list,
+          experiences,
+          stops,
+          created_at
+        FROM trips
+        WHERE source_type = 'grenselos_episode'
+          AND source_episode_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [row.source_episode_id]
+      );
+
+      const c = canonRes.rows?.[0] || null;
+      if (c) {
+        // stops: behold gjerne brukerens stops om du vil; men for “episode-trip” er canonical ofte riktig
+        // Her velger jeg canonical hvis den finnes, ellers fallback til original.
+        const canonStops = toArray(c.stops);
+        if (canonStops.length) stops = canonStops;
+
+        gallery = toArray(c.gallery);
+        hotels = toArray(c.hotels);
+        experiences = toArray(c.experiences);
+        packing = toJson(c.packing_list, []);
+      }
+    }
+
+    // --- normalize items (best effort) ---
+    const hotelsFull = (hotels || [])
+      .filter((h) => h && typeof h === "object")
+      .map((h) => ({ ...h, url: makeHotelUrl(h) }));
+
+    const experiencesFull = (experiences || [])
+      .filter((x) => x && typeof x === "object")
+      .map((x) => ({ ...x, url: makeExperienceUrl(x) }));
+
+    const packingFull = normalizePackingForClient(packing);
+
+    // --- teasers ---
+    const hotelsPreview = hotelsFull.slice(0, 3).map((h) => ({
+      name: h?.name || h?.title || "Hotell",
+      location: h?.location || h?.city || h?.area || null,
+    }));
+
+    const experiencesPreview = experiencesFull.slice(0, 3).map((x) => ({
+      name: x?.name || x?.title || "Opplevelse",
+      location: x?.location || x?.city || x?.area || null,
+      description: x?.description || null,
+    }));
+
+    const packingPreview = Array.isArray(packingFull) ? packingFull.slice(0, 6) : [];
+
+    const locked = {
+      hotels: !isPro,
+      experiences: !isPro,
+      packing_list: !isPro,
+    };
+
+    const destination_text = pickDestinationTextFromStops(stops);
+
+    return res.json({
+      id: row.id,
+      user_id: row.user_id,
+      title: row.title,
+      description: row.description,
+      source_type: row.source_type,
+      source_episode_id: row.source_episode_id,
+      episode_url: row.episode_url,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+
+      // Parsed/normalized:
+      stops,
+      destination_text,
+      gallery,
+
+      // Gated payload:
+      hotels: isPro ? hotelsFull : hotelsPreview,
+      experiences: isPro ? experiencesFull : experiencesPreview,
+      packing_list: isPro ? packingFull : packingPreview,
+
+      entitlements: { isPro, locked },
+      counts: {
+        hotels: hotelsFull.length,
+        experiences: experiencesFull.length,
+        packing_list: Array.isArray(packingFull) ? packingFull.length : 0,
+        stops: Array.isArray(stops) ? stops.length : 0,
+        gallery: Array.isArray(gallery) ? gallery.length : 0,
+      },
+    });
+  } catch (err) {
+    console.error("/api/trips/:id GET-feil:", err);
+    return res.status(500).json({ error: "Kunne ikke hente reisen." });
+  }
+});
+
+
 
 // ----------------------------------------------------------------------
 // 📌 API: Hent alle brukerens reiser
@@ -5143,12 +5345,15 @@ app.get("/api/trips/:id/hotels", authMiddleware, async (req, res) => {
   }
 });
 
-app.get("/api/trips/:id/experiences", authMiddleware, requirePro, async (req, res) => {
+app.get("/api/trips/:id/experiences", authMiddleware, async (req, res) => {
   try {
     const tripId = req.params.id;
 
+    const ent = await getUserEntitlements(req.user.id);
+    const isPro = !!ent?.isPro;
+
     const tripRes = await query(
-      `SELECT id, source_episode_id, experiences
+      `SELECT id, source_episode_id, source_type, experiences, stops
        FROM trips
        WHERE id = $1 AND user_id = $2
        LIMIT 1`,
@@ -5162,6 +5367,7 @@ app.get("/api/trips/:id/experiences", authMiddleware, requirePro, async (req, re
     const row = tripRes.rows[0];
     let experiences = parseJsonArray(row.experiences);
 
+    // episode-trip: hent canonical experiences
     if (row.source_episode_id) {
       const canonRes = await query(
         `
@@ -5179,11 +5385,26 @@ app.get("/api/trips/:id/experiences", authMiddleware, requirePro, async (req, re
       }
     }
 
+    // Full liste (pro)
     const experiencesFull = (experiences || [])
       .filter((x) => x && typeof x === "object")
-      .map((x) => ({ ...x, url: makeExperienceUrl(x) }));
+      .map((x) => ({ ...x, url: makeExperienceUrl(x) })); // hvis du har den helperen
 
-    return res.json({ ok: true, tripId, experiences: experiencesFull });
+    // Teaser (gratis)
+    const experiencesPreview = experiencesFull.slice(0, 3).map((x) => ({
+      name: x?.name || x?.title || "Opplevelse",
+      location: x?.location || x?.city || x?.area || null,
+      description: x?.description || null,
+      // IKKE url til gratis
+    }));
+
+    return res.json({
+      ok: true,
+      tripId,
+      experiences: isPro ? experiencesFull : experiencesPreview,
+      entitlements: { isPro, locked: { experiences: !isPro } },
+      counts: { experiences: experiencesFull.length },
+    });
   } catch (e) {
     console.error("/api/trips/:id/experiences-feil:", e);
     return res.status(500).json({ error: "Kunne ikke hente opplevelser." });
@@ -6339,6 +6560,114 @@ app.post("/api/hotels/results", async (req, res) => {
   } catch (e) {
     console.error("❌ /api/hotels/results feilet:", e?.response?.data || e?.message || e);
     return res.status(502).json({ error: "Upstream hotels results failed", details: e?.response?.data || null });
+  }
+});
+
+// ---------- Travelpayouts Experiences (start/results) ----------
+
+const EXPERIENCE_CREATE_URL =
+  "https://api.travelpayouts.com/experience_search/v1/create_search"; // TODO: sjekk riktig endpoint i din TP-avtale
+
+const EXPERIENCE_RESULT_URL =
+  "https://api.travelpayouts.com/experience_search/v1/result"; // TODO: sjekk riktig endpoint i din TP-avtale
+
+function toQuery(obj) {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (v === undefined || v === null) continue;
+    p.set(k, String(v));
+  }
+  return p;
+}
+
+app.post("/api/experiences/start", authMiddleware, requirePro, async (req, res) => {
+  try {
+    if (!tp?.token || !tp?.marker) {
+      return res
+        .status(500)
+        .json({ error: "Mangler TRAVELPAYOUTS_TOKEN/TRAVELPAYOUTS_MARKER" });
+    }
+
+    const body = req.body || {};
+    const query = String(body.query || "").trim(); // f.eks. "Eiffel Tower tickets"
+    const lang = String(body.lang || "no_NO");
+    const currency = String(body.currency || "NOK");
+
+    if (!query) return res.status(400).json({ error: "Mangler query" });
+
+    const params = {
+      query,
+      customerIP: normalizeIp(getUserIp(req)),
+      lang,
+      currency,
+      waitForResult: body.waitForResult ? 1 : 0,
+      marker: tp.marker,
+    };
+
+    const signature = makeSignature(tp.token, tp.marker, params);
+    params.signature = signature;
+
+    const url = `${EXPERIENCE_CREATE_URL}?${toQuery(params).toString()}`;
+    const r = await axios.get(url, { timeout: 20000 });
+
+    const searchId =
+      r.data?.searchId ||
+      r.data?.search_id ||
+      r.data?.data?.searchId ||
+      r.data?.data?.search_id ||
+      null;
+
+    if (!searchId) {
+      return res.status(502).json({
+        error: "Ugyldig svar fra create_search (experiences)",
+        details: r.data || null,
+      });
+    }
+
+    return res.json({ ok: true, searchId: String(searchId) });
+  } catch (e) {
+    console.error("❌ /api/experiences/start feilet:", e?.response?.data || e?.message || e);
+    return res.status(502).json({
+      error: "Upstream experiences start failed",
+      details: e?.response?.data || null,
+    });
+  }
+});
+
+app.post("/api/experiences/results", authMiddleware, requirePro, async (req, res) => {
+  try {
+    if (!tp?.token || !tp?.marker) {
+      return res
+        .status(500)
+        .json({ error: "Mangler TRAVELPAYOUTS_TOKEN/TRAVELPAYOUTS_MARKER" });
+    }
+
+    const body = req.body || {};
+    const searchId = String(body.searchId || "").trim();
+    if (!searchId) return res.status(400).json({ error: "Mangler searchId" });
+
+    const params = {
+      searchId,
+      limit: Number(body.limit ?? 50),
+      offset: Number(body.offset ?? 0),
+      sortBy: body.sortBy || "popularity",
+      sortAsc: body.sortAsc === 0 ? 0 : 1,
+      marker: tp.marker,
+    };
+
+    const signature = makeSignature(tp.token, tp.marker, params);
+    params.signature = signature;
+
+    const url = `${EXPERIENCE_RESULT_URL}?${toQuery(params).toString()}`;
+    const r = await axios.get(url, { timeout: 20000 });
+
+    return res.json({ ok: true, ...r.data });
+  } catch (e) {
+    console.error("❌ /api/experiences/results feilet:", e?.response?.data || e?.message || e);
+    return res.status(502).json({
+      error: "Upstream experiences results failed",
+      details: e?.response?.data || null,
+    });
   }
 });
 
