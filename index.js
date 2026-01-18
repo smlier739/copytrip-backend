@@ -6662,6 +6662,197 @@ app.post("/api/experiences/results", authMiddleware, requirePro, async (req, res
   }
 });
 
+// ---------------- Car rentals helpers ----------------
+
+function toArrayMaybe(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v;
+  if (typeof v === "string") {
+    try {
+      const x = JSON.parse(v);
+      return Array.isArray(x) ? x : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function pickStop1(stops) {
+  const s = Array.isArray(stops) ? stops : [];
+  const s1 = s[0];
+  return s1 && typeof s1 === "object" ? s1 : null;
+}
+
+function toNum(v) {
+  const n = typeof v === "number" ? v : Number(String(v || "").trim());
+  return Number.isFinite(n) ? n : null;
+}
+
+function pickLatLngFromStop(stop) {
+  if (!stop) return null;
+
+  // støtter flere mulige strukturer
+  const lat =
+    toNum(stop.lat) ??
+    toNum(stop.latitude) ??
+    toNum(stop?.coords?.lat) ??
+    toNum(stop?.coords?.latitude) ??
+    toNum(stop?.location?.lat) ??
+    toNum(stop?.location?.latitude);
+
+  const lng =
+    toNum(stop.lng) ??
+    toNum(stop.lon) ??
+    toNum(stop.longitude) ??
+    toNum(stop?.coords?.lng) ??
+    toNum(stop?.coords?.lon) ??
+    toNum(stop?.coords?.longitude) ??
+    toNum(stop?.location?.lng) ??
+    toNum(stop?.location?.lon) ??
+    toNum(stop?.location?.longitude);
+
+  if (typeof lat === "number" && typeof lng === "number") return { lat, lng };
+  return null;
+}
+
+function pickTextFromStop(stop) {
+  if (!stop) return null;
+  const name =
+    stop.name ||
+    stop.title ||
+    stop.place ||
+    stop.city ||
+    stop.location ||
+    stop.destination ||
+    stop.address ||
+    null;
+
+  const country = stop.country || stop.countryName || null;
+  const parts = [name, country].filter(Boolean).map((x) => String(x).trim()).filter(Boolean);
+  return parts.length ? parts.join(", ") : null;
+}
+
+// Foreløpig: generer en stabil fallback-lenke.
+// Senere: erstatt med affiliate-lenke / partner deep-link.
+function makeCarRentalUrl({ queryText, pickupISO, dropoffISO }) {
+  const q = encodeURIComponent(
+    [
+      "bilutleie",
+      queryText || "",
+      pickupISO ? `pickup ${pickupISO}` : "",
+      dropoffISO ? `dropoff ${dropoffISO}` : "",
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
+  return `https://www.google.com/search?q=${q}`;
+}
+
+// Foreløpig: “search” returnerer bare ett “tilbud” pr kategori.
+// Senere: bytt ut med ekte aggregator som returnerer mange tilbud.
+function searchCarRentals({ queryText, pickupISO, dropoffISO }) {
+  const url = makeCarRentalUrl({ queryText, pickupISO, dropoffISO });
+
+  // Eksempeldata som UI kan vise (teaser/full)
+  return [
+    {
+      id: "google-search",
+      provider: "Søk",
+      title: "Finn bilutleie (søk)",
+      location: queryText || null,
+      price_hint: null,
+      url,
+    },
+  ];
+}
+
+// GET: hent bilutleie-forslag knyttet til turens stopp 1 + datoer fra klient
+app.get("/api/trips/:id/car-rentals", authMiddleware, async (req, res) => {
+  try {
+    const tripId = req.params.id;
+
+    const ent = await getUserEntitlements(req.user.id);
+    const isPro = !!ent?.isPro;
+
+    const tripRes = await query(
+      `
+      SELECT id, user_id, source_episode_id, source_type, stops, created_at
+      FROM trips
+      WHERE id = $1 AND user_id = $2
+      LIMIT 1
+      `,
+      [tripId, req.user.id]
+    );
+
+    if (tripRes.rows.length === 0) {
+      return res.status(404).json({ error: "Fant ikke denne reisen." });
+    }
+
+    const row = tripRes.rows[0];
+    let stops = toArrayMaybe(row.stops);
+
+    // canonical override hvis dette er en "brukertur" fra episode
+    if (row.source_episode_id) {
+      const canonRes = await query(
+        `
+        SELECT stops
+        FROM trips
+        WHERE source_type = 'grenselos_episode'
+          AND source_episode_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [row.source_episode_id]
+      );
+      if (canonRes.rows?.[0]) {
+        const canonStops = toArrayMaybe(canonRes.rows[0].stops);
+        if (canonStops.length) stops = canonStops;
+      }
+    }
+
+    const stop1 = pickStop1(stops);
+    const queryText = pickTextFromStop(stop1);
+    const latlng = pickLatLngFromStop(stop1);
+
+    // Datoer kommer fra klient (må legges inn av bruker)
+    // ISO 8601, f.eks: 2026-01-18T10:00
+    const pickup = typeof req.query.pickup === "string" ? req.query.pickup.trim() : "";
+    const dropoff = typeof req.query.dropoff === "string" ? req.query.dropoff.trim() : "";
+
+    // Vi krever ikke pickup/dropoff for å returnere liste (kan vise “fyll inn datoer” i UI),
+    // men for et reelt søk vil du bruke disse.
+    const all = searchCarRentals({
+      queryText: queryText || (latlng ? `${latlng.lat},${latlng.lng}` : ""),
+      pickupISO: pickup || null,
+      dropoffISO: dropoff || null,
+    });
+
+    const full = (all || []).filter((x) => x && typeof x === "object");
+    const preview = full.slice(0, 3).map((x) => ({
+      id: x.id || null,
+      title: x.title || "Bilutleie",
+      provider: x.provider || null,
+      location: x.location || null,
+    }));
+
+    return res.json({
+      ok: true,
+      tripId,
+      destination_text: queryText || null,
+      destination_latlng: latlng || null,
+      pickup: pickup || null,
+      dropoff: dropoff || null,
+      car_rentals: isPro ? full : preview,
+      entitlements: { isPro, locked: { car_rentals: !isPro } },
+      counts: { car_rentals: full.length },
+    });
+  } catch (e) {
+    console.error("/api/trips/:id/car-rentals-feil:", e);
+    return res.status(500).json({ error: "Kunne ikke hente bilutleie." });
+  }
+});
+
 // -------------------------------------------------------
 //  GLOBAL FEILHANDLER (helt nederst)
 // -------------------------------------------------------
