@@ -1,6 +1,6 @@
 // routes/johnnysTips.js
 import express from "express";
-import { requireAdmin } from "../middleware/requireAdmin.js";
+import requireAdmin from "../middleware/requireAdmin.js";
 import authMiddleware from "../middleware/authMiddleware.js";
 import pool from "../db.js";
 
