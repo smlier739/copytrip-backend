@@ -30,6 +30,7 @@ export default async function authMiddleware(req, res, next) {
     }
 
     const decoded = jwt.verify(token, JWT_SECRET);
+    console.log("JWT decoded payload keys:", Object.keys(decoded || {}));
 
     // Support common payload shapes
     const userId =
