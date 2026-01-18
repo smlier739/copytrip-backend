@@ -6571,15 +6571,6 @@ const EXPERIENCE_CREATE_URL =
 const EXPERIENCE_RESULT_URL =
   "https://api.travelpayouts.com/experience_search/v1/result"; // TODO: sjekk riktig endpoint i din TP-avtale
 
-function toQuery(obj) {
-  const p = new URLSearchParams();
-  for (const [k, v] of Object.entries(obj || {})) {
-    if (v === undefined || v === null) continue;
-    p.set(k, String(v));
-  }
-  return p;
-}
-
 app.post("/api/experiences/start", authMiddleware, requirePro, async (req, res) => {
   try {
     if (!tp?.token || !tp?.marker) {
