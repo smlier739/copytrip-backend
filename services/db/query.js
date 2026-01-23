@@ -19,17 +19,3 @@ export async function query(text, params = []) {
     client.release();
   }
 }
-
-export function sanitizeUser(row) {
-  if (!row || typeof row !== "object") return null;
-
-  // Fjern sensitive felt (utvid ved behov)
-  const {
-    password_hash,
-    reset_token,
-    reset_token_expires_at,
-    ...rest
-  } = row;
-
-  return rest;
-}

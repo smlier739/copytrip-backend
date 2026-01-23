@@ -5,8 +5,8 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { Resend } from "resend";
 
-import { query } from "../db.js"; // <-- tilpass hvis din query ligger et annet sted
-import { sanitizeUser } from "../utils/sanitizeUser.js"; // <-- tilpass/lag hvis du ikke har
+import { query } from "../services/db/query.js";
+import { sanitizeUser } from "../services/utils/sanitizeUser.js";
 
 const router = express.Router();
 

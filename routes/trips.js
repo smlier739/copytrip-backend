@@ -4,7 +4,7 @@ import authMiddleware from "../middleware/authMiddleware.js";
 import requirePro from "../middleware/requirePro.js";
 import pool from "../db.js";
 
-// Utils/services (tilpass paths hvis dine ligger andre steder)
+// Utils/services
 import { parseJsonArray } from "../services/utils/json.js";
 import { normalizePackingForClient } from "../services/packing/packingNormalize.js";
 

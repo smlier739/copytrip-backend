@@ -1,4 +1,4 @@
-// backend/utils/json.js
+// backend/services/utils/json.js
 export function parseJsonArray(value) {
   if (!value) return [];
   if (Array.isArray(value)) return value;
