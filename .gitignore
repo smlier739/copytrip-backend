@@ -1,6 +1,5 @@
 .env
 node_modules/
-.env
 .DS_Store
-backend/uploads/*
-!backend/uploads/.gitkeep
+uploads/*
+!uploads/.gitkeep
