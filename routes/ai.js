@@ -10,10 +10,10 @@ import authMiddleware from "../middleware/authMiddleware.js";
 
 // Tilpass disse til ditt prosjekt (de finnes allerede hos deg, siden du bruker dem i dag):
 import { query } from "../db.js"; // hvis du har query-export herfra. Hvis ikke: importer fra riktig sted.
-import { openai } from "../openaiClient.js"; // hvis du har en openai-klientfil. Ellers importer fra der du initierer openai.
-import { extractJson } from "../utils/extractJson.js"; // hvis du har den i utils
-import { normalizeTripStructure } from "../utils/normalizeTripStructure.js"; // hvis du har den i utils
-import { generateGalleryForTrip } from "../services/gallery.js"; // hvis du har den i services
+import { openai } from "../services/openai/openaiClient.js"; // hvis du har en openai-klientfil. Ellers importer fra der du initierer openai.
+import { extractJson } from "../services/utils/extractJson.js"; // hvis du har den i utils
+import { normalizeTripStructure } from "../services/trips/normalizeTrip.js"; // hvis du har den i utils
+import { generateGalleryForTrip } from "../services/gallery/galleryService.js"; // hvis du har den i services
 
 const router = express.Router();
 
