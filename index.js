@@ -23,7 +23,7 @@ import debugRouter from "./routes/debug.js";
 import grenselosRouter from "./routes/grenselos.js";
 import profileRouter from "./routes/profile.js";
 
-import { uploadDir } from "./services/uploads/communityUpload.js";
+import { uploadDir } from "./services/uploads/communityUploads.js";
 import { errorHandler } from "./middleware/errorHandler.js";
 
 // ---------------------------------
