@@ -57,7 +57,7 @@ app.use("/api/auth", authRouter);
 app.use("/api/profile", profileRouter);
 
 app.use("/api/admin", adminRoutes);
-app.use("/api/admin/grenselos", adminGrenselosRouter);
+app.use("/api/admin", adminGrenselosRouter);
 
 app.use("/api/johnnys-tips", johnnysTipsRouter);
 app.use("/api/community", communityRouter);
