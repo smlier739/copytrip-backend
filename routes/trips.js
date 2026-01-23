@@ -10,7 +10,7 @@ import { normalizePackingForClient } from "../services/packing/packingNormalize.
 
 import { makeHotelUrl } from "../services/links/hotelLinks.js";
 import { makeExperienceUrl } from "../services/links/experienceLinks.js";
-import { sanitizeUrl } from "../services/links/urlSanitize.js";
+import { sanitizeUrl } from "../services/util/sanitizeUrl.js";
 
 // Entitlements (må finnes; hvis du har annet navn, bytt importen)
 import { getUserEntitlements } from "../services/entitlements.js";
