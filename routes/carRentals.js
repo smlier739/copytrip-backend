@@ -4,7 +4,7 @@ import express from "express";
 import pool from "../db.js";
 import authMiddleware from "../middleware/authMiddleware.js";
 
-import { getUserEntitlements } from "../services/entitlements.js"; // <-- juster path til der du har den
+import { getUserEntitlements } from "../services/utils/entitlements.js";
 import { toArrayMaybe, pickStop1, pickLatLngFromStop, pickTextFromStop } from "../services/tripStops.js";
 import { searchCarRentals } from "../services/carRentalsService.js";
 
