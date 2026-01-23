@@ -4,7 +4,7 @@ import express from "express";
 import pool from "../db.js";
 import authMiddleware from "../middleware/authMiddleware.js";
 import adminOnlyMiddleware from "../middleware/adminOnlyMiddleware.js";
-import { communityUpload } from "../services/uploads/communityUpload.js";
+import { communityUpload } from "../services/uploads/communityUploads.js";
 
 const router = express.Router();
 
