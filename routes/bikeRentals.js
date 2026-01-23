@@ -8,7 +8,7 @@ import {
   pickStop1,
   pickLatLngFromStop,
   pickTextFromStop,
-} from "../services/tripStops.js";
+} from "../services/utils/tripStops.js";
 
 const router = express.Router();
 
