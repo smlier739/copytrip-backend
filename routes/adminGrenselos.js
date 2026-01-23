@@ -13,7 +13,7 @@ import { fetchGrenselosEpisodes } from "../services/spotify/fetchGrenselosEpisod
 import { ensureTripForEpisode } from "../services/trips/episodeTrips.js";
 
 // Viktig: bruk samme uploadDir som appen server via /uploads
-import { uploadDir } from "../services/uploads/communityUpload.js";
+import { uploadDir } from "../services/uploads/communityUploads.js";
 
 const router = express.Router();
 
