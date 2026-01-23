@@ -5,22 +5,21 @@ import requirePro from "../middleware/requirePro.js";
 import pool from "../db.js";
 
 // Utils/services (tilpass paths hvis dine ligger andre steder)
-import { parseJsonArray } from "../utils/json.js";
+import { parseJsonArray } from "../services/utils/json.js";
 import { normalizePackingForClient } from "../services/packing/packingNormalize.js";
 
 import { makeHotelUrl } from "../services/links/hotelLinks.js";
 import { makeExperienceUrl } from "../services/links/experienceLinks.js";
-import { sanitizeUrl } from "../services/util/sanitizeUrl.js";
+import { sanitizeUrl } from "../services/utils/sanitizeUrl.js";
 
-// Entitlements (må finnes; hvis du har annet navn, bytt importen)
-import { getUserEntitlements } from "../services/entitlements.js";
+import { getUserEntitlements } from "../services/utils/entitlements.js";
 
 // Trip services (tilpass hvis du har dem andre steder)
-import { generateGalleryForTrip } from "../services/gallery/generateGalleryForTrip.js";
+import { generateGalleryForTrip } from "../services/gallery/galleryService.js";
 import { inferCountryForTrip } from "../services/travelAdvice/inferCountryForTrip.js";
 import { buildTravelAdviceText } from "../services/travelAdvice/buildTravelAdviceText.js";
 import { extractDestinationFromStop1 } from "../services/trips/extractDestinationFromStop1.js";
-import { getGenericVirtualTripGallery } from "../services/gallery/genericVirtualTripGallery.js";
+import { getGenericVirtualTripGallery } from "../services/gallery/galleryService.js";
 
 const router = express.Router();
 
