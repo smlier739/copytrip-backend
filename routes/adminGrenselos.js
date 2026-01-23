@@ -1,94 +1,275 @@
-// backend/routes/adminGrenselos.js
+// backend/routes/adminGrenselos.js (ESM)
+import express from "express";
+import path from "path";
+import fs from "fs";
+import multer from "multer";
+import { fileURLToPath } from "url";
 
-const express = require('express');
-const path = require('path');
-const fs = require('fs');
-const multer = require('multer');
+import authMiddleware from "../middleware/authMiddleware.js";
+import requireAdmin from "../middleware/requireAdmin.js";
+import pool from "../db.js";
+
+import { fetchGrenselosEpisodes } from "../services/spotify/fetchGrenselosEpisodes.js";
+import { ensureTripForEpisode } from "../services/trips/ensureTripForEpisode.js";
+
+// Hvis du allerede har en felles uploadDir-export (anbefalt):
+// import { uploadDir } from "../services/uploads/communityUpload.js";
+
+// Hvis ikke: bruk samme default som i communityUpload.js:
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const uploadDir =
+  process.env.UPLOAD_DIR ||
+  path.join(__dirname, "..", "uploads"); // routes/.. -> backend/uploads
+
 const router = express.Router();
 
-// Tilpass disse importene til ditt prosjekt:
-const { requireAuth, requireAdmin } = require('../middleware/auth');
-const { GrenselosEpisode } = require('../db/models'); // ELLER riktig modell-path
+// ---------------------------------------------------------
+// Galleri-root under samme uploadDir som serveres via /uploads
+// ---------------------------------------------------------
+const GALLERY_ROOT = path.join(uploadDir, "grenselos-gallery");
 
-// Rot for galleribilder: backend/uploads/grenselos-gallery
-const UPLOAD_ROOT = path.join(__dirname, '..', 'uploads', 'grenselos-gallery');
+if (!fs.existsSync(GALLERY_ROOT)) {
+  fs.mkdirSync(GALLERY_ROOT, { recursive: true });
+}
 
-if (!fs.existsSync(UPLOAD_ROOT)) {
-  fs.mkdirSync(UPLOAD_ROOT, { recursive: true });
+function safeSegment(s) {
+  return String(s || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, "_")
+    .slice(0, 120);
 }
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const episodeId = req.params.episodeId;
-    const dest = path.join(UPLOAD_ROOT, String(episodeId));
-    if (!fs.existsSync(dest)) {
-      fs.mkdirSync(dest, { recursive: true });
-    }
+    const episodeId = safeSegment(req.params.episodeId);
+    const dest = path.join(GALLERY_ROOT, episodeId);
+    if (!fs.existsSync(dest)) fs.mkdirSync(dest, { recursive: true });
     cb(null, dest);
   },
   filename: (req, file, cb) => {
-    const safeName = file.originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_');
-    cb(null, Date.now() + '-' + safeName);
+    const original = file.originalname || "image";
+    const safeName = original.replace(/[^a-zA-Z0-9.\-_]/g, "_");
+    cb(null, `${Date.now()}-${safeName}`);
+  },
+});
+
+// Kun bilder (hold deg til det du støtter ellers i appen)
+function fileFilter(req, file, cb) {
+  const ok = /^image\/(jpeg|png|webp|gif)$/i.test(file.mimetype);
+  if (!ok) return cb(new Error("Kun bildefiler er tillatt (jpeg/png/webp/gif)."));
+  cb(null, true);
+}
+
+const upload = multer({
+  storage,
+  fileFilter,
+  limits: {
+    files: 20,
+    fileSize: 15 * 1024 * 1024, // 15MB
+  },
+});
+
+function parseJsonArray(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+// auth først, så admin-sjekk
+router.use(authMiddleware);
+router.use(requireAdmin);
+
+/**
+ * GET /api/admin/grenselos/grenselos-episodes
+ * Returnerer episoder + ev. eksisterende galleri for "per bruker"-trip
+ */
+router.get("/grenselos-episodes", async (req, res) => {
+  try {
+    const episodes = await fetchGrenselosEpisodes();
+    if (!Array.isArray(episodes)) {
+      throw new Error("fetchGrenselosEpisodes() ga ikke en liste.");
+    }
+
+    const episodeIds = episodes.map((ep) => ep.id).filter(Boolean);
+
+    // hent nyeste trip per episode for denne brukeren
+    let tripsByEpisodeId = {};
+    if (episodeIds.length > 0) {
+      const tripsRes = await pool.query(
+        `
+        SELECT id, source_episode_id, gallery, created_at
+        FROM trips
+        WHERE source_type = 'grenselos_episode'
+          AND user_id = $1
+          AND source_episode_id = ANY($2)
+        ORDER BY source_episode_id ASC, created_at DESC
+        `,
+        [req.user.id, episodeIds]
+      );
+
+      tripsByEpisodeId = tripsRes.rows.reduce((acc, row) => {
+        if (!acc[row.source_episode_id]) acc[row.source_episode_id] = row;
+        return acc;
+      }, {});
+    }
+
+    const data = episodes.map((ep) => {
+      const trip = tripsByEpisodeId[ep.id] || null;
+
+      let gallery = [];
+      if (trip?.gallery) {
+        gallery = parseJsonArray(trip.gallery);
+      }
+
+      return {
+        episode_id: ep.id,
+        name: ep.name,
+        description: ep.description,
+        release_date: ep.release_date,
+        image: ep.image,
+        external_url: ep.external_url,
+        trip_id: trip ? trip.id : null,
+        gallery,
+      };
+    });
+
+    return res.json({ episodes: data });
+  } catch (e) {
+    console.error("[adminGrenselos] GET /grenselos-episodes error:", e?.message || e);
+    return res.status(500).json({ error: "Kunne ikke hente episoder/galleri." });
   }
 });
 
-const upload = multer({ storage });
+/**
+ * POST /api/admin/grenselos/grenselos-episodes/:episodeId/gallery
+ * Setter galleri manuelt (JSON)
+ */
+router.post("/grenselos-episodes/:episodeId/gallery", async (req, res) => {
+  try {
+    const { episodeId } = req.params;
+    const { gallery } = req.body || {};
+
+    if (!Array.isArray(gallery)) {
+      return res.status(400).json({
+        error: "Galleri må være en liste (array) med objekter: [{ url, title, caption }]",
+      });
+    }
+
+    const episodes = await fetchGrenselosEpisodes();
+    const episode = episodes.find((e) => e.id === episodeId);
+
+    if (!episode) {
+      return res.status(404).json({ error: "Episode ikke funnet på Spotify." });
+    }
+
+    // per bruker
+    const tripId = await ensureTripForEpisode(episode, req.user.id);
+
+    const update = await pool.query(
+      `
+      UPDATE trips
+      SET gallery = $1
+      WHERE id = $2 AND user_id = $3
+      RETURNING id, source_episode_id, gallery
+      `,
+      [JSON.stringify(gallery), tripId, req.user.id]
+    );
+
+    if (update.rowCount === 0) {
+      return res.status(404).json({ error: "Trip ikke funnet/tilgang nektet." });
+    }
+
+    return res.json({
+      ok: true,
+      tripId,
+      episode_id: update.rows[0].source_episode_id,
+      gallery: parseJsonArray(update.rows[0].gallery),
+    });
+  } catch (e) {
+    console.error("[adminGrenselos] POST /gallery error:", e?.message || e);
+    return res.status(500).json({ error: "Kunne ikke lagre galleri for episoden." });
+  }
+});
 
 /**
- * POST /api/admin/grenselos-episodes/:episodeId/gallery-upload
- * Felt: images (en eller flere filer)
+ * POST /api/admin/grenselos/grenselos-episodes/:episodeId/gallery-upload
+ * Form-data: images[]
+ * Lagrer filer under /uploads/grenselos-gallery/<episodeId>/<filename>
  */
 router.post(
-  '/grenselos-episodes/:episodeId/gallery-upload',
-  requireAuth,
-  requireAdmin,
-  upload.array('images', 20),
+  "/grenselos-episodes/:episodeId/gallery-upload",
+  upload.array("images", 20),
   async (req, res) => {
     try {
-      const episodeId = req.params.episodeId;
+      const episodeId = String(req.params.episodeId || "").trim();
+      if (!episodeId) return res.status(400).json({ error: "Mangler episodeId." });
 
-      // Finn episoden i databasen – tilpass til din modell
-      const episode = await GrenselosEpisode.findOne({
-        where: { episode_id: episodeId }
-      });
-
-      if (!episode) {
-        return res.status(404).json({ error: 'Episode ikke funnet.' });
+      const files = req.files || [];
+      if (!files.length) {
+        return res.status(400).json({ error: "Ingen bildefiler ble lastet opp." });
       }
 
-      const existingGallery = Array.isArray(episode.gallery)
-        ? episode.gallery
-        : [];
+      const episodes = await fetchGrenselosEpisodes();
+      const episode = episodes.find((e) => e.id === episodeId);
+      if (!episode) {
+        return res.status(404).json({ error: "Episode ikke funnet på Spotify." });
+      }
 
-      const newItems = (req.files || []).map((file, idx) => {
-        const relPath = `/uploads/grenselos-gallery/${episodeId}/${file.filename}`;
-        return {
-          url: relPath,
-          title: `Bilde ${existingGallery.length + idx + 1}`,
-          caption: ''
-        };
-      });
+      // per bruker
+      const tripId = await ensureTripForEpisode(episode, req.user.id);
+
+      const tripRes = await pool.query(
+        `SELECT gallery FROM trips WHERE id = $1 AND user_id = $2 LIMIT 1`,
+        [tripId, req.user.id]
+      );
+
+      if (tripRes.rowCount === 0) {
+        return res.status(404).json({ error: "Trip ikke funnet/tilgang nektet." });
+      }
+
+      const existingGallery = parseJsonArray(tripRes.rows[0]?.gallery);
+
+      const epSeg = safeSegment(episodeId);
+
+      const newItems = files.map((file, idx) => ({
+        url: `/uploads/grenselos-gallery/${epSeg}/${file.filename}`,
+        title: `Bilde ${existingGallery.length + idx + 1}`,
+        caption: null,
+      }));
 
       const updatedGallery = [...existingGallery, ...newItems];
 
-      episode.gallery = updatedGallery; // JSON-kolonne
-      await episode.save();
+      const upd = await pool.query(
+        `
+        UPDATE trips
+        SET gallery = $1
+        WHERE id = $2 AND user_id = $3
+        RETURNING id, source_episode_id, gallery
+        `,
+        [JSON.stringify(updatedGallery), tripId, req.user.id]
+      );
 
       return res.json({
-        success: true,
-        episode_id: episodeId,
-        gallery: updatedGallery
+        ok: true,
+        tripId: upd.rows[0].id,
+        episode_id: upd.rows[0].source_episode_id,
+        gallery: parseJsonArray(upd.rows[0].gallery),
       });
     } catch (err) {
-      console.error(
-        '/api/admin/grenselos-episodes/:episodeId/gallery-upload error:',
-        err
-      );
-      return res.status(500).json({
-        error: 'Kunne ikke lagre galleri.'
-      });
+      console.error("[adminGrenselos] gallery-upload error:", err?.message || err);
+      return res.status(500).json({ error: err?.message || "Kunne ikke lagre galleri." });
     }
   }
 );
 
-module.exports = router;
+export default router;

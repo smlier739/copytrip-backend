@@ -1,19 +1,8 @@
-// src/config/travelpayouts.js
+// backend/services/travelpayouts/tpSign.js (ESM)
+
 import crypto from "crypto";
 
-const env = (k) => (process.env[k] || "").trim();
-
-export const travelpayoutsConfig = {
-  token: env("TRAVELPAYOUTS_TOKEN") || env("TP_API_TOKEN"),
-  marker: env("TRAVELPAYOUTS_MARKER") || env("TP_MARKER"),
-  realHost: (env("TRAVELPAYOUTS_REAL_HOST") || env("TP_REAL_HOST"))
-    .replace(/^https?:\/\//i, "")
-    .replace(/\/+$/, ""),
-  lang: env("TRAVELPAYOUTS_LANG") || "en",
-};
-
-// ---- SIGNATURE (KORREKT iht. Travelpayouts) ----
-// Sorter keys i objekter. Ikke sorter arrays (behold rekkefølgen).
+// ---- SIGNATURE ----
 function collectValuesInOrder(obj, out = []) {
   if (obj === null || obj === undefined) return out;
 
@@ -30,48 +19,72 @@ function collectValuesInOrder(obj, out = []) {
   if (typeof obj === "object") {
     const keys = Object.keys(obj)
       .filter((k) => k !== "signature")
-      .sort((a, b) => a.localeCompare(b, "en"));
+      .sort(); // deterministisk uten locale
 
     for (const k of keys) collectValuesInOrder(obj[k], out);
     return out;
   }
 
-  // primitive
+  // primitives
   out.push(String(obj));
   return out;
 }
 
 export function makeSignature(token, bodyObj) {
+  const t = String(token || "");
   const values = collectValuesInOrder(bodyObj, []);
-  // IKKE sorter values her – rekkefølgen kommer fra sorterte keys i payload
-  const base = [String(token), ...values].join(":");
-  return crypto.createHash("md5").update(base).digest("hex");
+  const base = [t, ...values].join(":");
+
+  return crypto
+    .createHash("md5")
+    .update(base, "utf8")
+    .digest("hex");
 }
 
 // ---- HEADERS ----
 function normalizeIp(ip) {
   if (!ip) return "";
-  return String(ip).replace(/^::ffff:/, "");
+  const s = String(ip).trim();
+
+  // IPv4-mapped IPv6: ::ffff:1.2.3.4
+  const v4 = s.replace(/^::ffff:/, "");
+
+  // strip port if any (rare, but safe)
+  // e.g. "1.2.3.4:12345" or "[2001:db8::1]:12345"
+  return v4
+    .replace(/^\[([^\]]+)\](:\d+)?$/, "$1")
+    .replace(/:\d+$/, "");
 }
 
 function getUserIp(req) {
   if (!req) return "";
+
   const xff = req.headers?.["x-forwarded-for"];
   if (xff) return String(xff).split(",")[0].trim();
-  return String(req.headers?.["x-real-ip"] || req.socket?.remoteAddress || "");
+
+  const xri = req.headers?.["x-real-ip"];
+  if (xri) return String(xri).trim();
+
+  // Express kan gi ip hvis trust proxy er satt:
+  if (req.ip) return String(req.ip).trim();
+
+  return String(req.socket?.remoteAddress || "").trim();
 }
 
-export function makeHeaders(req, signature, tp = travelpayoutsConfig) {
+export function makeHeaders(req, signature, tp) {
   if (!tp?.token || !tp?.realHost) {
     throw new Error("Travelpayouts headers: missing token/realHost");
+  }
+  if (!signature) {
+    throw new Error("Travelpayouts headers: missing signature");
   }
 
   const headers = {
     "Content-Type": "application/json",
     Accept: "application/json",
-    "x-affiliate-user-id": tp.token,
-    "x-real-host": tp.realHost,
-    "x-signature": signature,
+    "x-affiliate-user-id": String(tp.token),
+    "x-real-host": String(tp.realHost),
+    "x-signature": String(signature),
   };
 
   const ip = normalizeIp(getUserIp(req));
