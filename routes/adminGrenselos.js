@@ -10,7 +10,7 @@ import requireAdmin from "../middleware/requireAdmin.js";
 import pool from "../db.js";
 
 import { fetchGrenselosEpisodes } from "../services/spotify/fetchGrenselosEpisodes.js";
-import { ensureTripForEpisode } from "../services/trips/ensureTripForEpisode.js";
+import { ensureTripForEpisode } from "../services/trips/episodeTrips.js";
 
 // Viktig: bruk samme uploadDir som appen server via /uploads
 import { uploadDir } from "../services/uploads/communityUpload.js";
