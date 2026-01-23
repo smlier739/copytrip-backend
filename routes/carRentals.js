@@ -5,7 +5,7 @@ import pool from "../db.js";
 import authMiddleware from "../middleware/authMiddleware.js";
 
 import { getUserEntitlements } from "../services/utils/entitlements.js";
-import { toArrayMaybe, pickStop1, pickLatLngFromStop, pickTextFromStop } from "../services/tripStops.js";
+import { toArrayMaybe, pickStop1, pickLatLngFromStop, pickTextFromStop } from "../services/utils/tripStops.js";
 import { searchCarRentals } from "../services/carRentalsService.js";
 
 const router = express.Router();
