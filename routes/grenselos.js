@@ -5,8 +5,7 @@ import axios from "axios";
 
 import authMiddleware from "../middleware/authMiddleware.js";
 
-// TILPASS disse til dine faktiske paths/exports:
-import { query } from "../db.js";
+import { query } from "../services/db/query.js";
 import { getSpotifyAccessToken } from "../services/spotify/spotifyClient.js";
 import { generateTripFromEpisode } from "../services/ai/tripFromEpisode.js";
 import { normalizePackingForClient } from "../services/packing/normalizePackingForClient.js";
