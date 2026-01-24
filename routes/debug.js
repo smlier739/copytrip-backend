@@ -8,8 +8,8 @@ import { fileURLToPath } from "url";
 import authMiddleware from "../middleware/authMiddleware.js";
 import requireAdmin from "../middleware/requireAdmin.js";
 
-import { query } from "../db.js"; // <-- tilpass hvis din query ligger annet sted
-import { fetchGrenselosEpisodes } from "../services/spotifyGrenselos.js"; // <-- tilpass import-path
+import { query } from "../services/db/query.js";
+import { fetchGrenselosEpisodes } from "../services/spotify/fetchGrenselosEpisodes.js";
 
 const router = express.Router();
 
