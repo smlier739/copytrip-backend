@@ -1,6 +1,6 @@
 // backend/services/ai/tripGenerator.js (ESM)
 
-import { getOpenAI } from "../../openai/openaiClient.js"; // 👈 justert path (vanlig i denne strukturen)
+import { getOpenAI } from "../openai/openaiClient.js"; 
 
 // -------------------- helpers --------------------
 

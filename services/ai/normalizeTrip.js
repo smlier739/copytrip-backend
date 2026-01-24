@@ -1,4 +1,4 @@
-import { normalizeExperiencesArray } from "./normalizeExperiencesArray.js";
+import { normalizeExperiencesArray } from "./tripGenerator.js";
 
 export function applyExperienceFallback({
   trip,

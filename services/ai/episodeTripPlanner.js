@@ -1,6 +1,6 @@
 // backend/services/ai/episodeTripPlanner.js (ESM)
 
-import { getOpenAI } from "../../openai/openaiClient.js"; // ✅ riktig relativ path (services/ai -> openai)
+import { getOpenAI } from "../openai/openaiClient.js";
 
 /**
  * Ekstraher JSON fra en LLM-respons (tåler ```json``` blokker og tekst rundt).
