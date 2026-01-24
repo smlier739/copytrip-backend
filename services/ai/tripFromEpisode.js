@@ -1,6 +1,6 @@
 // backend/services/ai/tripFromEpisode.js (ESM)
 
-import { getOpenAI } from "../../openai/openaiClient.js"; // 👈 viktig: riktig path fra services/ai -> backend/openai
+import { getOpenAI } from "../openai/openaiClient.js"; 
 
 // -------------------- helpers --------------------
 
