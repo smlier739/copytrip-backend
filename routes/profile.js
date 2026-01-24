@@ -3,8 +3,7 @@
 import express from "express";
 import authMiddleware from "../middleware/authMiddleware.js";
 
-// TILPASS til din db-export (pool/query). Jeg antar du har query(...) tilgjengelig:
-import { query } from "../db.js";
+import { query } from "../services/db/query.js";
 
 const router = express.Router();
 
