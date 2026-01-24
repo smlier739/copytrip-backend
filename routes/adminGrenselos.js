@@ -36,8 +36,10 @@ function safeSegment(s) {
 }
 
 function parseJsonArray(value) {
+  // gallery er jsonb i DB, men vi tåler både string/object
   if (!value) return [];
   if (Array.isArray(value)) return value;
+  if (typeof value === "object") return value; // jsonb kan komme som objekt/array allerede
   if (typeof value === "string") {
     try {
       const parsed = JSON.parse(value);
@@ -53,7 +55,7 @@ function parseJsonArray(value) {
 // Multer storage
 // ---------------------------------------------------------
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
+  destination: (req, _file, cb) => {
     const episodeId = safeSegment(req.params.episodeId);
     const dest = path.join(GALLERY_ROOT, episodeId);
     try {
@@ -63,7 +65,7 @@ const storage = multer.diskStorage({
       cb(e);
     }
   },
-  filename: (req, file, cb) => {
+  filename: (_req, file, cb) => {
     const original = file.originalname || "image";
     const safeName = original.replace(/[^a-zA-Z0-9.\-_]/g, "_");
     cb(null, `${Date.now()}-${safeName}`);
@@ -91,10 +93,14 @@ router.use(authMiddleware);
 router.use(requireAdmin);
 
 /**
- * GET /api/admin/grenselos-episodes
- * Returnerer episoder + ev. eksisterende galleri for "per bruker"-trip
+ * GET /api/admin/grenselos/grenselos-episodes
+ * Admin: Returnerer episoder + galleri uavhengig av bruker.
+ *
+ * Logikk:
+ * - Hent siste trip per episode
+ * - Foretrekk trip som faktisk har bilder i gallery (hvis finnes)
  */
-router.get("/grenselos-episodes", async (req, res) => {
+router.get("/grenselos-episodes", async (_req, res) => {
   try {
     const episodes = await fetchGrenselosEpisodes();
     if (!Array.isArray(episodes)) {
@@ -103,23 +109,29 @@ router.get("/grenselos-episodes", async (req, res) => {
 
     const episodeIds = episodes.map((ep) => ep.id).filter(Boolean);
 
-    // hent nyeste trip per episode for denne brukeren
     let tripsByEpisodeId = {};
     if (episodeIds.length > 0) {
       const tripsRes = await pool.query(
         `
-        SELECT id, source_episode_id, gallery, created_at
+        SELECT DISTINCT ON (source_episode_id)
+          id,
+          user_id,
+          source_episode_id,
+          gallery,
+          created_at
         FROM trips
         WHERE source_type = 'grenselos_episode'
-          AND user_id = $1
-          AND source_episode_id = ANY($2)
-        ORDER BY source_episode_id ASC, created_at DESC
+          AND source_episode_id = ANY($1)
+        ORDER BY
+          source_episode_id,
+          (jsonb_array_length(COALESCE(gallery, '[]'::jsonb)) > 0) DESC,
+          created_at DESC
         `,
-        [req.user.id, episodeIds]
+        [episodeIds]
       );
 
       tripsByEpisodeId = tripsRes.rows.reduce((acc, row) => {
-        if (!acc[row.source_episode_id]) acc[row.source_episode_id] = row;
+        acc[row.source_episode_id] = row;
         return acc;
       }, {});
     }
@@ -135,6 +147,7 @@ router.get("/grenselos-episodes", async (req, res) => {
         image: ep.image,
         external_url: ep.external_url,
         trip_id: trip ? trip.id : null,
+        trip_user_id: trip ? trip.user_id : null, // nyttig i admin/debug
         gallery: trip?.gallery ? parseJsonArray(trip.gallery) : [],
       };
     });
@@ -147,8 +160,12 @@ router.get("/grenselos-episodes", async (req, res) => {
 });
 
 /**
- * POST /api/admin/grenselos-episodes/:episodeId/gallery
- * Setter galleri manuelt (JSON)
+ * POST /api/admin/grenselos/grenselos-episodes/:episodeId/gallery
+ * Admin: Setter galleri manuelt (JSON) på "canonical" trip for episoden.
+ *
+ * Canonical-strategi:
+ * - Finn (eller opprett) en admin-owned trip for episoden (req.user.id)
+ * - Dette gjør at du får ett stabilt sted å lagre admin-galleri fremover
  */
 router.post("/grenselos-episodes/:episodeId/gallery", async (req, res) => {
   try {
@@ -168,21 +185,21 @@ router.post("/grenselos-episodes/:episodeId/gallery", async (req, res) => {
       return res.status(404).json({ error: "Episode ikke funnet på Spotify." });
     }
 
-    // per bruker (canonical)
+    // Bruk admin-user som canonical owner for skriving
     const tripId = await ensureTripForEpisode(episode, req.user.id);
 
     const update = await pool.query(
       `
       UPDATE trips
       SET gallery = $1
-      WHERE id = $2 AND user_id = $3
+      WHERE id = $2
       RETURNING id, source_episode_id, gallery
       `,
-      [JSON.stringify(gallery), tripId, req.user.id]
+      [JSON.stringify(gallery), tripId]
     );
 
     if (update.rowCount === 0) {
-      return res.status(404).json({ error: "Trip ikke funnet/tilgang nektet." });
+      return res.status(404).json({ error: "Trip ikke funnet." });
     }
 
     return res.json({
@@ -198,12 +215,15 @@ router.post("/grenselos-episodes/:episodeId/gallery", async (req, res) => {
 });
 
 /**
- * POST /api/admin/grenselos-episodes/:episodeId/gallery-upload
+ * POST /api/admin/grenselos/grenselos-episodes/:episodeId/gallery-upload
  * Form-data: images[]
+ *
  * Lagrer filer under:
  *   uploadDir/grenselos-gallery/<episodeId>/<filename>
  * og URL blir:
  *   /uploads/grenselos-gallery/<episodeId>/<filename>
+ *
+ * NB: Skriver til canonical admin-trip (req.user.id), men lesing i GET er uavhengig av bruker.
  */
 router.post(
   "/grenselos-episodes/:episodeId/gallery-upload",
@@ -224,17 +244,13 @@ router.post(
         return res.status(404).json({ error: "Episode ikke funnet på Spotify." });
       }
 
-      // per bruker (canonical)
+      // Canonical admin trip for skriving
       const tripId = await ensureTripForEpisode(episode, req.user.id);
 
-      // hent eksisterende galleri for denne tripen
-      const tripRes = await pool.query(
-        `SELECT gallery FROM trips WHERE id = $1 AND user_id = $2 LIMIT 1`,
-        [tripId, req.user.id]
-      );
+      const tripRes = await pool.query(`SELECT gallery FROM trips WHERE id = $1 LIMIT 1`, [tripId]);
 
       if (tripRes.rowCount === 0) {
-        return res.status(404).json({ error: "Trip ikke funnet/tilgang nektet." });
+        return res.status(404).json({ error: "Trip ikke funnet." });
       }
 
       const existingGallery = parseJsonArray(tripRes.rows[0]?.gallery);
@@ -252,10 +268,10 @@ router.post(
         `
         UPDATE trips
         SET gallery = $1
-        WHERE id = $2 AND user_id = $3
+        WHERE id = $2
         RETURNING id, source_episode_id, gallery
         `,
-        [JSON.stringify(updatedGallery), tripId, req.user.id]
+        [JSON.stringify(updatedGallery), tripId]
       );
 
       return res.json({
