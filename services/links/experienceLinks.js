@@ -1,6 +1,6 @@
 // backend/services/links/experienceLinks.js (ESM)
 
-import { sanitizeUrl as sanitizeUrlImported } from "../../utils/url.js";
+import { sanitizeUrl as sanitizeUrlImported } from "../utils/sanitizeUrl.js";
 
 /**
  * Local safe wrapper so we don't crash if sanitizeUrl is missing/not a function.
