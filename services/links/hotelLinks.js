@@ -1,6 +1,6 @@
 // backend/services/links/hotelLinks.js (ESM)
 
-import { sanitizeUrl } from "../services/utils/sanitizeUrl.js";
+import { sanitizeUrl } from "../utils/sanitizeUrl.js";
 
 // -----------------------------------------------------
 // Fallback: Booking.com-søk (foretrukket for hoteller)
