@@ -7,9 +7,9 @@ import authMiddleware from "../middleware/authMiddleware.js";
 
 // TILPASS disse til dine faktiske paths/exports:
 import { query } from "../db.js";
-import { getSpotifyAccessToken } from "../services/spotify.js";
-import { generateTripFromEpisode } from "../services/aiTrips.js";
-import { normalizePackingForClient } from "../utils/normalizePacking.js";
+import { getSpotifyAccessToken } from "../services/spotify/spotifyClient.js";
+import { generateTripFromEpisode } from "../services/ai/tripFromEpisode.js";
+import { normalizePackingForClient } from "../services/packing/normalizePackingForClient.js";
 
 const router = express.Router();
 
