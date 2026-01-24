@@ -1,13 +1,16 @@
 // backend/services/db/query.js (ESM)
 
-import pool from "../../db.js"; // ✅ tilpass hvis din pool ligger et annet sted
+import pool from "../../db.js";
 
+/**
+ * Standard DB-query wrapper
+ * - bruker pool direkte (riktig for pg.Pool)
+ * - logger trygt ved feil
+ */
 export async function query(text, params = []) {
-  const client = await pool.connect();
   try {
-    return await client.query(text, params);
+    return await pool.query(text, params);
   } catch (err) {
-    // Ikke logg params (kan inneholde sensitiv info)
     console.error("[db.query] error:", {
       message: err?.message,
       code: err?.code,
@@ -15,7 +18,5 @@ export async function query(text, params = []) {
       where: err?.where,
     });
     throw err;
-  } finally {
-    client.release();
   }
 }
