@@ -1,26 +1,59 @@
-// routes/ai.js (ESM)
+// backend/routes/ai.js (ESM)
 // -------------------------------------------------------
 //  KI-GENERERT REISE + GALLERI
 //  - ESM (type: "module")
-//  - Bruker router (ikke app.* inne i route-fil)
+//  - Router-only (ingen app.* her)
+//  - Bruker getOpenAI() (ikke { openai } export)
 // -------------------------------------------------------
 
 import express from "express";
 import authMiddleware from "../middleware/authMiddleware.js";
 
 import { query } from "../services/db/query.js";
-import { openai } from "../services/openai/openaiClient.js";
-import { extractJson } from "../services/utils/extractJson.js";
-import { normalizeTripStructure } from "../services/trips/normalizeTrip.js";
+import { getOpenAI } from "../services/openai/openaiClient.js";
+import { normalizeTripV2 } from "../services/trips/tripSchemaV2.js";
 import { generateGalleryForTrip } from "../services/gallery/galleryService.js";
 
 const router = express.Router();
 
+/**
+ * Ekstraher JSON fra en LLM-respons (tåler ```json``` blokker og tekst rundt).
+ * (Holdes lokalt her for å unngå runtime-feil hvis utils/export ikke er på plass.)
+ */
+function extractJson(text) {
+  if (!text) return null;
+
+  let s = String(text).trim();
+
+  // Strip ```json ... ```
+  if (s.startsWith("```")) {
+    const lines = s.split("\n");
+    lines.shift(); // ```json eller ```
+    if (lines.length && lines[lines.length - 1].trim().startsWith("```")) lines.pop();
+    s = lines.join("\n").trim();
+  }
+
+  // Finn første { ... siste }
+  if (!(s.startsWith("{") && s.endsWith("}"))) {
+    const a = s.indexOf("{");
+    const b = s.lastIndexOf("}");
+    if (a !== -1 && b !== -1 && b > a) s = s.slice(a, b + 1);
+  }
+
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
 // -------------------------------------------------------
 //  KI-GENERERT REISE
+//  POST /api/ai/generate-trip
 // -------------------------------------------------------
 router.post("/generate-trip", authMiddleware, async (req, res) => {
   try {
+    const openai = getOpenAI();
     const { sourceUrl, userDescription, useProfile } = req.body || {};
 
     // --- 1) Hent evt. brukerprofil til prompten ---
@@ -40,6 +73,7 @@ router.post("/generate-trip", authMiddleware, async (req, res) => {
             experience_level
           FROM users
           WHERE id = $1
+          LIMIT 1
           `,
           [req.user.id]
         );
@@ -70,22 +104,10 @@ Output-format (mal):
     }
   ],
   "packing_list": [
-    {
-      "category": "Klær",
-      "items": ["Vind- og regnjakke", "Gode joggesko", "2–3 t-skjorter"]
-    },
-    {
-      "category": "Toalettsaker",
-      "items": ["Tannbørste og tannkrem", "Deodorant", "Solkrem"]
-    },
-    {
-      "category": "Elektronikk",
-      "items": ["Mobil og lader", "Powerbank", "Hodetelefoner"]
-    },
-    {
-      "category": "Annet",
-      "items": ["Pass/ID-kort", "Reiseforsikringsbevis", "Solbriller"]
-    }
+    { "category": "Klær", "items": ["..."] },
+    { "category": "Toalettsaker", "items": ["..."] },
+    { "category": "Elektronikk", "items": ["..."] },
+    { "category": "Annet", "items": ["..."] }
   ],
   "hotels": [
     {
@@ -101,7 +123,10 @@ Output-format (mal):
       "title": "Guidet byvandring",
       "location": "By / område",
       "description": "Kort beskrivelse",
-      "booking_url": "https://…"
+      "booking_url": null,
+      "day": 1,
+      "price_per_person": null,
+      "currency": "NOK"
     }
   ]
 }
@@ -114,21 +139,19 @@ VIKTIG OM PACKING_LIST:
     3) "Elektronikk"
     4) "Annet"
 - Kategorinavnene MÅ være akkurat disse.
-- Hver kategori SKAL ha en "items"-liste med 3–10 KONKRETE ting (strenger).
-- Ikke skriv generelle ting som "annet", "diverse", "osv." som item.
+- Hver kategori SKAL ha 3–10 KONKRETE ting (strenger).
+- Ikke bruk "osv.", "diverse" som items.
 
 VIKTIG OM STOPS:
-- "stops" SKAL være en liste (array).
-- Bruk helst 3–10 stopp.
+- 3–10 stopp.
 - Hvert stopp SKAL ha "name" og "description".
-- "day" skal være et positivt heltall (1, 2, 3 ...).
+- "day" skal være et positivt heltall.
 - Hvis du ikke vet koordinater, sett "lat" og "lng" til null.
 
 VIKTIG OM HOTELS:
-- "hotels" SKAL være en liste (array) med 2–6 forslag totalt.
+- 2–6 forslag totalt.
 - Hvert hotell SKAL ha "name".
-- "price_per_night" skal være et tall (omtrentlig pris per natt) i NOK hvis det er naturlig.
-- Hvis du er usikker på pris, kan "price_per_night" være null.
+- "price_per_night" i NOK hvis naturlig, ellers null.
 `.trim();
 
     // --- 3) Bygg userPrompt ---
@@ -148,7 +171,7 @@ VIKTIG OM HOTELS:
 
     if (!userPrompt.trim()) {
       userPrompt =
-        "Lag et konkret reiseforslag (5–7 dager) et sted i Europa, med stopp, pakkeliste i 4 kategorier (Klær, Toalettsaker, Elektronikk, Annet) og 2–6 hotellforslag.";
+        "Lag et konkret reiseforslag (5–7 dager) et sted i Europa, med stopp, pakkeliste i 4 kategorier (Klær, Toalettsaker, Elektronikk, Annet), 2–6 hotellforslag og 4–10 opplevelser.";
     }
 
     // --- 4) Kall OpenAI ---
@@ -156,9 +179,9 @@ VIKTIG OM HOTELS:
       model: process.env.OPENAI_MODEL || "gpt-4o-mini",
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt }
+        { role: "user", content: userPrompt },
       ],
-      temperature: 0.7
+      temperature: 0.7,
     });
 
     const aiText = completion.choices?.[0]?.message?.content?.trim() || "";
@@ -166,33 +189,29 @@ VIKTIG OM HOTELS:
     // --- 5) Parse JSON ---
     const parsed = extractJson(aiText);
 
-    let trip;
-    if (parsed && typeof parsed === "object") {
-      trip = normalizeTripStructure(parsed);
-    } else {
-      trip = {
-        title: "Reiseforslag fra KI (tekst)",
-        description: aiText || null,
-        stops: [],
-        packing_list: [],
-        hotels: [],
-        experiences: []
-      };
-    }
+    // --- 6) Normaliser til V2-format (robust) ---
+    // normalizeTripV2 tåler både {title,...} og {trip:{...}} best effort.
+    const trip = parsed && typeof parsed === "object"
+      ? normalizeTripV2(parsed)
+      : {
+          title: "Reiseforslag fra KI (tekst)",
+          description: aiText || null,
+          stops: [],
+          packing_list: [],
+          hotels: [],
+          experiences: [],
+        };
 
-    return res.json({
-      ok: true,
-      trip,
-      raw: aiText
-    });
+    return res.json({ ok: true, trip, raw: aiText });
   } catch (e) {
-    console.error("/api/ai/generate-trip-feil:", e);
+    console.error("[ai] POST /generate-trip error:", e?.message || e);
     return res.status(500).json({ error: "Kunne ikke generere reiseforslag." });
   }
 });
 
 // -------------------------------------------------------
 //  KI: GENERER GALLERI
+//  POST /api/ai/generate-gallery
 // -------------------------------------------------------
 router.post("/generate-gallery", authMiddleware, async (req, res) => {
   try {
@@ -205,8 +224,8 @@ router.post("/generate-gallery", authMiddleware, async (req, res) => {
     );
 
     return res.json({ ok: true, gallery });
-  } catch (err) {
-    console.error("❌ /api/ai/generate-gallery:", err);
+  } catch (e) {
+    console.error("[ai] POST /generate-gallery error:", e?.message || e);
     return res.status(500).json({ error: "Kunne ikke generere galleri." });
   }
 });
