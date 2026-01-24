@@ -4,8 +4,8 @@ import express from "express";
 import axios from "axios";
 
 import { getTpConfig, assertTpConfigured } from "../services/travelpayouts/tpConfig.js";
-import { makeSignature } from "../services/travelpayouts/tpSign.js";
-import { makeHeaders, normalizeAbsoluteUrl } from "../services/travelpayouts/tpHttp.js";
+import { makeHeaders, makeSignature } from "../services/travelpayouts/tpSign.js";
+import { normalizeAbsoluteUrl } from "../services/travelpayouts/tpHttp.js";
 import { flightSearchCache } from "../services/travelpayouts/flightsCache.js";
 
 const router = express.Router();
