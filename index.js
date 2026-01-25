@@ -87,12 +87,15 @@ app.use((req, res) => {
 });
 
 console.log("🗂️ uploadDir =", uploadDir);
-console.log("FLIGHTS START URL =", `${API_BASE}/api/flights/start`);
 
 // ---------------------------------
 // Error handler (sist)
 // ---------------------------------
 app.use(errorHandler);
+
+console.log("ENV PORT =", process.env.PORT);
+console.log("CWD =", process.cwd());
+console.log("FILE =", new URL(import.meta.url).pathname);
 
 // ---------------------------------
 // Server start
