@@ -1,6 +1,7 @@
 // backend/services/spotify/fetchGrenselosEpisodes.js (ESM)
 
 import { spotifyGet, getSpotifyAccessToken } from "./spotifyClient.js";
+import { cleanEpisodeDescription } from "./spotifyEpisodehelpers.js";
 
 export async function fetchGrenselosEpisodes() {
   const showId = String(process.env.SPOTIFY_SHOW_ID || "").trim();
@@ -12,7 +13,6 @@ export async function fetchGrenselosEpisodes() {
   let offset = 0;
   const allItems = [];
 
-  // hent token én gang
   let token = await getSpotifyAccessToken();
 
   while (true) {
@@ -24,9 +24,7 @@ export async function fetchGrenselosEpisodes() {
         params: { market: "NO", limit, offset },
       });
     } catch (err) {
-      // Robusthet: hvis token av en eller annen grunn er utløpt midt i løkka
-      const status = err?.response?.status;
-      if (status === 401) {
+      if (err?.response?.status === 401) {
         token = await getSpotifyAccessToken();
         res = await spotifyGet(url, token, {
           params: { market: "NO", limit, offset },
@@ -43,22 +41,18 @@ export async function fetchGrenselosEpisodes() {
     offset += limit;
   }
 
-  // Map til klientformat
   const episodes = allItems.map((ep) => ({
     id: ep.id,
     name: ep.name,
-    description: ep.description,
+    description: cleanEpisodeDescription(ep.description),
     release_date: ep.release_date,
     image: ep.images?.[0]?.url || null,
     external_url: ep.external_urls?.spotify || null,
   }));
 
-  // ISO-datoer kan sorteres trygt som strings (eldst -> nyest)
-  episodes.sort((a, b) => {
-    const da = a.release_date || "";
-    const db = b.release_date || "";
-    return da.localeCompare(db);
-  });
+  episodes.sort((a, b) =>
+    (a.release_date || "").localeCompare(b.release_date || "")
+  );
 
   return episodes;
 }

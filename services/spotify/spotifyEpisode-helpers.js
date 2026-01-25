@@ -1,33 +1,41 @@
-// backend/utils/cleanEpisodeDescription.js (ESM)
+// backend/services/spotify/spotifyEpisodehelpers.js (ESM)
 
-export function cleanEpisodeDescription(text) {
-  if (!text) return "";
+export function cleanEpisodeDescription(input) {
+  if (!input || typeof input !== "string") return null;
 
-  const raw = String(text);
+  let text = input.trim();
 
-  const BLOCK_PATTERNS = [
-    /vil du annonsere/i,
-    /hosted on acast/i,
-    /acast\.com\/privacy/i,
-    /ta kontakt med (vår|vår(e)?) salgspartner/i,
-    /send e-?post til/i,
-    /annonser(e|ing)/i,
-    /reklame/i,
-    /sponsored by/i,
+  // 1) Fjern URLs (Spotify, Instagram, Linktree, etc.)
+  text = text.replace(/https?:\/\/\S+/gi, "");
+
+  // 2) Fjern vanlige CTA / standardfraser
+  const junkPatterns = [
+    /følg oss på.*$/i,
+    /abonner på.*$/i,
+    /hør flere episoder.*$/i,
+    /nye episoder.*hver.*$/i,
+    /produsert av.*$/i,
+    /ansvarlig redaktør.*$/i,
+    /kontakt oss.*$/i,
+    /se mer på.*$/i,
+    /instagram.*$/i,
+    /facebook.*$/i,
+    /tiktok.*$/i,
+    /snapchat.*$/i
   ];
 
-  const lines = raw
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean) // fjern tomme linjer tidlig
-    .filter((line) => {
-      const low = line.toLowerCase();
-      return !BLOCK_PATTERNS.some((re) => re.test(low));
-    });
+  for (const rx of junkPatterns) {
+    text = text.replace(rx, "");
+  }
 
-  // Slå sammen og rydd whitespace
-  return lines
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n") // maks 1 tom linje
+  // 3) Rydd opp whitespace
+  text = text
+    .replace(/\n{3,}/g, "\n\n")   // maks to linjeskift
+    .replace(/[ \t]{2,}/g, " ")
     .trim();
+
+  // 4) For korte beskrivelser er ofte bare støy
+  if (text.length < 30) return null;
+
+  return text;
 }

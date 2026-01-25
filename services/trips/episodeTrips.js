@@ -1,7 +1,7 @@
 // services/trips/episodeTrips.js (ESM)
 
 import axios from "axios";
-import { query } from "../db/query.js"; // 👈 juster path til der query faktisk ligger
+import { query } from "../db/query.js";
 import { generateTripFromAI } from "../ai/tripGenerator.js"; // 👈 juster path
 // import { generateGalleryForTrip } from "../gallery/galleryService.js"; // hvis du vil generere gallery her
 
