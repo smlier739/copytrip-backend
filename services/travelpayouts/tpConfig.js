@@ -11,18 +11,21 @@ function normalizeRealHost(v) {
     .trim();
 }
 
-export const travelpayoutsConfig = {
-  token: env("TRAVELPAYOUTS_TOKEN") || env("TP_API_TOKEN"),
-  marker: env("TRAVELPAYOUTS_MARKER") || env("TP_MARKER"),
-  realHost: normalizeRealHost(env("TRAVELPAYOUTS_REAL_HOST") || env("TP_REAL_HOST")),
-  lang: env("TRAVELPAYOUTS_LANG") || "en",
-};
-
 export function getTpConfig() {
-  return travelpayoutsConfig;
+  // Les env NÅ (ved kall), ikke når modulen importeres
+  const token = env("TRAVELPAYOUTS_TOKEN") || env("TP_API_TOKEN") || env("TP_TOKEN");
+  const marker = env("TRAVELPAYOUTS_MARKER") || env("TP_MARKER");
+  const realHost = normalizeRealHost(env("TRAVELPAYOUTS_REAL_HOST") || env("TP_REAL_HOST"));
+
+  return {
+    token,
+    marker,
+    realHost, // f.eks. "podtech.no"
+    lang: env("TRAVELPAYOUTS_LANG") || "en",
+  };
 }
 
-export function assertTpConfigured(tp = travelpayoutsConfig) {
+export function assertTpConfigured(tp) {
   if (!tp?.token || !tp?.marker) {
     return {
       ok: false,
@@ -41,13 +44,16 @@ export function assertTpConfigured(tp = travelpayoutsConfig) {
   return { ok: true };
 }
 
-// Debug kun i dev
-if (process.env.NODE_ENV !== "production") {
-  console.log("✈️ Travelpayouts config:", {
-    hasToken: !!travelpayoutsConfig.token,
-    hasMarker: !!travelpayoutsConfig.marker,
-    hasRealHost: !!travelpayoutsConfig.realHost,
-    realHost: travelpayoutsConfig.realHost,
-    lang: travelpayoutsConfig.lang,
-  });
+// Kall denne fra index.js etter dotenv (valgfritt)
+export function logTpConfigIfDev() {
+  if (process.env.NODE_ENV !== "production") {
+    const tp = getTpConfig();
+    console.log("✈️ Travelpayouts config:", {
+      hasToken: !!tp.token,
+      hasMarker: !!tp.marker,
+      hasRealHost: !!tp.realHost,
+      realHost: tp.realHost,
+      lang: tp.lang,
+    });
+  }
 }

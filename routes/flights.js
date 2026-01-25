@@ -10,7 +10,7 @@ import { flightSearchCache } from "../services/travelpayouts/flightsCache.js";
 
 const router = express.Router();
 
-// Tilpass om du har en annen start-URL i din kodebase:
+// Travelpayouts start endpoint (fast)
 const TP_START_URL = "https://api.travelpayouts.com/flight_search/v1/start";
 
 /* ------------------------- Small helpers ------------------------- */
@@ -107,6 +107,22 @@ function pickUrlFromObj(o) {
   );
 }
 
+// click-respons kan være string, eller objekt med url et eller annet sted
+function normalizeClickUrl(respData, axiosHeaders) {
+  // 1) Hvis TP svarer med et objekt med url
+  const fromObj = pickUrlFromObj(respData);
+  if (fromObj) return fromObj;
+
+  // 2) Hvis TP svarer med ren string
+  if (typeof respData === "string" && respData.trim()) return respData.trim();
+
+  // 3) Noen click-endepunkt svarer med Location header (redirect uten å følge)
+  const loc = axiosHeaders?.location || axiosHeaders?.Location || null;
+  if (loc) return String(loc);
+
+  return null;
+}
+
 /* ------------------------- START – /api/flights/start ------------------------- */
 
 router.post("/flights/start", async (req, res) => {
@@ -167,7 +183,7 @@ router.post("/flights/start", async (req, res) => {
       },
     };
 
-    // ✅ VIKTIG: din makeSignature tar (token, payload) – IKKE (token, marker, payload)
+    // makeSignature(token, payload)
     const signature = makeSignature(tp.token, payload);
 
     const response = await axios.post(
@@ -175,7 +191,7 @@ router.post("/flights/start", async (req, res) => {
       { ...payload, signature },
       {
         headers: makeHeaders(req, signature, tp),
-        timeout: 15000,
+        timeout: 20000,
       }
     );
 
@@ -244,10 +260,7 @@ router.post("/flights/results", async (req, res) => {
     }
 
     const resultsUrl = new URL("/search/affiliate/results", base).toString();
-
     const payload = { marker: tp.marker, search_id: sid, last_update_timestamp: tsIn };
-
-    // ✅ VIKTIG: makeSignature(token, payload)
     const signature = makeSignature(tp.token, payload);
 
     const r = await axios.post(
@@ -255,7 +268,7 @@ router.post("/flights/results", async (req, res) => {
       { ...payload, signature },
       {
         headers: makeHeaders(req, signature, tp),
-        timeout: 20000,
+        timeout: 25000,
         validateStatus: (status) => (status >= 200 && status < 300) || status === 304,
       }
     );
@@ -265,7 +278,7 @@ router.post("/flights/results", async (req, res) => {
         ok: true,
         is_over: false,
         last_update_timestamp: tsIn,
-        offers: null, // 👈 viktig: app skal ikke overskrive eksisterende offers
+        offers: null, // app skal ikke overskrive eksisterende offers
       });
     }
 
@@ -298,7 +311,7 @@ router.post("/flights/results", async (req, res) => {
       if (id != null) legsById.set(String(id), leg);
     }
 
-    // ✅ flights[] kan være indeks ELLER id
+    // flights[] kan være indeks ELLER id
     const resolveLeg = (ref) => {
       if (ref == null) return null;
       if (typeof ref === "object") return ref;
@@ -307,7 +320,7 @@ router.post("/flights/results", async (req, res) => {
       const byId = legsById.get(String(ref));
       if (byId) return byId;
 
-      // 2) index-lookup (vanlig når flights = [82,83,84])
+      // 2) index-lookup
       const idx = typeof ref === "number" ? ref : Number(ref);
       if (Number.isInteger(idx) && idx >= 0 && idx < legsArr.length) return legsArr[idx];
 
@@ -446,21 +459,16 @@ router.post("/flights/results", async (req, res) => {
         offers.push({
           offer_id,
           tp_proposal_id: tp_proposal_id != null ? String(tp_proposal_id) : null,
-
           price: typeof price === "number" ? price : null,
           currency,
-
           depTime,
           arrTime,
           durationText,
-
           routeText,
           stopsText,
-
           airlinesText,
           flightNosText,
           agentText: "",
-
           signature: t?.signature || null,
         });
       }
@@ -489,7 +497,12 @@ router.post("/flights/results", async (req, res) => {
 });
 
 /* ------------------------- CLICK – /api/flights/click ------------------------- */
-
+/**
+ * Viktig:
+ * - Denne MÅ IKKE bruke makeHeaders(req, "", tp) hvis makeHeaders krever signature.
+ * - Vi lager derfor en egen header-builder for click uten signature.
+ * - Click-endepunktet kan returnere url i body, eller via Location header (redirect).
+ */
 router.post("/flights/click", async (req, res) => {
   try {
     const tp = getTpConfig();
@@ -520,34 +533,53 @@ router.post("/flights/click", async (req, res) => {
       });
     }
 
-    async function doTpClickNewEndpoint(tpProposalId, sourceLabel) {
+    // Click trenger token+realhost+ip, men ikke signature
+    function makeClickHeaders() {
+      // makeHeaders kan feile hvis den forventer signature -> bygg "light" headers her
+      const headers = {
+        Accept: "application/json",
+        "x-affiliate-user-id": String(tp.token),
+        "x-real-host": String(tp.realHost),
+        // marker i header (TP ber om den i noen varianter)
+        "x-affiliate-marker": String(tp.marker),
+        "x-affiliate-mark": String(tp.marker),
+        "x-affiliate-marker-id": String(tp.marker),
+        "x-marker": String(tp.marker),
+        marker: String(tp.marker),
+      };
+
+      // prøv å hente ip fra makeHeaders uten signature hvis din makeHeaders er gjort valgfri,
+      // men ikke la det knekke click om den kaster
+      try {
+        const maybe = makeHeaders(req, null, tp);
+        if (maybe?.["x-user-ip"]) headers["x-user-ip"] = maybe["x-user-ip"];
+      } catch {
+        // ignorer
+      }
+
+      return headers;
+    }
+
+    async function doTpClick(tpProposalId, sourceLabel) {
       const clickUrl = new URL(
         `/searches/${encodeURIComponent(sid)}/clicks/${encodeURIComponent(String(tpProposalId))}`,
         base
       ).toString();
 
-      // marker i header (påkrevd) – behold resten av headerne dine
-      const headers = {
-        ...(makeHeaders(req, "", tp) || {}),
-        "X-Affiliate-Marker": tp.marker,
-        "X-Marker": tp.marker,
-        marker: tp.marker,
-      };
-
       const cr = await axios.get(clickUrl, {
-        headers,
-        timeout: 20000,
+        headers: makeClickHeaders(),
+        timeout: 25000,
         validateStatus: (status) => status >= 200 && status < 400,
-        maxRedirects: 0,
+        maxRedirects: 0, // vi vil fange Location selv
       });
 
-      const url = pickUrlFromObj(cr?.data);
+      const url = normalizeClickUrl(cr?.data, cr?.headers);
       if (!url) {
         return {
           ok: false,
           status: 502,
           error: "TP click manglet url (uventet respons)",
-          details: { status: cr.status, data: cr.data || null },
+          details: { status: cr.status, data: cr.data || null, headers: cr.headers || null },
         };
       }
 
@@ -556,7 +588,7 @@ router.post("/flights/click", async (req, res) => {
 
     // 1) direkte tp_proposal_id (best)
     if (clientTpProposalId) {
-      const r = await doTpClickNewEndpoint(clientTpProposalId, "tp_click_direct");
+      const r = await doTpClick(clientTpProposalId, "tp_click_direct");
       if (!r.ok) return res.status(r.status || 502).json({ error: r.error, details: r.details || null });
       return res.json({ ok: true, url: r.url, source: r.source });
     }
@@ -564,7 +596,7 @@ router.post("/flights/click", async (req, res) => {
     // 2) offer_id -> cached mapping (krever at results har kjørt)
     const cachedProposal = cached?.offer_to_tp_proposal?.[clientOfferId];
     if (cachedProposal) {
-      const r = await doTpClickNewEndpoint(cachedProposal, "tp_click_cached_map");
+      const r = await doTpClick(cachedProposal, "tp_click_cached_map");
       if (!r.ok) return res.status(r.status || 502).json({ error: r.error, details: r.details || null });
       return res.json({ ok: true, url: r.url, source: r.source });
     }

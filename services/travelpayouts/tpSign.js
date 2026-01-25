@@ -75,17 +75,16 @@ export function makeHeaders(req, signature, tp) {
   if (!tp?.token || !tp?.realHost) {
     throw new Error("Travelpayouts headers: missing token/realHost");
   }
-  if (!signature) {
-    throw new Error("Travelpayouts headers: missing signature");
-  }
 
   const headers = {
     "Content-Type": "application/json",
     Accept: "application/json",
     "x-affiliate-user-id": String(tp.token),
     "x-real-host": String(tp.realHost),
-    "x-signature": String(signature),
   };
+
+  // signature er kun påkrevd for de endepunktene som faktisk trenger det
+  if (signature) headers["x-signature"] = String(signature);
 
   const ip = normalizeIp(getUserIp(req));
   if (ip) headers["x-user-ip"] = ip;

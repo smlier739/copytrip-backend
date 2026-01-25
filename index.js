@@ -1,6 +1,9 @@
 // backend/index.js – Grenseløs Reise backend (ESM)
 import dotenv from "dotenv";
-dotenv.config({ override: true });
+dotenv.config({ override: false });
+
+import { logTpConfigIfDev } from "./services/travelpayouts/tpConfig.js";
+logTpConfigIfDev();
 
 import express from "express";
 import cors from "cors";
