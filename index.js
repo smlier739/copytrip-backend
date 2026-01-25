@@ -101,7 +101,7 @@ console.log("FILE =", new URL(import.meta.url).pathname);
 // Server start
 // ---------------------------------
 const PORT = Number(process.env.PORT || 4000);
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Grenseløs Reise backend kjører på port ${PORT}`);
 });
 
