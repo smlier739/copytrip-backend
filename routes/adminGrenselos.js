@@ -51,10 +51,99 @@ function parseJsonArray(value) {
   return [];
 }
 
-// Hjelper: flatten {Europe:[...], Asia:[...]} til array
-function flattenEpisodesGrouped(grouped) {
-  if (!grouped || typeof grouped !== "object") return [];
-  return Object.values(grouped).flat().filter(Boolean);
+// ---------------------------------------------------------
+// Kontinent-grouping (deterministisk)
+// NB: Dette er en enkel heuristikk basert på tittel/beskrivelse.
+// Du kan senere gjøre dette "riktig" via egen episode-metadata-tabell.
+// ---------------------------------------------------------
+const CONTINENT_ORDER = ["Europe", "America", "Asia", "Africa", "Oceania", "Other"];
+
+function normalizeName(s) {
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function sortEpisodesStable(a, b) {
+  // Stabil, deterministisk sort for å unngå "vilkårlig" rekkefølge
+  const byName = normalizeName(a?.name).localeCompare(normalizeName(b?.name), "nb");
+  if (byName !== 0) return byName;
+
+  const byDate = String(b?.release_date || "").localeCompare(String(a?.release_date || ""));
+  if (byDate !== 0) return byDate;
+
+  return String(a?.id || "").localeCompare(String(b?.id || ""));
+}
+
+function guessContinent(ep) {
+  const hay = `${ep?.name || ""} ${ep?.description || ""}`.toLowerCase();
+
+  // Europe (inkl. Norge/Europa-byer/land)
+  if (
+    /(norge|norway|oslo|bergen|trondheim|stavanger|sverige|sweden|danmark|denmark|finland|island|uk|england|scotland|ireland|frankrike|france|paris|spain|madrid|italy|roma|tyskland|germany|berlin|polen|poland|portugal|lisboa|hellas|greece|athen|praha|vienna|østerrike|austria|københavn|copenhagen|stockholm)/i.test(
+      hay
+    )
+  )
+    return "Europe";
+
+  // America (Nord+Sør)
+  if (
+    /(usa|united states|new york|los angeles|california|texas|miami|canada|toronto|vancouver|mexico|brazil|brasil|argentina|peru|chile|colombia|cuba|patagonia)/i.test(
+      hay
+    )
+  )
+    return "America";
+
+  // Asia
+  if (
+    /(japan|tokyo|kina|china|beijing|shanghai|thailand|bangkok|vietnam|hanoi|saigon|india|delhi|nepal|kathmandu|indonesia|bali|philippines|manila|singapore|korea|seoul|sri lanka|pakistan)/i.test(
+      hay
+    )
+  )
+    return "Asia";
+
+  // Africa
+  if (
+    /(afrika|africa|marokko|morocco|egypt|cairo|tanzania|zanzibar|kenya|nairobi|south africa|cape town|tunisia|algeria|ethiopia|uganda|rwanda)/i.test(
+      hay
+    )
+  )
+    return "Africa";
+
+  // Oceania
+  if (
+    /(australia|sydney|melbourne|new zealand|nz|auckland|oceania|polynesia|fiji|tahiti|samoa)/i.test(
+      hay
+    )
+  )
+    return "Oceania";
+
+  return "Other";
+}
+
+function groupEpisodesByContinent(episodes) {
+  const temp = {};
+  for (const ep of episodes || []) {
+    const c = guessContinent(ep);
+    if (!temp[c]) temp[c] = [];
+    temp[c].push(ep);
+  }
+
+  // Sortér inni grupper deterministisk
+  for (const k of Object.keys(temp)) temp[k].sort(sortEpisodesStable);
+
+  // Stabil nøkkelrekkefølge
+  const out = {};
+  for (const k of CONTINENT_ORDER) if (temp[k]?.length) out[k] = temp[k];
+
+  // Eventuelle ukjente keys (skal normalt ikke skje)
+  const extras = Object.keys(temp)
+    .filter((k) => !CONTINENT_ORDER.includes(k))
+    .sort();
+  for (const k of extras) out[k] = temp[k];
+
+  return out;
 }
 
 // ---------------------------------------------------------
@@ -100,31 +189,24 @@ router.use(requireAdmin);
 
 /**
  * GET /api/admin/grenselos/grenselos-episodes
- * Admin: Returnerer episoder gruppert per verdensdel + galleri uavhengig av bruker.
  *
- * Return:
- * {
- *   episodesByContinent: {
- *     Europe: [ {episode..., trip_id, gallery, ...}, ... ],
- *     America: [...],
- *     ...
- *   }
- * }
+ * Admin: Returnerer:
+ * - episodes: FLAT liste (bakoverkompatibel med eksisterende AdminScreen)
+ * - episodesByContinent: gruppert objekt
  *
- * Logikk galleri:
- * - Hent "beste" trip per episode uavhengig av bruker:
+ * Galleri (uavhengig av bruker):
+ * - Finn "beste" trip per episode:
  *   - foretrekk trip med bilder i gallery
- *   - ellers den nyeste
+ *   - ellers nyeste trip
  */
 router.get("/grenselos-episodes", async (_req, res) => {
   try {
-    const grouped = await fetchGrenselosEpisodes();
-    if (!grouped || typeof grouped !== "object") {
-      throw new Error("fetchGrenselosEpisodes() ga ikke et grouped-objekt.");
+    const episodes = await fetchGrenselosEpisodes(); // MÅ være Array
+    if (!Array.isArray(episodes)) {
+      throw new Error("fetchGrenselosEpisodes() må returnere en array.");
     }
 
-    const allEpisodes = flattenEpisodesGrouped(grouped);
-    const episodeIds = allEpisodes.map((ep) => ep.id).filter(Boolean);
+    const episodeIds = episodes.map((ep) => ep.id).filter(Boolean);
 
     // Finn beste trip per episode (uavhengig av bruker)
     let tripsByEpisodeId = {};
@@ -154,29 +236,61 @@ router.get("/grenselos-episodes", async (_req, res) => {
       }, {});
     }
 
-    // Bygg grouped respons med galleri
-    const episodesByContinent = {};
-    for (const [continent, eps] of Object.entries(grouped)) {
-      episodesByContinent[continent] = (Array.isArray(eps) ? eps : []).map((ep) => {
-        const trip = tripsByEpisodeId[ep.id] || null;
+    // Bygg flat liste med galleri
+    const flat = episodes.map((ep) => {
+      const trip = tripsByEpisodeId[ep.id] || null;
+      return {
+        episode_id: ep.id,
+        name: ep.name,
+        description: ep.description,
+        release_date: ep.release_date,
+        image: ep.image,
+        external_url: ep.external_url,
 
-        return {
-          episode_id: ep.id,
-          continent: ep.continent || continent || "Other",
-          name: ep.name,
-          description: ep.description,
-          release_date: ep.release_date,
-          image: ep.image,
-          external_url: ep.external_url,
+        trip_id: trip ? trip.id : null,
+        trip_user_id: trip ? trip.user_id : null,
+        gallery: trip?.gallery ? parseJsonArray(trip.gallery) : [],
+      };
+    });
 
-          trip_id: trip ? trip.id : null,
-          trip_user_id: trip ? trip.user_id : null, // nyttig i admin/debug
-          gallery: trip?.gallery ? parseJsonArray(trip.gallery) : [],
-        };
-      });
+    // Gruppér basert på flat liste (inkl. galleri)
+    const episodesByContinent = groupEpisodesByContinent(
+      flat.map((x) => ({
+        // group-funksjonen forventer {id,name,description,...}
+        id: x.episode_id,
+        name: x.name,
+        description: x.description,
+        release_date: x.release_date,
+        image: x.image,
+        external_url: x.external_url,
+        // beholder admin-felter:
+        trip_id: x.trip_id,
+        trip_user_id: x.trip_user_id,
+        gallery: x.gallery,
+      }))
+    );
+
+    // Konverter tilbake til samme shape inne i grupper
+    const groupedOut = {};
+    for (const [continent, eps] of Object.entries(episodesByContinent)) {
+      groupedOut[continent] = (eps || []).map((ep) => ({
+        episode_id: ep.id,
+        continent,
+        name: ep.name,
+        description: ep.description,
+        release_date: ep.release_date,
+        image: ep.image,
+        external_url: ep.external_url,
+        trip_id: ep.trip_id || null,
+        trip_user_id: ep.trip_user_id || null,
+        gallery: Array.isArray(ep.gallery) ? ep.gallery : [],
+      }));
     }
 
-    return res.json({ episodesByContinent });
+    return res.json({
+      episodes: flat, // bakoverkompatibel
+      episodesByContinent: groupedOut,
+    });
   } catch (e) {
     console.error("[adminGrenselos] GET /grenselos-episodes error:", e?.message || e);
     return res.status(500).json({ error: "Kunne ikke hente episoder/galleri." });
@@ -187,7 +301,7 @@ router.get("/grenselos-episodes", async (_req, res) => {
  * POST /api/admin/grenselos/grenselos-episodes/:episodeId/gallery
  * Admin: Setter galleri manuelt (JSON) på "canonical" admin-trip for episoden.
  *
- * Canonical-strategi:
+ * Canonical:
  * - Finn/oppdater en admin-owned trip for episoden (req.user.id)
  */
 router.post("/grenselos-episodes/:episodeId/gallery", async (req, res) => {
@@ -201,10 +315,8 @@ router.post("/grenselos-episodes/:episodeId/gallery", async (req, res) => {
       });
     }
 
-    // fetch er gruppert nå – vi flater ut for å finne episoden
-    const grouped = await fetchGrenselosEpisodes();
-    const allEpisodes = flattenEpisodesGrouped(grouped);
-    const episode = allEpisodes.find((e) => e.id === episodeId);
+    const episodes = await fetchGrenselosEpisodes(); // array
+    const episode = Array.isArray(episodes) ? episodes.find((e) => e.id === episodeId) : null;
 
     if (!episode) {
       return res.status(404).json({ error: "Episode ikke funnet på Spotify." });
@@ -263,10 +375,8 @@ router.post(
         return res.status(400).json({ error: "Ingen bildefiler ble lastet opp." });
       }
 
-      // fetch er gruppert nå – vi flater ut for å finne episoden
-      const grouped = await fetchGrenselosEpisodes();
-      const allEpisodes = flattenEpisodesGrouped(grouped);
-      const episode = allEpisodes.find((e) => e.id === episodeId);
+      const episodes = await fetchGrenselosEpisodes(); // array
+      const episode = Array.isArray(episodes) ? episodes.find((e) => e.id === episodeId) : null;
 
       if (!episode) {
         return res.status(404).json({ error: "Episode ikke funnet på Spotify." });
@@ -275,11 +385,7 @@ router.post(
       // Canonical admin trip for skriving
       const tripId = await ensureTripForEpisode(episode, req.user.id);
 
-      const tripRes = await pool.query(
-        `SELECT gallery FROM trips WHERE id = $1 LIMIT 1`,
-        [tripId]
-      );
-
+      const tripRes = await pool.query(`SELECT gallery FROM trips WHERE id = $1 LIMIT 1`, [tripId]);
       if (tripRes.rowCount === 0) {
         return res.status(404).json({ error: "Trip ikke funnet." });
       }
