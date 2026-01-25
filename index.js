@@ -87,6 +87,7 @@ app.use((req, res) => {
 });
 
 console.log("🗂️ uploadDir =", uploadDir);
+console.log("FLIGHTS START URL =", `${API_BASE}/api/flights/start`);
 
 // ---------------------------------
 // Error handler (sist)
