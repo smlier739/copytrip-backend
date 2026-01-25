@@ -2,6 +2,16 @@
 
 import { spotifyGet, getSpotifyAccessToken } from "./spotifyClient.js";
 import { cleanEpisodeDescription } from "./spotifyEpisodehelpers.js";
+import { detectContinent } from "./continentDetector.js";
+
+const CONTINENT_ORDER = [
+  "Europe",
+  "America",
+  "Asia",
+  "Africa",
+  "Oceania",
+  "Other"
+];
 
 export async function fetchGrenselosEpisodes() {
   const showId = String(process.env.SPOTIFY_SHOW_ID || "").trim();
@@ -41,18 +51,33 @@ export async function fetchGrenselosEpisodes() {
     offset += limit;
   }
 
-  const episodes = allItems.map((ep) => ({
-    id: ep.id,
-    name: ep.name,
-    description: cleanEpisodeDescription(ep.description),
-    release_date: ep.release_date,
-    image: ep.images?.[0]?.url || null,
-    external_url: ep.external_urls?.spotify || null,
-  }));
+  const episodes = allItems.map((ep) => {
+    const cleanDesc = cleanEpisodeDescription(ep.description);
 
-  episodes.sort((a, b) =>
-    (a.release_date || "").localeCompare(b.release_date || "")
-  );
+    const continent = detectContinent(
+      `${ep.name || ""} ${cleanDesc || ""}`
+    );
+
+    return {
+      id: ep.id,
+      name: ep.name,
+      description: cleanDesc,
+      release_date: ep.release_date,
+      image: ep.images?.[0]?.url || null,
+      external_url: ep.external_urls?.spotify || null,
+      continent
+    };
+  });
+
+  episodes.sort((a, b) => {
+    const ca = CONTINENT_ORDER.indexOf(a.continent);
+    const cb = CONTINENT_ORDER.indexOf(b.continent);
+
+    if (ca !== cb) return ca - cb;
+
+    // sekundær sortering: eldste → nyeste innen samme verdensdel
+    return (a.release_date || "").localeCompare(b.release_date || "");
+  });
 
   return episodes;
 }
