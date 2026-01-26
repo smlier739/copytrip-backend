@@ -1,4 +1,4 @@
-// backend/routes/flights.js (ESM)
+// routes/flights.js (ESM)
 
 import express from "express";
 import axios from "axios";
@@ -13,14 +13,13 @@ const TP_LEGACY_START_URL = "https://api.travelpayouts.com/v1/flight_search";
 const TP_LEGACY_RESULTS_URL = "https://api.travelpayouts.com/v1/flight_search_results";
 
 const START_TIMEOUT_MS = 20000;
-const RESULTS_TIMEOUT_MS = 65000;
+// Viktig: appen din har timeoutMs=30000 i fetch. Hold backend < 30s.
+const RESULTS_TIMEOUT_MS = 25000;
 
 function dbgEnabled() {
-  return (
-    String(process.env.TP_DEBUG || process.env.TRAVELPAYOUTS_DEBUG || "")
-      .trim()
-      .toLowerCase() === "true"
-  );
+  return String(process.env.TP_DEBUG || process.env.TRAVELPAYOUTS_DEBUG || "")
+    .trim()
+    .toLowerCase() === "true";
 }
 
 function rid() {
@@ -109,6 +108,7 @@ function pickCurrency(p, t, data) {
   return toUpper(c || "NOK");
 }
 
+// “er ferdig?”-deteksjon på tvers av varianter
 function inferIsOver(data) {
   if (!data) return false;
   if (typeof data.is_over === "boolean") return data.is_over;
@@ -134,9 +134,7 @@ function inferLastTs(data, fallback = 0) {
 
 /**
  * Normaliser Travelpayouts legacy results -> appens offers-format.
- * Først prøver tickets + flight_legs. Hvis schema er annerledes:
- * - returner offers: []
- * - logg keys + sample i debug (for å kunne tilpasse parseren)
+ * Forventer “tickets + flight_legs”. Hvis ikke: returner tomt men OK.
  */
 function buildOffersFromTpResults(data, searchId) {
   const tickets = Array.isArray(data?.tickets) ? data.tickets : [];
@@ -145,12 +143,7 @@ function buildOffersFromTpResults(data, searchId) {
   if (!tickets.length || !legsArr.length) {
     return {
       offers: [],
-      meta: {
-        schema: "unknown_or_empty",
-        keys: data && typeof data === "object" ? Object.keys(data) : null,
-        tickets: tickets.length,
-        legs: legsArr.length,
-      },
+      meta: { schema: "unknown_or_empty", tickets: tickets.length, legs: legsArr.length },
     };
   }
 
@@ -325,10 +318,7 @@ function buildOffersFromTpResults(data, searchId) {
   }
 
   offers.sort((a, b) => (a.price ?? 1e18) - (b.price ?? 1e18));
-  return {
-    offers,
-    meta: { schema: "tickets+flight_legs", tickets: tickets.length, legs: legsArr.length },
-  };
+  return { offers, meta: { schema: "tickets+flight_legs", tickets: tickets.length, legs: legsArr.length } };
 }
 
 /* ---------------------------------------------------------
@@ -341,7 +331,9 @@ router.post("/flights/start", async (req, res) => {
   try {
     const tp = getTpConfig();
     const okCfg = assertTpConfigured(tp);
-    if (!okCfg.ok) return res.status(okCfg.status).json({ error: okCfg.error, request_id: requestId });
+    if (!okCfg.ok) {
+      return res.status(okCfg.status).json({ error: okCfg.error, request_id: requestId });
+    }
 
     const body = req.body || {};
     const segments = Array.isArray(body.segments) ? body.segments : [];
@@ -384,16 +376,15 @@ router.post("/flights/start", async (req, res) => {
       return res.status(400).json({ error: "Ugyldig passasjer-oppsett", request_id: requestId });
     }
 
-    const userIp = String(
-      req.headers["x-forwarded-for"] || req.headers["x-real-ip"] || req.ip || ""
-    )
-      .split(",")[0]
-      .trim();
+    const userIp =
+      String(req.headers["x-forwarded-for"] || req.headers["x-real-ip"] || req.ip || "")
+        .split(",")[0]
+        .trim() || "127.0.0.1";
 
     const payload = {
       marker: tp.marker,
       host: tp.realHost, // f.eks. "podtech.no"
-      user_ip: userIp || "127.0.0.1",
+      user_ip: userIp,
       locale: body.locale || "no",
       trip_class: toUpper(body.trip_class || "Y"),
       passengers: {
@@ -436,25 +427,21 @@ router.post("/flights/start", async (req, res) => {
       {
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         timeout: START_TIMEOUT_MS,
+        validateStatus: (s) => s >= 200 && s < 300,
       }
     );
 
-    // ✅ FIX: riktig variabelnavn + riktig requestId
-    console.log(`[TP][start][${requestId}] response`, {
-      status: r.status,
-      keys: r.data && typeof r.data === "object" ? Object.keys(r.data) : null,
-      uuid: r.data?.uuid ?? null,
-      search_id: r.data?.search_id ?? null,
-    });
-
-    const uuid = r.data?.uuid ?? r.data?.search_id ?? r.data?.searchId ?? null;
-
+    // ✅ FIX: bruk r, ikke "response"
     if (dbg) {
-      console.log(`[TP][start][${requestId}] upstream`, {
+      console.log(`[TP][start][${requestId}] response`, {
         status: r.status,
-        uuid: uuid ? safe(uuid, 8) : null,
+        keys: r.data && typeof r.data === "object" ? Object.keys(r.data) : null,
+        search_id: r.data?.search_id,
+        uuid: r.data?.uuid,
       });
     }
+
+    const uuid = r.data?.uuid ?? r.data?.search_id ?? r.data?.searchId ?? null;
 
     if (!uuid) {
       return res.status(502).json({
@@ -472,8 +459,8 @@ router.post("/flights/start", async (req, res) => {
       last_ok_at: null,
       last_ok_offers: null,
       last_ok_meta: null,
-      last_ok_ts: null,
-      last_ok_is_over: null,
+      last_ok_ts: 0,
+      last_ok_is_over: false,
     });
 
     return res.json({
@@ -511,7 +498,9 @@ router.post("/flights/results", async (req, res) => {
   try {
     const tp = getTpConfig();
     const okCfg = assertTpConfigured(tp);
-    if (!okCfg.ok) return res.status(okCfg.status).json({ error: okCfg.error, request_id: requestId });
+    if (!okCfg.ok) {
+      return res.status(okCfg.status).json({ error: okCfg.error, request_id: requestId });
+    }
 
     const { search_id } = req.body || {};
     const sid = String(search_id || "").trim();
@@ -534,15 +523,6 @@ router.post("/flights/results", async (req, res) => {
     const data = r.data || {};
     const isOver = inferIsOver(data);
     const lastTs = inferLastTs(data, 0);
-
-    // ✅ Debug schema når offers ender tomt
-    if (dbg) {
-      console.log(`[TP][results][${requestId}] keys`, data && typeof data === "object" ? Object.keys(data) : null);
-      console.log(
-        `[TP][results][${requestId}] sample`,
-        JSON.stringify(data, null, 2).slice(0, 2000)
-      );
-    }
 
     const { offers, meta } = buildOffersFromTpResults(data, sid);
 
@@ -578,8 +558,7 @@ router.post("/flights/results", async (req, res) => {
     const status = err?.response?.status ?? null;
     const data = err?.response?.data ?? null;
     const isTimeout =
-      err?.code === "ECONNABORTED" ||
-      String(err?.message || "").toLowerCase().includes("timeout");
+      err?.code === "ECONNABORTED" || String(err?.message || "").toLowerCase().includes("timeout");
 
     if (isTimeout) {
       try {
