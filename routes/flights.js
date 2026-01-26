@@ -4,156 +4,68 @@ import express from "express";
 import axios from "axios";
 
 import { getTpConfig, assertTpConfigured } from "../services/travelpayouts/tpConfig.js";
-import { makeHeaders, makeSignature } from "../services/travelpayouts/tpSign.js";
-import { normalizeAbsoluteUrl } from "../services/travelpayouts/tpHttp.js";
+import { makeSignature } from "../services/travelpayouts/tpSign.js";
 import { flightSearchCache } from "../services/travelpayouts/flightsCache.js";
 
 const router = express.Router();
 
-// Travelpayouts start endpoint (fast)
-const TP_START_URL = "https://api.travelpayouts.com/flight_search/v1/start";
+// Legacy endpoints (dette er de som faktisk brukes i Travelpayouts realtime flight search)
+const TP_LEGACY_START_URL = "https://api.travelpayouts.com/v1/flight_search";
+const TP_LEGACY_RESULTS_URL = "https://api.travelpayouts.com/v1/flight_search_results";
 
-/* ------------------------- Small helpers ------------------------- */
+/* ------------------------- helpers ------------------------- */
 
 function toUpper(v) {
   return String(v || "").toUpperCase().trim();
 }
 
-function num(v) {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v === "string" && v.trim()) {
-    const n = Number(v.replace(",", "."));
-    return Number.isFinite(n) ? n : null;
-  }
-  return null;
+function safe(v, keep = 4) {
+  const s = String(v || "");
+  if (!s) return "";
+  if (s.length <= keep) return "***";
+  return `${s.slice(0, keep)}***`;
 }
 
-function pick(obj, keys) {
-  for (const k of keys) {
-    const v = obj?.[k];
-    if (v != null && v !== "") return v;
-  }
-  return null;
+function dbgEnabled() {
+  return String(process.env.TP_DEBUG || process.env.TRAVELPAYOUTS_DEBUG || "")
+    .trim()
+    .toLowerCase() === "true";
 }
 
-function fmtTimeHHMM(v) {
-  if (!v) return "";
-  const s = String(v);
-  if (s.includes("T")) return s.split("T")[1]?.slice(0, 5) || "";
-  if (s.includes(" ")) return s.split(" ")[1]?.slice(0, 5) || "";
-  return s.slice(0, 5);
-}
-
-function fmtDurationMins(mins) {
-  const n = Number(mins);
-  if (!Number.isFinite(n)) return "";
-  const h = Math.floor(n / 60);
-  const m = n % 60;
-  return h > 0 ? `${h}t ${m}m` : `${m}m`;
-}
-
-function uniq(arr) {
-  return Array.from(new Set((arr || []).filter(Boolean)));
-}
-
-function pickObj(v, keys) {
-  if (!v) return null;
-  if (typeof v === "string") return v;
-  if (typeof v === "object") {
-    for (const k of keys) {
-      const x = v?.[k];
-      if (x != null && x !== "") return x;
-    }
-  }
-  return null;
-}
-
-function pickPriceFromProposal(p) {
-  const c = p?.price ?? p?.unified_price ?? p?.total_price ?? p?.amount ?? null;
-  if (typeof c === "number" && Number.isFinite(c)) return c;
-  if (typeof c === "string") return num(c);
-  if (c && typeof c === "object") return num(c.amount ?? c.value ?? c.price ?? c.total);
-  return null;
-}
-
-function pickCurrency(p, t, data) {
-  const c =
-    (typeof p?.price === "object" ? p.price?.currency : null) ||
-    (typeof p?.unified_price === "object" ? p.unified_price?.currency : null) ||
-    (typeof p?.price_per_person === "object" ? p.price_per_person?.currency : null) ||
-    p?.currency ||
-    t?.currency ||
-    data?.search_params?.currency_code ||
-    data?.search_params?.currency ||
-    "NOK";
-  return toUpper(c || "NOK");
-}
-
-function pickUrlFromObj(o) {
+function getReqId(req) {
   return (
-    (o &&
-      (o.url ||
-        o.click_url ||
-        o.clickUrl ||
-        o.redirect_url ||
-        o.redirectUrl ||
-        o.deeplink ||
-        o.deep_link ||
-        o.deepLink ||
-        o.link ||
-        o.result_url ||
-        o.resultUrl)) ||
-    null
+    req.headers["x-request-id"] ||
+    req.headers["x-correlation-id"] ||
+    `rid_${Date.now()}_${Math.random().toString(16).slice(2)}`
   );
 }
 
-// click-respons kan være string, eller objekt med url et eller annet sted
-function normalizeClickUrl(respData, axiosHeaders) {
-  // 1) Hvis TP svarer med et objekt med url
-  const fromObj = pickUrlFromObj(respData);
-  if (fromObj) return fromObj;
-
-  // 2) Hvis TP svarer med ren string
-  if (typeof respData === "string" && respData.trim()) return respData.trim();
-
-  // 3) Noen click-endepunkt svarer med Location header (redirect uten å følge)
-  const loc = axiosHeaders?.location || axiosHeaders?.Location || null;
-  if (loc) return String(loc);
-
-  return null;
+function getUserIp(req) {
+  const xff = req.headers?.["x-forwarded-for"];
+  if (xff) return String(xff).split(",")[0].trim();
+  const xri = req.headers?.["x-real-ip"];
+  if (xri) return String(xri).trim();
+  if (req.ip) return String(req.ip).trim();
+  return String(req.socket?.remoteAddress || "").trim();
 }
 
 /* ------------------------- START – /api/flights/start ------------------------- */
-
-// i backend/routes/flights.js
-
+/**
+ * Body eksempel:
+ * {
+ *   "segments":[{"origin":"OSL","destination":"LHR","date":"2026-02-01"}],
+ *   "passengers":{"adults":1,"children":0,"infants":0},
+ *   "trip_class":"Y",
+ *   "locale":"no",
+ *   "currency":"NOK"
+ * }
+ */
 router.post("/flights/start", async (req, res) => {
-  // ---- local debug helpers (safe logging) ----
-  const rid =
-    req.headers["x-request-id"] ||
-    req.headers["x-correlation-id"] ||
-    `rid_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const rid = getReqId(req);
+  const dbg = dbgEnabled();
 
-  const dbgOn =
-    String(process.env.TP_DEBUG || process.env.TRAVELPAYOUTS_DEBUG || "")
-      .trim()
-      .toLowerCase() === "true";
-
-  const safe = (v, keep = 4) => {
-    const s = String(v || "");
-    if (!s) return "";
-    if (s.length <= keep) return "***";
-    return `${s.slice(0, keep)}***`;
-  };
-
-  const log = (...args) => {
-    if (!dbgOn) return;
-    console.log(`[TP][start][${rid}]`, ...args);
-  };
-
-  const logErr = (...args) => {
-    console.error(`[TP][start][${rid}]`, ...args);
-  };
+  const log = (...args) => dbg && console.log(`[TP][start][${rid}]`, ...args);
+  const logErr = (...args) => console.error(`[TP][start][${rid}]`, ...args);
 
   try {
     const tp = getTpConfig();
@@ -163,24 +75,13 @@ router.post("/flights/start", async (req, res) => {
       return res.status(okCfg.status).json({ error: okCfg.error, request_id: rid });
     }
 
-    // Debug: viser hvilke env keys som faktisk er lastet (uten å lekke verdier)
-    log("TP config snapshot:", {
-      hasToken: !!tp?.token,
-      hasMarker: !!tp?.marker,
-      hasRealHost: !!tp?.realHost,
-      realHost: tp?.realHost || "",
-      tokenPreview: safe(tp?.token, 4),
-      markerPreview: safe(tp?.marker, 3),
-      nodeEnv: process.env.NODE_ENV || "",
-    });
-
     const body = req.body || {};
     const segments = Array.isArray(body.segments) ? body.segments : [];
 
     const directions = segments
       .map((s) => ({
-        origin: toUpper(String(s?.origin || "").trim()),
-        destination: toUpper(String(s?.destination || "").trim()),
+        origin: toUpper(s?.origin),
+        destination: toUpper(s?.destination),
         date: String(s?.date || "").trim(), // YYYY-MM-DD
       }))
       .filter((d) => d.origin && d.destination && d.date);
@@ -191,12 +92,8 @@ router.post("/flights/start", async (req, res) => {
         request_id: rid,
       });
     }
-
     if (directions.some((d) => d.origin === d.destination)) {
-      return res.status(400).json({
-        error: "origin og destination kan ikke være like",
-        request_id: rid,
-      });
+      return res.status(400).json({ error: "origin og destination kan ikke være like", request_id: rid });
     }
 
     const passengers = body.passengers || {};
@@ -216,602 +113,161 @@ router.post("/flights/start", async (req, res) => {
       return res.status(400).json({ error: "Ugyldig passasjer-oppsett", request_id: rid });
     }
 
-    // --------------------------
-    // (A) Prøv "NY" endpoint først
-    // --------------------------
-    const payloadNew = {
+    const payload = {
       marker: tp.marker,
-      locale: body.locale || "no",
-      currency_code: body.currency || "NOK",
-      market_code: body.market_code || "NO",
-      search_params: {
-        trip_class: toUpper(body.trip_class || "Y"),
-        passengers: { adults, children, infants },
-        directions,
-      },
-    };
-
-    const signatureNew = makeSignature(tp.token, payloadNew);
-
-    const headersNew = makeHeaders(req, signatureNew, tp);
-
-    log("Trying NEW start endpoint:", {
-      url: TP_START_URL,
-      headers: {
-        ...headersNew,
-        "x-affiliate-user-id": safe(headersNew["x-affiliate-user-id"], 4),
-        "x-signature": safe(headersNew["x-signature"], 6),
-      },
-      payload_shape: {
-        marker: safe(payloadNew.marker, 3),
-        locale: payloadNew.locale,
-        currency_code: payloadNew.currency_code,
-        market_code: payloadNew.market_code,
-        directionsCount: payloadNew.search_params?.directions?.length || 0,
-      },
-    });
-
-    try {
-      const response = await axios.post(
-        TP_START_URL,
-        { ...payloadNew, signature: signatureNew },
-        {
-          headers: headersNew,
-          timeout: 20000,
-        }
-      );
-
-      const searchId = response.data?.search_id;
-      const resultsUrl = response.data?.results_url;
-
-      log("NEW endpoint response ok:", {
-        status: response.status,
-        has_search_id: !!searchId,
-        has_results_url: !!resultsUrl,
-      });
-
-      if (!searchId || !resultsUrl) {
-        return res.status(502).json({
-          error: "Ugyldig svar fra Travelpayouts (mangler search_id/results_url)",
-          details: dbgOn ? response.data : null,
-          request_id: rid,
-        });
-      }
-
-      const normalizedResultsUrl = normalizeAbsoluteUrl(resultsUrl);
-      if (!normalizedResultsUrl) {
-        return res.status(502).json({
-          error: "Ugyldig results_url fra Travelpayouts (ikke absolutt URL)",
-          details: dbgOn ? { resultsUrl } : null,
-          request_id: rid,
-        });
-      }
-
-      flightSearchCache.set(String(searchId), {
-        mode: "new",
-        results_url: normalizedResultsUrl,
-        created_at: Date.now(),
-      });
-
-      return res.json({
-        ok: true,
-        search_id: String(searchId),
-        results_url: String(resultsUrl),
-        mode: "new",
-        request_id: rid,
-      });
-    } catch (errNew) {
-      const status = errNew?.response?.status;
-      const data = errNew?.response?.data;
-      const msg = errNew?.message || "unknown_error";
-
-      logErr("NEW endpoint failed:", {
-        status,
-        message: msg,
-        data_short:
-          typeof data === "string"
-            ? data.slice(0, 300)
-            : data
-            ? JSON.stringify(data).slice(0, 300)
-            : null,
-      });
-
-      // Hvis 404 fra TP: fallback til legacy /v1/flight_search
-      if (status !== 404) {
-        return res.status(502).json({
-          error: "Upstream start failed (new endpoint)",
-          upstream_status: status || null,
-          upstream_message: msg,
-          upstream_data: dbgOn ? data : null,
-          request_id: rid,
-        });
-      }
-    }
-
-    // --------------------------
-    // (B) FALLBACK: LEGACY endpoint
-    // --------------------------
-    // Travelpayouts FAQ beskriver legacy flow:
-    // POST http(s)://api.travelpayouts.com/v1/flight_search -> får search_id/uuid
-    //  [oai_citation:1‡support.travelpayouts.com](https://support.travelpayouts.com/hc/ru/articles/204529267-FAQ-%D0%BF%D0%BE-API-%D0%BE%D1%82-%D0%90%D0%B2%D0%B8%D0%B0%D1%81%D0%B5%D0%B9%D0%BB%D1%81)
-    const TP_START_URL_LEGACY = "https://api.travelpayouts.com/v1/flight_search";
-
-    // legacy payload bruker "host" + "segments" (ikke directions/search_params)
-    // og ofte "trip_class" på toppnivå.
-    const legacySegments = directions.map((d) => ({
-      origin: d.origin,
-      destination: d.destination,
-      date: d.date,
-    }));
-
-    // prøv å bruke IP (makeHeaders henter x-forwarded-for osv, men legacy kan også ha user_ip i body)
-    const userIp =
-      String(req.headers?.["x-forwarded-for"] || "").split(",")[0].trim() ||
-      String(req.headers?.["x-real-ip"] || "").trim() ||
-      String(req.ip || "").trim() ||
-      String(req.socket?.remoteAddress || "").trim();
-
-    const payloadLegacy = {
-      marker: tp.marker,
-      host: tp.realHost, // typisk "podtech.no"
-      user_ip: userIp || "127.0.0.1",
+      host: tp.realHost, // f.eks. "podtech.no"
+      user_ip: getUserIp(req) || "127.0.0.1",
       locale: body.locale || "no",
       trip_class: toUpper(body.trip_class || "Y"),
-      passengers: { adults: String(adults), children: String(children), infants: String(infants) },
-      segments: legacySegments,
+      passengers: {
+        // TP legacy tar ofte strings – vi sender string for å være safe
+        adults: String(adults),
+        children: String(children),
+        infants: String(infants),
+      },
+      segments: directions.map((d) => ({ origin: d.origin, destination: d.destination, date: d.date })),
+      // currency brukes ikke alltid i legacy, men du kan sende det hvis du vil
+      currency: toUpper(body.currency || "NOK"),
     };
 
-    const signatureLegacy = makeSignature(tp.token, payloadLegacy);
+    const signature = makeSignature(tp.token, payload);
 
-    log("Trying LEGACY start endpoint:", {
-      url: TP_START_URL_LEGACY,
-      payload_shape: {
-        marker: safe(payloadLegacy.marker, 3),
-        host: payloadLegacy.host,
-        locale: payloadLegacy.locale,
-        trip_class: payloadLegacy.trip_class,
-        segmentsCount: payloadLegacy.segments.length,
-        user_ip: payloadLegacy.user_ip,
+    log("Request:", {
+      url: TP_LEGACY_START_URL,
+      tokenPreview: safe(tp.token, 4),
+      markerPreview: safe(tp.marker, 3),
+      realHost: tp.realHost,
+      payloadShape: {
+        locale: payload.locale,
+        trip_class: payload.trip_class,
+        segmentsCount: payload.segments.length,
+        user_ip: payload.user_ip,
       },
-      signature_preview: safe(signatureLegacy, 6),
+      signaturePreview: safe(signature, 6),
     });
 
-    const legacyResp = await axios.post(
-      TP_START_URL_LEGACY,
-      { ...payloadLegacy, signature: signatureLegacy },
+    const r = await axios.post(
+      TP_LEGACY_START_URL,
+      { ...payload, signature },
       {
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
         timeout: 20000,
       }
     );
 
-    // legacy kan returnere search_id eller uuid
-    const legacySearchId =
-      legacyResp.data?.search_id ?? legacyResp.data?.uuid ?? legacyResp.data?.searchId ?? null;
+    // Legacy kan returnere uuid eller search_id
+    const uuid = r.data?.uuid ?? r.data?.search_id ?? r.data?.searchId ?? null;
 
-    log("LEGACY response:", {
-      status: legacyResp.status,
-      has_search_id: !!legacySearchId,
+    log("Response:", {
+      status: r.status,
+      hasUuid: !!uuid,
+      dataKeys: r.data && typeof r.data === "object" ? Object.keys(r.data) : null,
     });
 
-    if (!legacySearchId) {
+    if (!uuid) {
       return res.status(502).json({
-        error: "Ugyldig svar fra Travelpayouts (legacy) – mangler search_id/uuid",
-        details: dbgOn ? legacyResp.data : null,
+        error: "Ugyldig svar fra Travelpayouts (mangler uuid/search_id)",
+        details: dbg ? r.data : null,
         request_id: rid,
       });
     }
 
-    // legacy har ikke results_url – vi cache’r mode og uuid
-    flightSearchCache.set(String(legacySearchId), {
+    // cache – vi bruker uuid videre i /results
+    flightSearchCache.set(String(uuid), {
       mode: "legacy",
-      uuid: String(legacySearchId),
+      uuid: String(uuid),
       created_at: Date.now(),
     });
 
     return res.json({
       ok: true,
-      search_id: String(legacySearchId),
+      search_id: String(uuid),
       mode: "legacy",
       request_id: rid,
     });
   } catch (err) {
     const status = err?.response?.status || null;
     const data = err?.response?.data || null;
-
-    console.error("❌ /api/flights/start feilet:", status, err?.message || err);
-    if (dbgOn) {
-      console.error("[TP][start] Upstream data:", data);
-    }
+    logErr("FAILED:", { status, message: err?.message || err, dataShort: typeof data === "string" ? data.slice(0, 300) : data });
 
     return res.status(502).json({
-      error: "Upstream start failed",
+      error: "Upstream start failed (legacy)",
       upstream_status: status,
-      details: dbgOn ? data : null,
+      details: dbg ? data : null,
       request_id: rid,
     });
   }
 });
 
 /* ------------------------- RESULTS – /api/flights/results ------------------------- */
-
+/**
+ * Body:
+ * { "search_id":"<uuid>" }
+ *
+ * Returnerer "raw" fra TP så du kan se hva de faktisk gir deg.
+ * Appen din må deretter mappe dette til offers, eller du gjør mapping her.
+ */
 router.post("/flights/results", async (req, res) => {
+  const rid = getReqId(req);
+  const dbg = dbgEnabled();
+
+  const log = (...args) => dbg && console.log(`[TP][results][${rid}]`, ...args);
+  const logErr = (...args) => console.error(`[TP][results][${rid}]`, ...args);
+
   try {
     const tp = getTpConfig();
     const okCfg = assertTpConfigured(tp);
-    if (!okCfg.ok) return res.status(okCfg.status).json({ error: okCfg.error });
+    if (!okCfg.ok) return res.status(okCfg.status).json({ error: okCfg.error, request_id: rid });
 
-    const { search_id, last_update_timestamp = 0 } = req.body || {};
+    const { search_id } = req.body || {};
     const sid = String(search_id || "").trim();
-    const tsIn = Number(last_update_timestamp) || 0;
-
-    if (!sid) return res.status(400).json({ error: "Mangler search_id" });
+    if (!sid) return res.status(400).json({ error: "Mangler search_id", request_id: rid });
 
     const cached = flightSearchCache.get(sid);
-    if (!cached?.results_url) {
-      return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
+    if (!cached?.uuid) {
+      // appen din kaller /results rett etter /start, så om start feiler får du denne
+      return res.status(404).json({ error: "Ukjent search_id (start på nytt).", request_id: rid });
     }
 
-    const base = normalizeAbsoluteUrl(cached.results_url);
-    if (!base) {
-      return res.status(502).json({
-        error: "Cached results_url er ugyldig",
-        details: { cached_results_url: cached.results_url },
-      });
-    }
+    const url = `${TP_LEGACY_RESULTS_URL}?uuid=${encodeURIComponent(cached.uuid)}`;
 
-    const resultsUrl = new URL("/search/affiliate/results", base).toString();
-    const payload = { marker: tp.marker, search_id: sid, last_update_timestamp: tsIn };
-    const signature = makeSignature(tp.token, payload);
+    log("Request:", { url });
 
-    const r = await axios.post(
-      resultsUrl,
-      { ...payload, signature },
-      {
-        headers: makeHeaders(req, signature, tp),
-        timeout: 25000,
-        validateStatus: (status) => (status >= 200 && status < 300) || status === 304,
-      }
-    );
+    // Legacy results er GET
+    const r = await axios.get(url, {
+      headers: { Accept: "application/json" },
+      timeout: 20000,
+      validateStatus: (s) => s >= 200 && s < 300,
+    });
 
-    if (r.status === 304) {
-      return res.json({
-        ok: true,
-        is_over: false,
-        last_update_timestamp: tsIn,
-        offers: null, // app skal ikke overskrive eksisterende offers
-      });
-    }
+    log("Response:", {
+      status: r.status,
+      type: typeof r.data,
+      keys: r.data && typeof r.data === "object" ? Object.keys(r.data) : null,
+    });
 
-    const data = r.data || {};
-    const tickets = Array.isArray(data?.tickets) ? data.tickets : [];
-    const legsArr = Array.isArray(data?.flight_legs) ? data.flight_legs : [];
-
-    const tpRawTs =
-      typeof data.last_update_timestamp === "number"
-        ? data.last_update_timestamp
-        : typeof data.last_update_timestamp === "string"
-        ? Number(data.last_update_timestamp) || 0
-        : 0;
-
-    const tpTs = Math.max(tsIn, tpRawTs || 0);
-    const isOver = !!data.is_over;
-
-    // ---------------- build legsById + resolveLeg ----------------
-
-    const legsById = new Map();
-    for (const leg of legsArr) {
-      const id =
-        leg?.id ??
-        leg?._id ??
-        leg?.uuid ??
-        leg?.leg_id ??
-        leg?.flight_leg_id ??
-        leg?.flight_id ??
-        null;
-      if (id != null) legsById.set(String(id), leg);
-    }
-
-    // flights[] kan være indeks ELLER id
-    const resolveLeg = (ref) => {
-      if (ref == null) return null;
-      if (typeof ref === "object") return ref;
-
-      // 1) id-lookup
-      const byId = legsById.get(String(ref));
-      if (byId) return byId;
-
-      // 2) index-lookup
-      const idx = typeof ref === "number" ? ref : Number(ref);
-      if (Number.isInteger(idx) && idx >= 0 && idx < legsArr.length) return legsArr[idx];
-
-      return null;
-    };
-
-    // plukk felter fra et leg-objekt (flere varianter)
-    const legOrigin = (leg) =>
-      pick(leg, ["origin", "from", "origin_iata", "origin_code", "departure_airport", "airport_from"]);
-    const legDest = (leg) =>
-      pick(leg, ["destination", "to", "destination_iata", "destination_code", "arrival_airport", "airport_to"]);
-
-    const legDep = (leg) =>
-      pick(leg, [
-        "local_departure_date_time",
-        "departure_at",
-        "local_departure",
-        "departure_time",
-        "depart_at",
-        "departure_datetime",
-        "time_departure",
-      ]);
-
-    const legArr = (leg) =>
-      pick(leg, [
-        "local_arrival_date_time",
-        "arrival_at",
-        "local_arrival",
-        "arrival_time",
-        "arrive_at",
-        "arrival_datetime",
-        "time_arrival",
-      ]);
-
-    const legDurationMins = (leg) => {
-      const raw = pick(leg, ["duration", "duration_mins", "duration_minutes", "travel_time", "flight_time"]);
-      const n = Number(raw);
-      if (!Number.isFinite(n)) return null;
-      return n > 10000 ? Math.round(n / 60) : n; // sek -> min hvis det ser stort ut
-    };
-
-    const legAirline = (leg) => {
-      const direct = pick(leg, [
-        "airline",
-        "carrier",
-        "marketing_carrier",
-        "operating_carrier",
-        "airline_code",
-        "carrier_code",
-        "airline_iata",
-      ]);
-      if (direct && typeof direct === "string") return toUpper(direct);
-
-      const obj = leg?.airline || leg?.carrier || leg?.marketing_carrier || leg?.operating_carrier || null;
-      const code = pickObj(obj, ["iata", "iata_code", "code", "id", "carrier_code", "airline_code"]);
-      return toUpper(code || "");
-    };
-
-    const legFlightNo = (leg) => {
-      const direct = pick(leg, ["flight_number", "flight_no", "flightNumber", "flight_num", "number"]);
-      if (direct != null && direct !== "") return toUpper(String(direct));
-
-      const obj = leg?.flight || leg?.flight_number_obj || null;
-      const n = pickObj(obj, ["number", "flight_number", "flightNo", "no"]);
-      return n != null && n !== "" ? toUpper(String(n)) : "";
-    };
-
-    // ---------------- build offers PER proposal ----------------
-
-    const offers = [];
-    let counter = 0;
-
-    for (const t of tickets) {
-      const proposals = Array.isArray(t?.proposals) ? t.proposals : [];
-      const segs = Array.isArray(t?.segments) ? t.segments : [];
-      const seg0 = segs[0] || null;
-
-      const flightRefs = Array.isArray(seg0?.flights) ? seg0.flights : [];
-      const legs = flightRefs.map(resolveLeg).filter(Boolean);
-
-      const firstLeg = legs[0] || null;
-      const lastLeg = legs[legs.length - 1] || null;
-
-      const origin =
-        (firstLeg && legOrigin(firstLeg)) ||
-        pick(t, ["origin", "from", "origin_iata", "origin_code"]) ||
-        "";
-
-      const destination =
-        (lastLeg && legDest(lastLeg)) ||
-        pick(t, ["destination", "to", "destination_iata", "destination_code"]) ||
-        "";
-
-      const dep =
-        (firstLeg && legDep(firstLeg)) ||
-        pick(t, ["local_departure_date_time", "departure_at", "local_departure", "departure_time"]) ||
-        null;
-
-      const arr =
-        (lastLeg && legArr(lastLeg)) ||
-        pick(t, ["local_arrival_date_time", "arrival_at", "local_arrival", "arrival_time"]) ||
-        null;
-
-      const durationSum =
-        legs.length > 0
-          ? legs.reduce((acc, leg) => acc + (legDurationMins(leg) || 0), 0)
-          : (num(t?.duration) ?? num(t?.total_duration) ?? num(t?.travel_time) ?? null);
-
-      const depTime = fmtTimeHHMM(dep);
-      const arrTime = fmtTimeHHMM(arr);
-      const durationText = durationSum != null ? fmtDurationMins(durationSum) : "";
-      const routeText = origin && destination ? `${toUpper(origin)} → ${toUpper(destination)}` : "";
-
-      const stops =
-        legs.length > 0
-          ? Math.max(0, legs.length - 1)
-          : Array.isArray(seg0?.transfers)
-          ? seg0.transfers.length
-          : null;
-
-      const stopsText = stops == null ? "" : stops === 0 ? "Direkte" : `${stops} stopp`;
-
-      const airlinesText = legs.length ? uniq(legs.map(legAirline)).filter(Boolean).join(", ") : "";
-      const flightNosText = legs.length ? uniq(legs.map(legFlightNo)).filter(Boolean).join(", ") : "";
-
-      for (const p of proposals) {
-        const offer_id = `${sid}:${counter}`;
-        counter += 1;
-
-        const tp_proposal_id =
-          p?.id ?? p?.proposal_id ?? p?.uuid ?? p?.proposalId ?? p?.click_id ?? p?.clickId ?? null;
-
-        const price = pickPriceFromProposal(p);
-        const currency = pickCurrency(p, t, data);
-
-        offers.push({
-          offer_id,
-          tp_proposal_id: tp_proposal_id != null ? String(tp_proposal_id) : null,
-          price: typeof price === "number" ? price : null,
-          currency,
-          depTime,
-          arrTime,
-          durationText,
-          routeText,
-          stopsText,
-          airlinesText,
-          flightNosText,
-          agentText: "",
-          signature: t?.signature || null,
-        });
-      }
-    }
-
-    offers.sort((a, b) => (a.price ?? 1e18) - (b.price ?? 1e18));
-
-    // cache mapping offer_id -> tp_proposal_id (til click fallback)
-    const map = {};
-    for (const o of offers) if (o.offer_id && o.tp_proposal_id) map[o.offer_id] = o.tp_proposal_id;
-    flightSearchCache.set(sid, { ...cached, offer_to_tp_proposal: map });
-
+    // Return raw – du kan bygge offer-mapping etterpå når du ser formatet i din konto
     return res.json({
       ok: true,
-      is_over: isOver,
-      last_update_timestamp: tpTs,
-      offers,
+      mode: "legacy",
+      request_id: rid,
+      data: r.data,
     });
-  } catch (e) {
-    console.error("❌ /api/flights/results feilet:", e?.response?.data || e?.message || e);
+  } catch (err) {
+    const status = err?.response?.status || null;
+    const data = err?.response?.data || null;
+    logErr("FAILED:", {
+      status,
+      message: err?.message || err,
+      dataShort: typeof data === "string" ? data.slice(0, 300) : data,
+    });
+
     return res.status(502).json({
-      error: "Upstream results failed",
-      details: e?.response?.data || null,
+      error: "Upstream results failed (legacy)",
+      upstream_status: status,
+      details: dbg ? data : null,
+      request_id: rid,
     });
-  }
-});
-
-/* ------------------------- CLICK – /api/flights/click ------------------------- */
-/**
- * Viktig:
- * - Denne MÅ IKKE bruke makeHeaders(req, "", tp) hvis makeHeaders krever signature.
- * - Vi lager derfor en egen header-builder for click uten signature.
- * - Click-endepunktet kan returnere url i body, eller via Location header (redirect).
- */
-router.post("/flights/click", async (req, res) => {
-  try {
-    const tp = getTpConfig();
-    const okCfg = assertTpConfigured(tp);
-    if (!okCfg.ok) return res.status(okCfg.status).json({ error: okCfg.error });
-
-    const { search_id, offer_id, proposal_id, tp_proposal_id } = req.body || {};
-    const sid = String(search_id || "").trim();
-
-    const clientOfferId = String(offer_id || proposal_id || "").trim();
-    const clientTpProposalId = tp_proposal_id != null ? String(tp_proposal_id).trim() : "";
-
-    if (!sid) return res.status(400).json({ error: "Mangler search_id" });
-    if (!clientTpProposalId && !clientOfferId) {
-      return res.status(400).json({ error: "Mangler tp_proposal_id eller offer_id/proposal_id" });
-    }
-
-    const cached = flightSearchCache.get(sid);
-    if (!cached?.results_url) {
-      return res.status(404).json({ error: "Ukjent search_id (start på nytt)." });
-    }
-
-    const base = normalizeAbsoluteUrl(cached.results_url);
-    if (!base) {
-      return res.status(502).json({
-        error: "Cached results_url er ugyldig",
-        details: { cached_results_url: cached.results_url },
-      });
-    }
-
-    // Click trenger token+realhost+ip, men ikke signature
-    function makeClickHeaders() {
-      // makeHeaders kan feile hvis den forventer signature -> bygg "light" headers her
-      const headers = {
-        Accept: "application/json",
-        "x-affiliate-user-id": String(tp.token),
-        "x-real-host": String(tp.realHost),
-        // marker i header (TP ber om den i noen varianter)
-        "x-affiliate-marker": String(tp.marker),
-        "x-affiliate-mark": String(tp.marker),
-        "x-affiliate-marker-id": String(tp.marker),
-        "x-marker": String(tp.marker),
-        marker: String(tp.marker),
-      };
-
-      // prøv å hente ip fra makeHeaders uten signature hvis din makeHeaders er gjort valgfri,
-      // men ikke la det knekke click om den kaster
-      try {
-        const maybe = makeHeaders(req, null, tp);
-        if (maybe?.["x-user-ip"]) headers["x-user-ip"] = maybe["x-user-ip"];
-      } catch {
-        // ignorer
-      }
-
-      return headers;
-    }
-
-    async function doTpClick(tpProposalId, sourceLabel) {
-      const clickUrl = new URL(
-        `/searches/${encodeURIComponent(sid)}/clicks/${encodeURIComponent(String(tpProposalId))}`,
-        base
-      ).toString();
-
-      const cr = await axios.get(clickUrl, {
-        headers: makeClickHeaders(),
-        timeout: 25000,
-        validateStatus: (status) => status >= 200 && status < 400,
-        maxRedirects: 0, // vi vil fange Location selv
-      });
-
-      const url = normalizeClickUrl(cr?.data, cr?.headers);
-      if (!url) {
-        return {
-          ok: false,
-          status: 502,
-          error: "TP click manglet url (uventet respons)",
-          details: { status: cr.status, data: cr.data || null, headers: cr.headers || null },
-        };
-      }
-
-      return { ok: true, url, source: sourceLabel };
-    }
-
-    // 1) direkte tp_proposal_id (best)
-    if (clientTpProposalId) {
-      const r = await doTpClick(clientTpProposalId, "tp_click_direct");
-      if (!r.ok) return res.status(r.status || 502).json({ error: r.error, details: r.details || null });
-      return res.json({ ok: true, url: r.url, source: r.source });
-    }
-
-    // 2) offer_id -> cached mapping (krever at results har kjørt)
-    const cachedProposal = cached?.offer_to_tp_proposal?.[clientOfferId];
-    if (cachedProposal) {
-      const r = await doTpClick(cachedProposal, "tp_click_cached_map");
-      if (!r.ok) return res.status(r.status || 502).json({ error: r.error, details: r.details || null });
-      return res.json({ ok: true, url: r.url, source: r.source });
-    }
-
-    return res.status(404).json({
-      error: "Fant ikke cached mapping for offer_id – kjør /api/flights/results først (så click).",
-      details: { offer_id: clientOfferId || null },
-    });
-  } catch (e) {
-    console.error("❌ /api/flights/click feilet:", e?.response?.data || e?.message || e);
-    return res.status(502).json({ error: "Upstream click failed", details: e?.response?.data || null });
   }
 });
 
