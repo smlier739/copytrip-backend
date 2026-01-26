@@ -13,7 +13,7 @@ const TP_LEGACY_START_URL = "https://api.travelpayouts.com/v1/flight_search";
 const TP_LEGACY_RESULTS_URL = "https://api.travelpayouts.com/v1/flight_search_results";
 
 const START_TIMEOUT_MS = 20000;
-const RESULTS_TIMEOUT_MS = 45000;
+const RESULTS_TIMEOUT_MS = 65000;
 
 function dbgEnabled() {
   return String(process.env.TP_DEBUG || process.env.TRAVELPAYOUTS_DEBUG || "")
@@ -419,6 +419,13 @@ router.post("/flights/start", async (req, res) => {
       }
     );
 
+    console.log(`[TP][start][${rid}] response`, {
+      status: response.status,
+      keys: response.data && typeof response.data === "object" ? Object.keys(response.data) : null,
+      search_id: response.data?.search_id,
+      results_url: response.data?.results_url,
+    });
+      
     const uuid = r.data?.uuid ?? r.data?.search_id ?? r.data?.searchId ?? null;
 
     if (dbg) {
