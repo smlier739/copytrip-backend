@@ -9,22 +9,11 @@ import { flightSearchCache } from "../services/travelpayouts/flightsCache.js";
 
 const router = express.Router();
 
-// Legacy endpoints (dette er de som faktisk brukes i Travelpayouts realtime flight search)
 const TP_LEGACY_START_URL = "https://api.travelpayouts.com/v1/flight_search";
 const TP_LEGACY_RESULTS_URL = "https://api.travelpayouts.com/v1/flight_search_results";
 
-/* ------------------------- helpers ------------------------- */
-
-function toUpper(v) {
-  return String(v || "").toUpperCase().trim();
-}
-
-function safe(v, keep = 4) {
-  const s = String(v || "");
-  if (!s) return "";
-  if (s.length <= keep) return "***";
-  return `${s.slice(0, keep)}***`;
-}
+const START_TIMEOUT_MS = 20000;
+const RESULTS_TIMEOUT_MS = 45000; // ↑ viktig for Render / mobilnett
 
 function dbgEnabled() {
   return String(process.env.TP_DEBUG || process.env.TRAVELPAYOUTS_DEBUG || "")
@@ -40,6 +29,17 @@ function getReqId(req) {
   );
 }
 
+function toUpper(v) {
+  return String(v || "").toUpperCase().trim();
+}
+
+function safe(v, keep = 4) {
+  const s = String(v || "");
+  if (!s) return "";
+  if (s.length <= keep) return "***";
+  return `${s.slice(0, keep)}***`;
+}
+
 function getUserIp(req) {
   const xff = req.headers?.["x-forwarded-for"];
   if (xff) return String(xff).split(",")[0].trim();
@@ -49,21 +49,44 @@ function getUserIp(req) {
   return String(req.socket?.remoteAddress || "").trim();
 }
 
-/* ------------------------- START – /api/flights/start ------------------------- */
-/**
- * Body eksempel:
- * {
- *   "segments":[{"origin":"OSL","destination":"LHR","date":"2026-02-01"}],
- *   "passengers":{"adults":1,"children":0,"infants":0},
- *   "trip_class":"Y",
- *   "locale":"no",
- *   "currency":"NOK"
- * }
- */
+function shortenData(data, max = 500) {
+  if (data == null) return null;
+  if (typeof data === "string") return data.slice(0, max);
+  try {
+    const s = JSON.stringify(data);
+    return s.length > max ? s.slice(0, max) + "…" : s;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------
+// DEBUG endpoint (for å bekrefte deploy/version + env-status)
+// ---------------------------------------------------------
+router.get("/flights/debug", (req, res) => {
+  const tp = getTpConfig();
+  res.json({
+    ok: true,
+    version: "2026-01-26-legacy-first-v2",
+    debugOn: dbgEnabled(),
+    cfg: {
+      hasToken: !!tp?.token,
+      hasMarker: !!tp?.marker,
+      hasRealHost: !!tp?.realHost,
+      realHost: tp?.realHost || null,
+      tokenPreview: safe(tp?.token, 4),
+      markerPreview: safe(tp?.marker, 3),
+      userIp: getUserIp(req) || null,
+    },
+  });
+});
+
+// ---------------------------------------------------------
+// START – /api/flights/start
+// ---------------------------------------------------------
 router.post("/flights/start", async (req, res) => {
   const rid = getReqId(req);
   const dbg = dbgEnabled();
-
   const log = (...args) => dbg && console.log(`[TP][start][${rid}]`, ...args);
   const logErr = (...args) => console.error(`[TP][start][${rid}]`, ...args);
 
@@ -120,30 +143,31 @@ router.post("/flights/start", async (req, res) => {
       locale: body.locale || "no",
       trip_class: toUpper(body.trip_class || "Y"),
       passengers: {
-        // TP legacy tar ofte strings – vi sender string for å være safe
         adults: String(adults),
         children: String(children),
         infants: String(infants),
       },
-      segments: directions.map((d) => ({ origin: d.origin, destination: d.destination, date: d.date })),
-      // currency brukes ikke alltid i legacy, men du kan sende det hvis du vil
+      segments: directions.map((d) => ({
+        origin: d.origin,
+        destination: d.destination,
+        date: d.date,
+      })),
       currency: toUpper(body.currency || "NOK"),
     };
 
     const signature = makeSignature(tp.token, payload);
 
-    log("Request:", {
+    log("Request -> legacy start", {
       url: TP_LEGACY_START_URL,
+      realHost: tp.realHost,
       tokenPreview: safe(tp.token, 4),
       markerPreview: safe(tp.marker, 3),
-      realHost: tp.realHost,
-      payloadShape: {
-        locale: payload.locale,
-        trip_class: payload.trip_class,
-        segmentsCount: payload.segments.length,
-        user_ip: payload.user_ip,
-      },
       signaturePreview: safe(signature, 6),
+      segments: payload.segments,
+      passengers: payload.passengers,
+      locale: payload.locale,
+      trip_class: payload.trip_class,
+      user_ip: payload.user_ip,
     });
 
     const r = await axios.post(
@@ -151,17 +175,16 @@ router.post("/flights/start", async (req, res) => {
       { ...payload, signature },
       {
         headers: { "Content-Type": "application/json", Accept: "application/json" },
-        timeout: 20000,
+        timeout: START_TIMEOUT_MS,
       }
     );
 
-    // Legacy kan returnere uuid eller search_id
     const uuid = r.data?.uuid ?? r.data?.search_id ?? r.data?.searchId ?? null;
 
-    log("Response:", {
+    log("Response <- legacy start", {
       status: r.status,
       hasUuid: !!uuid,
-      dataKeys: r.data && typeof r.data === "object" ? Object.keys(r.data) : null,
+      dataShort: shortenData(r.data, 600),
     });
 
     if (!uuid) {
@@ -172,23 +195,30 @@ router.post("/flights/start", async (req, res) => {
       });
     }
 
-    // cache – vi bruker uuid videre i /results
+    // Cache: lagre siste "ok results" senere for timeout-fallback
     flightSearchCache.set(String(uuid), {
       mode: "legacy",
       uuid: String(uuid),
       created_at: Date.now(),
+      last_ok_results: null,
+      last_ok_at: null,
     });
 
     return res.json({
       ok: true,
-      search_id: String(uuid),
       mode: "legacy",
+      search_id: String(uuid),
       request_id: rid,
     });
   } catch (err) {
-    const status = err?.response?.status || null;
-    const data = err?.response?.data || null;
-    logErr("FAILED:", { status, message: err?.message || err, dataShort: typeof data === "string" ? data.slice(0, 300) : data });
+    const status = err?.response?.status ?? null;
+    const data = err?.response?.data ?? null;
+
+    logErr("FAILED", {
+      status,
+      message: err?.message || String(err),
+      dataShort: shortenData(data, 600),
+    });
 
     return res.status(502).json({
       error: "Upstream start failed (legacy)",
@@ -199,18 +229,12 @@ router.post("/flights/start", async (req, res) => {
   }
 });
 
-/* ------------------------- RESULTS – /api/flights/results ------------------------- */
-/**
- * Body:
- * { "search_id":"<uuid>" }
- *
- * Returnerer "raw" fra TP så du kan se hva de faktisk gir deg.
- * Appen din må deretter mappe dette til offers, eller du gjør mapping her.
- */
+// ---------------------------------------------------------
+// RESULTS – /api/flights/results
+// ---------------------------------------------------------
 router.post("/flights/results", async (req, res) => {
   const rid = getReqId(req);
   const dbg = dbgEnabled();
-
   const log = (...args) => dbg && console.log(`[TP][results][${rid}]`, ...args);
   const logErr = (...args) => console.error(`[TP][results][${rid}]`, ...args);
 
@@ -225,28 +249,33 @@ router.post("/flights/results", async (req, res) => {
 
     const cached = flightSearchCache.get(sid);
     if (!cached?.uuid) {
-      // appen din kaller /results rett etter /start, så om start feiler får du denne
       return res.status(404).json({ error: "Ukjent search_id (start på nytt).", request_id: rid });
     }
 
     const url = `${TP_LEGACY_RESULTS_URL}?uuid=${encodeURIComponent(cached.uuid)}`;
 
-    log("Request:", { url });
+    log("Request -> legacy results", { url, timeout: RESULTS_TIMEOUT_MS });
 
-    // Legacy results er GET
     const r = await axios.get(url, {
       headers: { Accept: "application/json" },
-      timeout: 20000,
+      timeout: RESULTS_TIMEOUT_MS,
       validateStatus: (s) => s >= 200 && s < 300,
     });
 
-    log("Response:", {
+    // Oppdater cache med siste OK
+    const nextCached = {
+      ...cached,
+      last_ok_results: r.data,
+      last_ok_at: Date.now(),
+    };
+    flightSearchCache.set(sid, nextCached);
+
+    log("Response <- legacy results", {
       status: r.status,
-      type: typeof r.data,
-      keys: r.data && typeof r.data === "object" ? Object.keys(r.data) : null,
+      bytesHint: shortenData(r.data, 50)?.length || null,
+      dataShort: shortenData(r.data, 800),
     });
 
-    // Return raw – du kan bygge offer-mapping etterpå når du ser formatet i din konto
     return res.json({
       ok: true,
       mode: "legacy",
@@ -254,12 +283,43 @@ router.post("/flights/results", async (req, res) => {
       data: r.data,
     });
   } catch (err) {
-    const status = err?.response?.status || null;
-    const data = err?.response?.data || null;
-    logErr("FAILED:", {
+    const status = err?.response?.status ?? null;
+    const data = err?.response?.data ?? null;
+
+    // Timeout: returner siste ok results hvis vi har det (mye bedre UX)
+    const isTimeout =
+      err?.code === "ECONNABORTED" || String(err?.message || "").toLowerCase().includes("timeout");
+
+    if (isTimeout) {
+      try {
+        const { search_id } = req.body || {};
+        const sid = String(search_id || "").trim();
+        const cached = sid ? flightSearchCache.get(sid) : null;
+
+        if (cached?.last_ok_results) {
+          logErr("TIMEOUT -> returning cached last_ok_results", {
+            sid,
+            last_ok_age_ms: Date.now() - (cached.last_ok_at || Date.now()),
+          });
+
+          return res.json({
+            ok: true,
+            mode: "legacy",
+            request_id: rid,
+            is_cached: true,
+            data: cached.last_ok_results,
+          });
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    logErr("FAILED", {
       status,
-      message: err?.message || err,
-      dataShort: typeof data === "string" ? data.slice(0, 300) : data,
+      message: err?.message || String(err),
+      dataShort: shortenData(data, 600),
+      code: err?.code || null,
     });
 
     return res.status(502).json({
