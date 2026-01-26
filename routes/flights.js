@@ -125,34 +125,54 @@ function normalizeClickUrl(respData, axiosHeaders) {
 
 /* ------------------------- START – /api/flights/start ------------------------- */
 
-router.post("/flights/start", async (req, res) => {
-  const DEBUG =
-    String(process.env.FLIGHTS_DEBUG || "").toLowerCase() === "1" ||
-    process.env.NODE_ENV !== "production";
+// i backend/routes/flights.js
 
-  // Liten helper: mask token i logger
-  const mask = (s) => {
-    const x = String(s || "");
-    if (!x) return "";
-    if (x.length <= 8) return "***";
-    return `${x.slice(0, 4)}…${x.slice(-4)}`;
+router.post("/flights/start", async (req, res) => {
+  // ---- local debug helpers (safe logging) ----
+  const rid =
+    req.headers["x-request-id"] ||
+    req.headers["x-correlation-id"] ||
+    `rid_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+
+  const dbgOn =
+    String(process.env.TP_DEBUG || process.env.TRAVELPAYOUTS_DEBUG || "")
+      .trim()
+      .toLowerCase() === "true";
+
+  const safe = (v, keep = 4) => {
+    const s = String(v || "");
+    if (!s) return "";
+    if (s.length <= keep) return "***";
+    return `${s.slice(0, keep)}***`;
+  };
+
+  const log = (...args) => {
+    if (!dbgOn) return;
+    console.log(`[TP][start][${rid}]`, ...args);
+  };
+
+  const logErr = (...args) => {
+    console.error(`[TP][start][${rid}]`, ...args);
   };
 
   try {
     const tp = getTpConfig();
     const okCfg = assertTpConfigured(tp);
     if (!okCfg.ok) {
-      if (DEBUG) {
-        console.error("🧪 TP CONFIG INVALID:", okCfg);
-        console.error("🧪 TP CONFIG SNAPSHOT:", {
-          token: mask(tp?.token),
-          marker: tp?.marker || null,
-          realHost: tp?.realHost || null,
-          lang: tp?.lang || null,
-        });
-      }
-      return res.status(okCfg.status).json({ error: okCfg.error, debug: DEBUG ? okCfg : undefined });
+      log("Config error:", okCfg);
+      return res.status(okCfg.status).json({ error: okCfg.error, request_id: rid });
     }
+
+    // Debug: viser hvilke env keys som faktisk er lastet (uten å lekke verdier)
+    log("TP config snapshot:", {
+      hasToken: !!tp?.token,
+      hasMarker: !!tp?.marker,
+      hasRealHost: !!tp?.realHost,
+      realHost: tp?.realHost || "",
+      tokenPreview: safe(tp?.token, 4),
+      markerPreview: safe(tp?.marker, 3),
+      nodeEnv: process.env.NODE_ENV || "",
+    });
 
     const body = req.body || {};
     const segments = Array.isArray(body.segments) ? body.segments : [];
@@ -168,12 +188,14 @@ router.post("/flights/start", async (req, res) => {
     if (!directions.length) {
       return res.status(400).json({
         error: "Minst ett segment kreves (origin, destination, date)",
+        request_id: rid,
       });
     }
 
     if (directions.some((d) => d.origin === d.destination)) {
       return res.status(400).json({
         error: "origin og destination kan ikke være like",
+        request_id: rid,
       });
     }
 
@@ -191,10 +213,13 @@ router.post("/flights/start", async (req, res) => {
       infants < 0 ||
       infants > adults
     ) {
-      return res.status(400).json({ error: "Ugyldig passasjer-oppsett" });
+      return res.status(400).json({ error: "Ugyldig passasjer-oppsett", request_id: rid });
     }
 
-    const payload = {
+    // --------------------------
+    // (A) Prøv "NY" endpoint først
+    // --------------------------
+    const payloadNew = {
       marker: tp.marker,
       locale: body.locale || "no",
       currency_code: body.currency || "NOK",
@@ -206,99 +231,207 @@ router.post("/flights/start", async (req, res) => {
       },
     };
 
-    // makeSignature(token, payload)
-    const signature = makeSignature(tp.token, payload);
+    const signatureNew = makeSignature(tp.token, payloadNew);
 
-    // Bygg headers én gang (og logg dem)
-    const headers = makeHeaders(req, signature, tp);
+    const headersNew = makeHeaders(req, signatureNew, tp);
 
-    if (DEBUG) {
-      console.log("🧪 /flights/start DEBUG");
-      console.log("🧪 TP:", {
-        token: mask(tp.token),
-        marker: tp.marker,
-        realHost: tp.realHost,
-        lang: tp.lang,
+    log("Trying NEW start endpoint:", {
+      url: TP_START_URL,
+      headers: {
+        ...headersNew,
+        "x-affiliate-user-id": safe(headersNew["x-affiliate-user-id"], 4),
+        "x-signature": safe(headersNew["x-signature"], 6),
+      },
+      payload_shape: {
+        marker: safe(payloadNew.marker, 3),
+        locale: payloadNew.locale,
+        currency_code: payloadNew.currency_code,
+        market_code: payloadNew.market_code,
+        directionsCount: payloadNew.search_params?.directions?.length || 0,
+      },
+    });
+
+    try {
+      const response = await axios.post(
+        TP_START_URL,
+        { ...payloadNew, signature: signatureNew },
+        {
+          headers: headersNew,
+          timeout: 20000,
+        }
+      );
+
+      const searchId = response.data?.search_id;
+      const resultsUrl = response.data?.results_url;
+
+      log("NEW endpoint response ok:", {
+        status: response.status,
+        has_search_id: !!searchId,
+        has_results_url: !!resultsUrl,
       });
-      console.log("🧪 TP_START_URL:", TP_START_URL);
-      console.log("🧪 SIGNATURE:", signature);
-      console.log("🧪 HEADERS:", {
-        ...headers,
-        // vis trygt hva vi sender
-        "x-affiliate-user-id": mask(headers["x-affiliate-user-id"]),
+
+      if (!searchId || !resultsUrl) {
+        return res.status(502).json({
+          error: "Ugyldig svar fra Travelpayouts (mangler search_id/results_url)",
+          details: dbgOn ? response.data : null,
+          request_id: rid,
+        });
+      }
+
+      const normalizedResultsUrl = normalizeAbsoluteUrl(resultsUrl);
+      if (!normalizedResultsUrl) {
+        return res.status(502).json({
+          error: "Ugyldig results_url fra Travelpayouts (ikke absolutt URL)",
+          details: dbgOn ? { resultsUrl } : null,
+          request_id: rid,
+        });
+      }
+
+      flightSearchCache.set(String(searchId), {
+        mode: "new",
+        results_url: normalizedResultsUrl,
+        created_at: Date.now(),
       });
-      console.log("🧪 PAYLOAD:", JSON.stringify(payload, null, 2));
+
+      return res.json({
+        ok: true,
+        search_id: String(searchId),
+        results_url: String(resultsUrl),
+        mode: "new",
+        request_id: rid,
+      });
+    } catch (errNew) {
+      const status = errNew?.response?.status;
+      const data = errNew?.response?.data;
+      const msg = errNew?.message || "unknown_error";
+
+      logErr("NEW endpoint failed:", {
+        status,
+        message: msg,
+        data_short:
+          typeof data === "string"
+            ? data.slice(0, 300)
+            : data
+            ? JSON.stringify(data).slice(0, 300)
+            : null,
+      });
+
+      // Hvis 404 fra TP: fallback til legacy /v1/flight_search
+      if (status !== 404) {
+        return res.status(502).json({
+          error: "Upstream start failed (new endpoint)",
+          upstream_status: status || null,
+          upstream_message: msg,
+          upstream_data: dbgOn ? data : null,
+          request_id: rid,
+        });
+      }
     }
 
-    const response = await axios.post(
-      TP_START_URL,
-      { ...payload, signature },
+    // --------------------------
+    // (B) FALLBACK: LEGACY endpoint
+    // --------------------------
+    // Travelpayouts FAQ beskriver legacy flow:
+    // POST http(s)://api.travelpayouts.com/v1/flight_search -> får search_id/uuid
+    //  [oai_citation:1‡support.travelpayouts.com](https://support.travelpayouts.com/hc/ru/articles/204529267-FAQ-%D0%BF%D0%BE-API-%D0%BE%D1%82-%D0%90%D0%B2%D0%B8%D0%B0%D1%81%D0%B5%D0%B9%D0%BB%D1%81)
+    const TP_START_URL_LEGACY = "https://api.travelpayouts.com/v1/flight_search";
+
+    // legacy payload bruker "host" + "segments" (ikke directions/search_params)
+    // og ofte "trip_class" på toppnivå.
+    const legacySegments = directions.map((d) => ({
+      origin: d.origin,
+      destination: d.destination,
+      date: d.date,
+    }));
+
+    // prøv å bruke IP (makeHeaders henter x-forwarded-for osv, men legacy kan også ha user_ip i body)
+    const userIp =
+      String(req.headers?.["x-forwarded-for"] || "").split(",")[0].trim() ||
+      String(req.headers?.["x-real-ip"] || "").trim() ||
+      String(req.ip || "").trim() ||
+      String(req.socket?.remoteAddress || "").trim();
+
+    const payloadLegacy = {
+      marker: tp.marker,
+      host: tp.realHost, // typisk "podtech.no"
+      user_ip: userIp || "127.0.0.1",
+      locale: body.locale || "no",
+      trip_class: toUpper(body.trip_class || "Y"),
+      passengers: { adults: String(adults), children: String(children), infants: String(infants) },
+      segments: legacySegments,
+    };
+
+    const signatureLegacy = makeSignature(tp.token, payloadLegacy);
+
+    log("Trying LEGACY start endpoint:", {
+      url: TP_START_URL_LEGACY,
+      payload_shape: {
+        marker: safe(payloadLegacy.marker, 3),
+        host: payloadLegacy.host,
+        locale: payloadLegacy.locale,
+        trip_class: payloadLegacy.trip_class,
+        segmentsCount: payloadLegacy.segments.length,
+        user_ip: payloadLegacy.user_ip,
+      },
+      signature_preview: safe(signatureLegacy, 6),
+    });
+
+    const legacyResp = await axios.post(
+      TP_START_URL_LEGACY,
+      { ...payloadLegacy, signature: signatureLegacy },
       {
-        headers,
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
         timeout: 20000,
-        // nyttig når TP svarer med 4xx og axios ellers kaster
-        validateStatus: (status) => status >= 200 && status < 300,
       }
     );
 
-    if (DEBUG) {
-      console.log("🧪 TP RESPONSE STATUS:", response.status);
-      console.log("🧪 TP RESPONSE DATA:", JSON.stringify(response.data || null, null, 2));
-    }
+    // legacy kan returnere search_id eller uuid
+    const legacySearchId =
+      legacyResp.data?.search_id ?? legacyResp.data?.uuid ?? legacyResp.data?.searchId ?? null;
 
-    const searchId = response.data?.search_id;
-    const resultsUrl = response.data?.results_url;
+    log("LEGACY response:", {
+      status: legacyResp.status,
+      has_search_id: !!legacySearchId,
+    });
 
-    if (!searchId || !resultsUrl) {
+    if (!legacySearchId) {
       return res.status(502).json({
-        error: "Ugyldig svar fra Travelpayouts (mangler search_id/results_url)",
-        details: response.data || null,
+        error: "Ugyldig svar fra Travelpayouts (legacy) – mangler search_id/uuid",
+        details: dbgOn ? legacyResp.data : null,
+        request_id: rid,
       });
     }
 
-    const normalizedResultsUrl = normalizeAbsoluteUrl(resultsUrl);
-    if (!normalizedResultsUrl) {
-      return res.status(502).json({
-        error: "Ugyldig results_url fra Travelpayouts (ikke absolutt URL)",
-        details: { resultsUrl },
-      });
-    }
-
-    flightSearchCache.set(String(searchId), {
-      results_url: normalizedResultsUrl,
+    // legacy har ikke results_url – vi cache’r mode og uuid
+    flightSearchCache.set(String(legacySearchId), {
+      mode: "legacy",
+      uuid: String(legacySearchId),
       created_at: Date.now(),
     });
 
     return res.json({
       ok: true,
-      search_id: String(searchId),
-      results_url: String(resultsUrl),
+      search_id: String(legacySearchId),
+      mode: "legacy",
+      request_id: rid,
     });
   } catch (err) {
-    const status = err?.response?.status;
-    const data = err?.response?.data;
-    const respHeaders = err?.response?.headers;
+    const status = err?.response?.status || null;
+    const data = err?.response?.data || null;
 
-    console.error("❌ /api/flights/start feilet");
-    console.error("STATUS:", status || "(no status)");
-    console.error("MESSAGE:", err?.message || err);
-    if (DEBUG) {
-      console.error("🧪 TP ERROR DATA:", JSON.stringify(data || null, null, 2));
-      console.error("🧪 TP ERROR HEADERS:", respHeaders || null);
-    } else {
-      console.error("TP ERROR DATA (short):", data || null);
+    console.error("❌ /api/flights/start feilet:", status, err?.message || err);
+    if (dbgOn) {
+      console.error("[TP][start] Upstream data:", data);
     }
 
     return res.status(502).json({
       error: "Upstream start failed",
-      tp_status: status || null,
-      tp_error: data || null,
-      // send kun debug tilbake om du ønsker det (kan fjernes)
-      debug: DEBUG
-        ? {
-            message: err?.message || null,
-          }
-        : undefined,
+      upstream_status: status,
+      details: dbgOn ? data : null,
+      request_id: rid,
     });
   }
 });
