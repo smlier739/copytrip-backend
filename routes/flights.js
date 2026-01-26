@@ -16,9 +16,11 @@ const START_TIMEOUT_MS = 20000;
 const RESULTS_TIMEOUT_MS = 65000;
 
 function dbgEnabled() {
-  return String(process.env.TP_DEBUG || process.env.TRAVELPAYOUTS_DEBUG || "")
-    .trim()
-    .toLowerCase() === "true";
+  return (
+    String(process.env.TP_DEBUG || process.env.TRAVELPAYOUTS_DEBUG || "")
+      .trim()
+      .toLowerCase() === "true"
+  );
 }
 
 function rid() {
@@ -107,7 +109,6 @@ function pickCurrency(p, t, data) {
   return toUpper(c || "NOK");
 }
 
-// Enkel “er ferdig?”-deteksjon på tvers av varianter
 function inferIsOver(data) {
   if (!data) return false;
   if (typeof data.is_over === "boolean") return data.is_over;
@@ -133,19 +134,23 @@ function inferLastTs(data, fallback = 0) {
 
 /**
  * Normaliser Travelpayouts legacy results -> appens offers-format.
- * Vi forsøker først “new-ish” structure (tickets + flight_legs).
- * Hvis schema er annerledes, returnerer vi offers: [] (men ok=true),
- * og logger raw i debug.
+ * Først prøver tickets + flight_legs. Hvis schema er annerledes:
+ * - returner offers: []
+ * - logg keys + sample i debug (for å kunne tilpasse parseren)
  */
 function buildOffersFromTpResults(data, searchId) {
   const tickets = Array.isArray(data?.tickets) ? data.tickets : [];
   const legsArr = Array.isArray(data?.flight_legs) ? data.flight_legs : [];
 
-  // hvis schema ikke matcher, gi tomt men “ok”
   if (!tickets.length || !legsArr.length) {
     return {
       offers: [],
-      meta: { schema: "unknown_or_empty", tickets: tickets.length, legs: legsArr.length },
+      meta: {
+        schema: "unknown_or_empty",
+        keys: data && typeof data === "object" ? Object.keys(data) : null,
+        tickets: tickets.length,
+        legs: legsArr.length,
+      },
     };
   }
 
@@ -320,7 +325,10 @@ function buildOffersFromTpResults(data, searchId) {
   }
 
   offers.sort((a, b) => (a.price ?? 1e18) - (b.price ?? 1e18));
-  return { offers, meta: { schema: "tickets+flight_legs", tickets: tickets.length, legs: legsArr.length } };
+  return {
+    offers,
+    meta: { schema: "tickets+flight_legs", tickets: tickets.length, legs: legsArr.length },
+  };
 }
 
 /* ---------------------------------------------------------
@@ -347,10 +355,16 @@ router.post("/flights/start", async (req, res) => {
       .filter((d) => d.origin && d.destination && d.date);
 
     if (!directions.length) {
-      return res.status(400).json({ error: "Minst ett segment kreves (origin, destination, date)", request_id: requestId });
+      return res.status(400).json({
+        error: "Minst ett segment kreves (origin, destination, date)",
+        request_id: requestId,
+      });
     }
     if (directions.some((d) => d.origin === d.destination)) {
-      return res.status(400).json({ error: "origin og destination kan ikke være like", request_id: requestId });
+      return res.status(400).json({
+        error: "origin og destination kan ikke være like",
+        request_id: requestId,
+      });
     }
 
     const passengers = body.passengers || {};
@@ -370,10 +384,16 @@ router.post("/flights/start", async (req, res) => {
       return res.status(400).json({ error: "Ugyldig passasjer-oppsett", request_id: requestId });
     }
 
+    const userIp = String(
+      req.headers["x-forwarded-for"] || req.headers["x-real-ip"] || req.ip || ""
+    )
+      .split(",")[0]
+      .trim();
+
     const payload = {
       marker: tp.marker,
-      host: tp.realHost, // "podtech.no"
-      user_ip: String(req.headers["x-forwarded-for"] || req.headers["x-real-ip"] || req.ip || "").split(",")[0].trim() || "127.0.0.1",
+      host: tp.realHost, // f.eks. "podtech.no"
+      user_ip: userIp || "127.0.0.1",
       locale: body.locale || "no",
       trip_class: toUpper(body.trip_class || "Y"),
       passengers: {
@@ -419,13 +439,14 @@ router.post("/flights/start", async (req, res) => {
       }
     );
 
-    console.log(`[TP][start][${rid}] response`, {
-      status: response.status,
-      keys: response.data && typeof response.data === "object" ? Object.keys(response.data) : null,
-      search_id: response.data?.search_id,
-      results_url: response.data?.results_url,
+    // ✅ FIX: riktig variabelnavn + riktig requestId
+    console.log(`[TP][start][${requestId}] response`, {
+      status: r.status,
+      keys: r.data && typeof r.data === "object" ? Object.keys(r.data) : null,
+      uuid: r.data?.uuid ?? null,
+      search_id: r.data?.search_id ?? null,
     });
-      
+
     const uuid = r.data?.uuid ?? r.data?.search_id ?? r.data?.searchId ?? null;
 
     if (dbg) {
@@ -449,6 +470,10 @@ router.post("/flights/start", async (req, res) => {
       created_at: Date.now(),
       last_ok_results: null,
       last_ok_at: null,
+      last_ok_offers: null,
+      last_ok_meta: null,
+      last_ok_ts: null,
+      last_ok_is_over: null,
     });
 
     return res.json({
@@ -464,6 +489,7 @@ router.post("/flights/start", async (req, res) => {
       status,
       message: err?.message || String(err),
       dataShort: typeof data === "string" ? data.slice(0, 400) : data ? "json" : null,
+      code: err?.code || null,
     });
 
     return res.status(502).json({
@@ -497,7 +523,6 @@ router.post("/flights/results", async (req, res) => {
     }
 
     const url = `${TP_LEGACY_RESULTS_URL}?uuid=${encodeURIComponent(cached.uuid)}`;
-
     if (dbg) console.log(`[TP][results][${requestId}] GET`, { url });
 
     const r = await axios.get(url, {
@@ -510,9 +535,17 @@ router.post("/flights/results", async (req, res) => {
     const isOver = inferIsOver(data);
     const lastTs = inferLastTs(data, 0);
 
+    // ✅ Debug schema når offers ender tomt
+    if (dbg) {
+      console.log(`[TP][results][${requestId}] keys`, data && typeof data === "object" ? Object.keys(data) : null);
+      console.log(
+        `[TP][results][${requestId}] sample`,
+        JSON.stringify(data, null, 2).slice(0, 2000)
+      );
+    }
+
     const { offers, meta } = buildOffersFromTpResults(data, sid);
 
-    // cache siste OK raw + offers (for timeout fallback)
     flightSearchCache.set(sid, {
       ...cached,
       last_ok_results: data,
@@ -533,7 +566,6 @@ router.post("/flights/results", async (req, res) => {
       });
     }
 
-    // ✅ Dette er formatet appen forventer
     return res.json({
       ok: true,
       is_over: isOver,
@@ -545,9 +577,10 @@ router.post("/flights/results", async (req, res) => {
   } catch (err) {
     const status = err?.response?.status ?? null;
     const data = err?.response?.data ?? null;
-    const isTimeout = err?.code === "ECONNABORTED" || String(err?.message || "").toLowerCase().includes("timeout");
+    const isTimeout =
+      err?.code === "ECONNABORTED" ||
+      String(err?.message || "").toLowerCase().includes("timeout");
 
-    // Timeout: returner siste OK offers hvis vi har
     if (isTimeout) {
       try {
         const sid = String(req.body?.search_id || "").trim();
