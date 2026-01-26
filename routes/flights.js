@@ -13,13 +13,14 @@ const TP_LEGACY_START_URL = "https://api.travelpayouts.com/v1/flight_search";
 const TP_LEGACY_RESULTS_URL = "https://api.travelpayouts.com/v1/flight_search_results";
 
 const START_TIMEOUT_MS = 20000;
-// Viktig: appen din har timeoutMs=30000 i fetch. Hold backend < 30s.
-const RESULTS_TIMEOUT_MS = 25000;
+const RESULTS_TIMEOUT_MS = 65000;
 
 function dbgEnabled() {
-  return String(process.env.TP_DEBUG || process.env.TRAVELPAYOUTS_DEBUG || "")
-    .trim()
-    .toLowerCase() === "true";
+  return (
+    String(process.env.TP_DEBUG || process.env.TRAVELPAYOUTS_DEBUG || "")
+      .trim()
+      .toLowerCase() === "true"
+  );
 }
 
 function rid() {
@@ -108,7 +109,6 @@ function pickCurrency(p, t, data) {
   return toUpper(c || "NOK");
 }
 
-// “er ferdig?”-deteksjon på tvers av varianter
 function inferIsOver(data) {
   if (!data) return false;
   if (typeof data.is_over === "boolean") return data.is_over;
@@ -133,17 +133,16 @@ function inferLastTs(data, fallback = 0) {
 }
 
 /**
- * Normaliser Travelpayouts legacy results -> appens offers-format.
- * Forventer “tickets + flight_legs”. Hvis ikke: returner tomt men OK.
+ * Variant A: tickets + flight_legs (din opprinnelige)
  */
-function buildOffersFromTpResults(data, searchId) {
+function buildOffersFromTicketsAndLegs(data, searchId) {
   const tickets = Array.isArray(data?.tickets) ? data.tickets : [];
   const legsArr = Array.isArray(data?.flight_legs) ? data.flight_legs : [];
 
   if (!tickets.length || !legsArr.length) {
     return {
       offers: [],
-      meta: { schema: "unknown_or_empty", tickets: tickets.length, legs: legsArr.length },
+      meta: { schema: "tickets+flight_legs(empty)", tickets: tickets.length, legs: legsArr.length },
     };
   }
 
@@ -285,14 +284,11 @@ function buildOffersFromTpResults(data, searchId) {
         : null;
 
     const stopsText = stops == null ? "" : stops === 0 ? "Direkte" : `${stops} stopp`;
-
     const airlinesText = legs.length ? uniq(legs.map(legAirline)).filter(Boolean).join(", ") : "";
     const flightNosText = legs.length ? uniq(legs.map(legFlightNo)).filter(Boolean).join(", ") : "";
 
     for (const p of proposals) {
-      const offer_id = `${String(searchId)}:${counter}`;
-      counter += 1;
-
+      const offer_id = `${String(searchId)}:${counter++}`;
       const tp_proposal_id =
         p?.id ?? p?.proposal_id ?? p?.uuid ?? p?.proposalId ?? p?.click_id ?? p?.clickId ?? null;
 
@@ -312,13 +308,65 @@ function buildOffersFromTpResults(data, searchId) {
         airlinesText,
         flightNosText,
         agentText: "",
-        signature: t?.signature || null,
       });
     }
   }
 
   offers.sort((a, b) => (a.price ?? 1e18) - (b.price ?? 1e18));
   return { offers, meta: { schema: "tickets+flight_legs", tickets: tickets.length, legs: legsArr.length } };
+}
+
+/**
+ * Variant B: proposals på toppnivå (vanlig i noen TP-responser)
+ * Vi lager en enkel offer-liste uten rute-detaljer dersom vi ikke finner legs/tickets.
+ */
+function buildOffersFromTopLevelProposals(data, searchId) {
+  const props = Array.isArray(data?.proposals) ? data.proposals : [];
+  if (!props.length) {
+    return { offers: [], meta: { schema: "top_level_proposals(empty)", proposals: 0 } };
+  }
+
+  const offers = props
+    .map((p, idx) => {
+      const offer_id = `${String(searchId)}:p${idx}`;
+      const tp_proposal_id = p?.id ?? p?.proposal_id ?? p?.uuid ?? null;
+      const price = pickPriceFromProposal(p);
+      const currency = pickCurrency(p, null, data);
+
+      return {
+        offer_id,
+        tp_proposal_id: tp_proposal_id != null ? String(tp_proposal_id) : null,
+        price: typeof price === "number" ? price : null,
+        currency,
+        depTime: "",
+        arrTime: "",
+        durationText: "",
+        routeText: "",
+        stopsText: "",
+        airlinesText: "",
+        flightNosText: "",
+        agentText: String(p?.gate?.label || p?.gate || p?.agent || "") || "",
+      };
+    })
+    .filter((o) => o.tp_proposal_id || o.price != null);
+
+  offers.sort((a, b) => (a.price ?? 1e18) - (b.price ?? 1e18));
+  return { offers, meta: { schema: "top_level_proposals", proposals: props.length } };
+}
+
+/**
+ * Forsøk å “unwrappe” response dersom TP pakker den inn.
+ */
+function unwrapTpData(raw) {
+  if (!raw) return raw;
+
+  // noen ganger kommer array
+  if (Array.isArray(raw) && raw.length === 1 && typeof raw[0] === "object") return raw[0];
+
+  // noen ganger wrapper de i { data: {...} }
+  if (raw?.data && typeof raw.data === "object") return raw.data;
+
+  return raw;
 }
 
 /* ---------------------------------------------------------
@@ -331,9 +379,7 @@ router.post("/flights/start", async (req, res) => {
   try {
     const tp = getTpConfig();
     const okCfg = assertTpConfigured(tp);
-    if (!okCfg.ok) {
-      return res.status(okCfg.status).json({ error: okCfg.error, request_id: requestId });
-    }
+    if (!okCfg.ok) return res.status(okCfg.status).json({ error: okCfg.error, request_id: requestId });
 
     const body = req.body || {};
     const segments = Array.isArray(body.segments) ? body.segments : [];
@@ -347,16 +393,10 @@ router.post("/flights/start", async (req, res) => {
       .filter((d) => d.origin && d.destination && d.date);
 
     if (!directions.length) {
-      return res.status(400).json({
-        error: "Minst ett segment kreves (origin, destination, date)",
-        request_id: requestId,
-      });
+      return res.status(400).json({ error: "Minst ett segment kreves (origin, destination, date)", request_id: requestId });
     }
     if (directions.some((d) => d.origin === d.destination)) {
-      return res.status(400).json({
-        error: "origin og destination kan ikke være like",
-        request_id: requestId,
-      });
+      return res.status(400).json({ error: "origin og destination kan ikke være like", request_id: requestId });
     }
 
     const passengers = body.passengers || {};
@@ -376,15 +416,13 @@ router.post("/flights/start", async (req, res) => {
       return res.status(400).json({ error: "Ugyldig passasjer-oppsett", request_id: requestId });
     }
 
-    const userIp =
-      String(req.headers["x-forwarded-for"] || req.headers["x-real-ip"] || req.ip || "")
-        .split(",")[0]
-        .trim() || "127.0.0.1";
-
     const payload = {
       marker: tp.marker,
       host: tp.realHost, // f.eks. "podtech.no"
-      user_ip: userIp,
+      user_ip:
+        String(req.headers["x-forwarded-for"] || req.headers["x-real-ip"] || req.ip || "")
+          .split(",")[0]
+          .trim() || "127.0.0.1",
       locale: body.locale || "no",
       trip_class: toUpper(body.trip_class || "Y"),
       passengers: {
@@ -421,17 +459,13 @@ router.post("/flights/start", async (req, res) => {
       });
     }
 
-    const r = await axios.post(
-      TP_LEGACY_START_URL,
-      { ...payload, signature },
-      {
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        timeout: START_TIMEOUT_MS,
-        validateStatus: (s) => s >= 200 && s < 300,
-      }
-    );
+    const r = await axios.post(TP_LEGACY_START_URL, { ...payload, signature }, {
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      timeout: START_TIMEOUT_MS,
+      validateStatus: (s) => s >= 200 && s < 300,
+    });
 
-    // ✅ FIX: bruk r, ikke "response"
+    // FIX: riktig variabelnavn (ikke "response")
     if (dbg) {
       console.log(`[TP][start][${requestId}] response`, {
         status: r.status,
@@ -451,6 +485,7 @@ router.post("/flights/start", async (req, res) => {
       });
     }
 
+    // Cache for results
     flightSearchCache.set(String(uuid), {
       mode: "legacy",
       uuid: String(uuid),
@@ -476,7 +511,6 @@ router.post("/flights/start", async (req, res) => {
       status,
       message: err?.message || String(err),
       dataShort: typeof data === "string" ? data.slice(0, 400) : data ? "json" : null,
-      code: err?.code || null,
     });
 
     return res.status(502).json({
@@ -498,21 +532,18 @@ router.post("/flights/results", async (req, res) => {
   try {
     const tp = getTpConfig();
     const okCfg = assertTpConfigured(tp);
-    if (!okCfg.ok) {
-      return res.status(okCfg.status).json({ error: okCfg.error, request_id: requestId });
-    }
+    if (!okCfg.ok) return res.status(okCfg.status).json({ error: okCfg.error, request_id: requestId });
 
     const { search_id } = req.body || {};
     const sid = String(search_id || "").trim();
     if (!sid) return res.status(400).json({ error: "Mangler search_id", request_id: requestId });
 
+    // cache lookup (men fall back til sid som uuid hvis cache mangler)
     const cached = flightSearchCache.get(sid);
-    if (!cached?.uuid) {
-      return res.status(404).json({ error: "Ukjent search_id (start på nytt).", request_id: requestId });
-    }
+    const uuid = cached?.uuid ? String(cached.uuid) : sid;
 
-    const url = `${TP_LEGACY_RESULTS_URL}?uuid=${encodeURIComponent(cached.uuid)}`;
-    if (dbg) console.log(`[TP][results][${requestId}] GET`, { url });
+    const url = `${TP_LEGACY_RESULTS_URL}?uuid=${encodeURIComponent(uuid)}`;
+    if (dbg) console.log(`[TP][results][${requestId}] GET`, { url, cacheHit: !!cached?.uuid });
 
     const r = await axios.get(url, {
       headers: { Accept: "application/json" },
@@ -520,45 +551,67 @@ router.post("/flights/results", async (req, res) => {
       validateStatus: (s) => s >= 200 && s < 300,
     });
 
-    const data = r.data || {};
+    const raw = r.data;
+    const data = unwrapTpData(raw) || {};
+
     const isOver = inferIsOver(data);
     const lastTs = inferLastTs(data, 0);
 
-    const { offers, meta } = buildOffersFromTpResults(data, sid);
+    // 1) prøv tickets+legs
+    let offersPack = buildOffersFromTicketsAndLegs(data, sid);
 
-    flightSearchCache.set(sid, {
-      ...cached,
+    // 2) fallback: top-level proposals
+    if (!offersPack.offers.length) {
+      const alt = buildOffersFromTopLevelProposals(data, sid);
+      if (alt.offers.length) offersPack = alt;
+    }
+
+    // Debug: log schema når vi fortsatt er tomme
+    if (dbg && offersPack.offers.length === 0) {
+      console.log(`[TP][results][${requestId}] EMPTY offers — schema inspect`, {
+        topKeys: typeof data === "object" ? Object.keys(data) : typeof data,
+        hasTickets: Array.isArray(data?.tickets) ? data.tickets.length : 0,
+        hasLegs: Array.isArray(data?.flight_legs) ? data.flight_legs.length : 0,
+        hasProposals: Array.isArray(data?.proposals) ? data.proposals.length : 0,
+        meta: offersPack.meta,
+        sample: JSON.stringify(
+          {
+            tickets0: Array.isArray(data?.tickets) ? data.tickets[0] : null,
+            proposals0: Array.isArray(data?.proposals) ? data.proposals[0] : null,
+          },
+          null,
+          2
+        ).slice(0, 1200),
+      });
+    }
+
+    // cache siste OK
+    flightSearchCache.set(String(sid), {
+      mode: "legacy",
+      uuid: String(uuid),
+      created_at: cached?.created_at || Date.now(),
       last_ok_results: data,
       last_ok_at: Date.now(),
-      last_ok_offers: offers,
-      last_ok_meta: meta,
+      last_ok_offers: offersPack.offers,
+      last_ok_meta: offersPack.meta,
       last_ok_ts: lastTs,
       last_ok_is_over: isOver,
     });
-
-    if (dbg) {
-      console.log(`[TP][results][${requestId}] upstream`, {
-        status: r.status,
-        isOver,
-        lastTs,
-        offers: offers.length,
-        meta,
-      });
-    }
 
     return res.json({
       ok: true,
       is_over: isOver,
       last_update_timestamp: lastTs,
-      offers,
+      offers: offersPack.offers,
       request_id: requestId,
-      meta: dbg ? meta : undefined,
+      meta: dbg ? offersPack.meta : undefined,
     });
   } catch (err) {
     const status = err?.response?.status ?? null;
     const data = err?.response?.data ?? null;
     const isTimeout =
-      err?.code === "ECONNABORTED" || String(err?.message || "").toLowerCase().includes("timeout");
+      err?.code === "ECONNABORTED" ||
+      String(err?.message || "").toLowerCase().includes("timeout");
 
     if (isTimeout) {
       try {
