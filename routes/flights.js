@@ -126,10 +126,33 @@ function normalizeClickUrl(respData, axiosHeaders) {
 /* ------------------------- START – /api/flights/start ------------------------- */
 
 router.post("/flights/start", async (req, res) => {
+  const DEBUG =
+    String(process.env.FLIGHTS_DEBUG || "").toLowerCase() === "1" ||
+    process.env.NODE_ENV !== "production";
+
+  // Liten helper: mask token i logger
+  const mask = (s) => {
+    const x = String(s || "");
+    if (!x) return "";
+    if (x.length <= 8) return "***";
+    return `${x.slice(0, 4)}…${x.slice(-4)}`;
+  };
+
   try {
     const tp = getTpConfig();
     const okCfg = assertTpConfigured(tp);
-    if (!okCfg.ok) return res.status(okCfg.status).json({ error: okCfg.error });
+    if (!okCfg.ok) {
+      if (DEBUG) {
+        console.error("🧪 TP CONFIG INVALID:", okCfg);
+        console.error("🧪 TP CONFIG SNAPSHOT:", {
+          token: mask(tp?.token),
+          marker: tp?.marker || null,
+          realHost: tp?.realHost || null,
+          lang: tp?.lang || null,
+        });
+      }
+      return res.status(okCfg.status).json({ error: okCfg.error, debug: DEBUG ? okCfg : undefined });
+    }
 
     const body = req.body || {};
     const segments = Array.isArray(body.segments) ? body.segments : [];
@@ -186,14 +209,42 @@ router.post("/flights/start", async (req, res) => {
     // makeSignature(token, payload)
     const signature = makeSignature(tp.token, payload);
 
+    // Bygg headers én gang (og logg dem)
+    const headers = makeHeaders(req, signature, tp);
+
+    if (DEBUG) {
+      console.log("🧪 /flights/start DEBUG");
+      console.log("🧪 TP:", {
+        token: mask(tp.token),
+        marker: tp.marker,
+        realHost: tp.realHost,
+        lang: tp.lang,
+      });
+      console.log("🧪 TP_START_URL:", TP_START_URL);
+      console.log("🧪 SIGNATURE:", signature);
+      console.log("🧪 HEADERS:", {
+        ...headers,
+        // vis trygt hva vi sender
+        "x-affiliate-user-id": mask(headers["x-affiliate-user-id"]),
+      });
+      console.log("🧪 PAYLOAD:", JSON.stringify(payload, null, 2));
+    }
+
     const response = await axios.post(
       TP_START_URL,
       { ...payload, signature },
       {
-        headers: makeHeaders(req, signature, tp),
+        headers,
         timeout: 20000,
+        // nyttig når TP svarer med 4xx og axios ellers kaster
+        validateStatus: (status) => status >= 200 && status < 300,
       }
     );
+
+    if (DEBUG) {
+      console.log("🧪 TP RESPONSE STATUS:", response.status);
+      console.log("🧪 TP RESPONSE DATA:", JSON.stringify(response.data || null, null, 2));
+    }
 
     const searchId = response.data?.search_id;
     const resultsUrl = response.data?.results_url;
@@ -224,10 +275,30 @@ router.post("/flights/start", async (req, res) => {
       results_url: String(resultsUrl),
     });
   } catch (err) {
-    console.error("❌ /api/flights/start feilet:", err?.response?.data || err?.message || err);
+    const status = err?.response?.status;
+    const data = err?.response?.data;
+    const respHeaders = err?.response?.headers;
+
+    console.error("❌ /api/flights/start feilet");
+    console.error("STATUS:", status || "(no status)");
+    console.error("MESSAGE:", err?.message || err);
+    if (DEBUG) {
+      console.error("🧪 TP ERROR DATA:", JSON.stringify(data || null, null, 2));
+      console.error("🧪 TP ERROR HEADERS:", respHeaders || null);
+    } else {
+      console.error("TP ERROR DATA (short):", data || null);
+    }
+
     return res.status(502).json({
       error: "Upstream start failed",
-      details: err?.response?.data || null,
+      tp_status: status || null,
+      tp_error: data || null,
+      // send kun debug tilbake om du ønsker det (kan fjernes)
+      debug: DEBUG
+        ? {
+            message: err?.message || null,
+          }
+        : undefined,
     });
   }
 });
