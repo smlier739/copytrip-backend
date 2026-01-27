@@ -156,6 +156,59 @@ function pickCurrency(p, t, data) {
   return toUpper(c || "NOK");
 }
 
+function parseDurationToMinutes(raw) {
+  if (raw == null || raw === "") return null;
+
+  // number: minutes or seconds
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    // Heuristikk: veldig store tall er ofte sekunder
+    return raw > 10000 ? Math.round(raw / 60) : Math.round(raw);
+  }
+
+  const s = String(raw).trim();
+  if (!s) return null;
+
+  // "HH:MM" eller "H:MM"
+  const hm = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (hm) {
+    const h = Number(hm[1]);
+    const m = Number(hm[2]);
+    if (Number.isFinite(h) && Number.isFinite(m)) return h * 60 + m;
+  }
+
+  // ISO-8601 "PT4H50M", "PT55M", "PT1H"
+  const iso = s.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/i);
+  if (iso) {
+    const h = Number(iso[1] || 0);
+    const m = Number(iso[2] || 0);
+    const sec = Number(iso[3] || 0);
+    if ([h, m, sec].every(Number.isFinite)) return h * 60 + m + Math.round(sec / 60);
+  }
+
+  // plain number in string
+  const n = Number(s.replace(",", "."));
+  if (Number.isFinite(n)) {
+    return n > 10000 ? Math.round(n / 60) : Math.round(n);
+  }
+
+  return null;
+}
+
+function minutesBetween(dep, arr) {
+  if (!dep || !arr) return null;
+  const t1 = Date.parse(dep);
+  const t2 = Date.parse(arr);
+  if (!Number.isFinite(t1) || !Number.isFinite(t2)) return null;
+
+  let diffMin = Math.round((t2 - t1) / 60000);
+
+  // Hvis ankomst “dagen etter” men uten dato/zone som parse’t rart:
+  // tillat wrap innen 24t
+  if (diffMin < 0 && diffMin > -24 * 60) diffMin += 24 * 60;
+
+  return diffMin >= 0 ? diffMin : null;
+}
+
 /**
  * Normaliser tickets-api affiliate results -> appens offers-format.
  * Forventer data.tickets[] + data.flight_legs[] (som før).
@@ -232,12 +285,37 @@ function buildOffersFromTpResults(data, searchId) {
     ]);
 
   const legDurationMins = (leg) => {
-    const raw = pick(leg, ["duration", "duration_mins", "duration_minutes", "travel_time", "flight_time"]);
-    const n = Number(raw);
-    if (!Number.isFinite(n)) return null;
-    return n > 10000 ? Math.round(n / 60) : n;
-  };
+    const raw = pick(leg, [
+      "duration",
+      "duration_mins",
+      "duration_minutes",
+      "travel_time",
+      "flight_time",
+      "duration_min",
+      "duration_sec",
+      "duration_seconds",
+    ]);
 
+    // Prøv parse av flere formater
+    let mins = parseDurationToMinutes(raw);
+
+    // Noen API’er har eksplisitt sekunderfelt
+    if (mins == null) {
+      const sec = pick(leg, ["duration_sec", "duration_seconds"]);
+      const m2 = parseDurationToMinutes(sec);
+      if (m2 != null) mins = m2;
+    }
+
+    // Fallback: regn ut fra avgang/ankomst på leg
+    if (mins == null) {
+      const d = legDep(leg);
+      const a = legArr(leg);
+      mins = minutesBetween(d, a);
+    }
+
+    return mins;
+  };
+    
   const legAirline = (leg) => {
     const direct = pick(leg, [
       "airline",
@@ -298,11 +376,22 @@ function buildOffersFromTpResults(data, searchId) {
       pick(t, ["local_arrival_date_time", "arrival_at", "local_arrival", "arrival_time"]) ||
       null;
 
-    const durationSum =
+    let durationSum =
       legs.length > 0
         ? legs.reduce((acc, leg) => acc + (legDurationMins(leg) || 0), 0)
-        : (num(t?.duration) ?? num(t?.total_duration) ?? num(t?.travel_time) ?? null);
+        : (parseDurationToMinutes(t?.duration) ??
+          parseDurationToMinutes(t?.total_duration) ??
+          parseDurationToMinutes(t?.travel_time) ??
+          null);
 
+    // Hvis vi fortsatt ikke har varighet: regn ut fra første dep til siste arr
+    if (durationSum == null || durationSum === 0) {
+      const d0 = dep; // dep du allerede har plukket ut
+      const a0 = arr; // arr du allerede har plukket ut
+      const m = minutesBetween(d0, a0);
+      if (m != null) durationSum = m;
+    }
+      
     const depTime = fmtTimeHHMM(dep);
     const arrTime = fmtTimeHHMM(arr);
     const durationText = durationSum != null ? fmtDurationMins(durationSum) : "";
