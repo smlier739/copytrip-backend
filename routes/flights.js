@@ -433,8 +433,6 @@ function buildOffersFromTpResults(data, searchId) {
         parseDurationToMinutes(t?.travel_time) ??
         null;
     }
-
-    const durationText = durationSum != null ? fmtDurationMins(durationSum) : "";
       
     // Hvis vi fortsatt ikke har varighet: regn ut fra første dep til siste arr
     if (durationSum == null || durationSum === 0) {
