@@ -1,4 +1,4 @@
-// backend/routes/hotels.js (ESM)
+// routes/hotels.js (ESM)
 
 import express from "express";
 import axios from "axios";
@@ -19,9 +19,35 @@ const HOTEL_CREATE_URL =
 const HOTEL_RESULT_URL =
   "https://api.travelpayouts.com/hotellook_search/v1/result";
 
+// Travelpayouts Places Autocomplete (for IATA lookup)
+const TP_PLACES_URL = "https://autocomplete.travelpayouts.com/places2";
+
 // --------------------------------------------------
 // helpers
 // --------------------------------------------------
+
+async function resolveIataFromPlaceName(placeName, locale = "no") {
+  const term = String(placeName || "").trim();
+  if (!term) return null;
+
+  const r = await axios.get("https://autocomplete.travelpayouts.com/places2", {
+    params: {
+      term,
+      locale,
+      "types[]": ["city", "airport"],
+    },
+    timeout: 10000,
+  });
+
+  const arr = Array.isArray(r.data) ? r.data : [];
+
+  // Prefer airport iata hvis finnes, ellers city code
+  const first = arr[0];
+  if (!first) return null;
+
+  const code = first.code || first.iata || first.airport_iata || null;
+  return code ? String(code).trim().toUpperCase() : null;
+}
 
 function toQuery(obj) {
   const p = new URLSearchParams();
@@ -62,8 +88,53 @@ function pickSearchId(data) {
   );
 }
 
+function toUpper(v) {
+  return String(v || "").trim().toUpperCase();
+}
+
+// Prefer city over airport; return best guess
+function pickBestPlace(places = []) {
+  const arr = Array.isArray(places) ? places : [];
+  if (!arr.length) return null;
+
+  // Typical fields: { code, type, name, city_name, country_name }
+  const city = arr.find((p) => String(p?.type || "").toLowerCase() === "city");
+  if (city?.code) return city;
+
+  const airport = arr.find((p) => String(p?.type || "").toLowerCase() === "airport");
+  if (airport?.code) return airport;
+
+  const any = arr.find((p) => p?.code);
+  return any || null;
+}
+
+// Resolve missing iata from a human place name like "Sal"
+async function resolveIataFromPlaceName(placeName, locale = "no") {
+  const term = String(placeName || "").trim();
+  if (!term) return { iata: "", picked: null, raw: null };
+
+  const r = await axios.get(TP_PLACES_URL, {
+    params: {
+      term,
+      locale,
+      "types[]": ["city", "airport"],
+    },
+    timeout: 12000,
+  });
+
+  const raw = Array.isArray(r.data) ? r.data : [];
+  const picked = pickBestPlace(raw);
+
+  const iata = picked?.code ? toUpper(picked.code) : "";
+  return { iata, picked, raw };
+}
+
 // --------------------------------------------------
 // POST /api/hotels/start
+// Body supports:
+//   - iata (preferred)
+//   - OR placeName / destinationName / query  (fallback -> autocomplete -> iata)
+//   - checkIn, checkOut (required)
 // --------------------------------------------------
 router.post("/hotels/start", authMiddleware, async (req, res) => {
   try {
@@ -73,12 +144,59 @@ router.post("/hotels/start", authMiddleware, async (req, res) => {
 
     const body = req.body || {};
 
-    const iata = String(body.iata || "").trim().toUpperCase();
-    const checkIn = String(body.checkIn || "").trim();   // YYYY-MM-DD
+    let iata = String(body.iata || "").trim().toUpperCase();
+    const placeName = String(body.placeName || "").trim();
+
+    if (!iata && placeName) {
+      // prøv å resolve fra placeName
+      const resolved = await resolveIataFromPlaceName(placeName, (body.lang || "no_NO").startsWith("no") ? "no" : "en");
+        if (resolved) iata = resolved;
+    }
+    
+    const checkIn = String(body.checkIn || "").trim(); // YYYY-MM-DD
     const checkOut = String(body.checkOut || "").trim(); // YYYY-MM-DD
 
+    if (!checkIn || !checkOut) {
+      return res.status(400).json({ error: "Mangler checkIn/checkOut" });
+    }
+
+    // 🔁 Fallback: resolve iata from place name if missing
+    let resolvedFrom = null;
+    if (!iata) {
+      const placeName =
+        body.placeName ||
+        body.destinationName ||
+        body.query ||
+        body.city ||
+        body.destination ||
+        "";
+
+      if (placeName) {
+        const { iata: resolvedIata, picked } = await resolveIataFromPlaceName(
+          placeName,
+          (body.lang || "no_NO").startsWith("no") ? "no" : "en"
+        );
+
+        if (resolvedIata) {
+          iata = resolvedIata;
+          resolvedFrom = {
+            placeName: String(placeName),
+            picked: picked
+              ? {
+                  code: picked.code,
+                  type: picked.type,
+                  name: picked.name,
+                  city_name: picked.city_name,
+                  country_name: picked.country_name,
+                }
+              : null,
+          };
+        }
+      }
+    }
+
     if (!iata || !checkIn || !checkOut) {
-      return res.status(400).json({ error: "Mangler iata/checkIn/checkOut" });
+      return res.status(400).json({ error: "Mangler iata (eller kunne ikke resolve) /checkIn/checkOut", details: { placeName } });
     }
 
     const adultsCount = Number(body.adultsCount ?? 2);
@@ -115,7 +233,7 @@ router.post("/hotels/start", authMiddleware, async (req, res) => {
       });
     }
 
-    return res.json({ ok: true, searchId: String(searchId) });
+    return res.json({ ok: true, searchId: String(searchId), resolvedIata: iata });
   } catch (e) {
     console.error("❌ /api/hotels/start feilet:", e?.response?.data || e?.message || e);
     return res.status(502).json({
