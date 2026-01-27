@@ -265,25 +265,25 @@ function buildOffersFromTpResults(data, searchId) {
   const legDep = (leg) =>
     pick(leg, [
       "local_departure_date_time",
-      "departure_at",
-      "local_departure",
-      "departure_time",
-      "depart_at",
       "departure_datetime",
       "time_departure",
-    ]);
+      "departure_at",
+      "local_departure",
+      "depart_at",
+      "departure_time",
+  ]);
 
   const legArr = (leg) =>
     pick(leg, [
       "local_arrival_date_time",
-      "arrival_at",
-      "local_arrival",
-      "arrival_time",
-      "arrive_at",
       "arrival_datetime",
       "time_arrival",
-    ]);
-
+      "arrival_at",
+      "local_arrival",
+      "arrive_at",
+      "arrival_time",
+  ]);
+  
   const legDurationMins = (leg) => {
     const raw = pick(leg, [
       "duration",
@@ -376,14 +376,66 @@ function buildOffersFromTpResults(data, searchId) {
       pick(t, ["local_arrival_date_time", "arrival_at", "local_arrival", "arrival_time"]) ||
       null;
 
-    let durationSum =
-      legs.length > 0
-        ? legs.reduce((acc, leg) => acc + (legDurationMins(leg) || 0), 0)
-        : (parseDurationToMinutes(t?.duration) ??
-          parseDurationToMinutes(t?.total_duration) ??
-          parseDurationToMinutes(t?.travel_time) ??
-          null);
+    function parseDateMs(v) {
+      if (!v) return null;
+      const ms = Date.parse(String(v));
+      return Number.isFinite(ms) ? ms : null;
+    }
 
+    function computeTotalDurationMinsFromLegs(legs) {
+      if (!legs?.length) return null;
+
+      const dep0 = parseDateMs(legDep(legs[0]));
+      const arrLast = parseDateMs(legArr(legs[legs.length - 1]));
+
+      // 1) Beste: første avgang -> siste ankomst (inkl. layovers)
+      if (dep0 != null && arrLast != null) {
+        let diffMin = Math.round((arrLast - dep0) / 60000);
+        if (diffMin < 0 && diffMin > -24 * 60) diffMin += 24 * 60; // mild wrap
+        return diffMin >= 0 ? diffMin : null;
+      }
+
+      // 2) Neste: summer flytid + layover gaps når vi kan
+      let total = 0;
+      let hasAny = false;
+
+      for (let i = 0; i < legs.length; i++) {
+        const lm = legDurationMins(legs[i]);
+        if (lm != null) {
+          total += lm;
+          hasAny = true;
+        }
+        if (i < legs.length - 1) {
+          const a = parseDateMs(legArr(legs[i]));
+          const d = parseDateMs(legDep(legs[i + 1]));
+          if (a != null && d != null) {
+            let gap = Math.round((d - a) / 60000);
+            if (gap < 0 && gap > -24 * 60) gap += 24 * 60;
+            if (gap > 0) {
+              total += gap;
+              hasAny = true;
+            }
+          }
+        }
+      }
+
+      return hasAny ? total : null;
+    }
+      
+    // Total varighet inkl. layovers
+    let durationSum = legs.length > 0 ? computeTotalDurationMinsFromLegs(legs) : null;
+
+    // Ticket-level fallback (kan ofte være total inkl. layovers)
+    if (durationSum == null) {
+      durationSum =
+        parseDurationToMinutes(t?.total_duration) ??
+        parseDurationToMinutes(t?.duration) ??
+        parseDurationToMinutes(t?.travel_time) ??
+        null;
+    }
+
+    const durationText = durationSum != null ? fmtDurationMins(durationSum) : "";
+      
     // Hvis vi fortsatt ikke har varighet: regn ut fra første dep til siste arr
     if (durationSum == null || durationSum === 0) {
       const d0 = dep; // dep du allerede har plukket ut
