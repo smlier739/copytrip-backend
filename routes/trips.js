@@ -15,18 +15,52 @@ import { sanitizeUrl } from "../services/utils/sanitizeUrl.js";
 import { getUserEntitlements } from "../services/utils/entitlements.js";
 
 // Trip services (tilpass hvis du har dem andre steder)
-import { generateGalleryForTrip } from "../services/gallery/galleryService.js";
+import { generateGalleryForTrip, getGenericVirtualTripGallery } from "../services/gallery/galleryService.js";
 import { inferCountryForTrip } from "../services/travelAdvice/inferCountryForTrip.js";
 import { buildTravelAdviceText } from "../services/travelAdvice/buildTravelAdviceText.js";
 import { extractDestinationFromStop1 } from "../services/trips/extractDestinationFromStop1.js";
-import { getGenericVirtualTripGallery } from "../services/gallery/galleryService.js";
 
 const router = express.Router();
 
-/**
- * GET /api/trips/:id/packing-list  (mounted as /:id/packing-list)
- * Pro-only, med canonical override hvis episode-trip
- */
+/* --------------------------------------------------
+   Helpers: stops normalization + destination
+-------------------------------------------------- */
+
+function normalizeStops(stopsRaw) {
+  const arr = Array.isArray(stopsRaw) ? stopsRaw : parseJsonArray(stopsRaw);
+  return (arr || [])
+    .filter((s) => s && typeof s === "object")
+    .map((s) => {
+      const iata =
+        (s.iata || s.code || s.airport_iata || s.airportIata || s.iata_code || "")
+          .toString()
+          .trim()
+          .toUpperCase() || null;
+
+      const name =
+        (s.name || s.city || s.place || s.location || s.title || "").toString().trim() || null;
+
+      const country =
+        (s.country || s.country_name || s.countryName || "").toString().trim() || null;
+
+      return { ...s, iata, name, country };
+    });
+}
+
+function pickDestinationFromStops(stopsNorm) {
+  const s0 = Array.isArray(stopsNorm) ? stopsNorm[0] : null;
+  if (!s0) return null;
+  return {
+    name: s0.name || null,
+    country: s0.country || null,
+    iata: s0.iata || null,
+  };
+}
+
+/* --------------------------------------------------
+   GET /api/trips/:id/packing-list (Pro)
+-------------------------------------------------- */
+
 router.get("/:id/packing-list", authMiddleware, requirePro, async (req, res) => {
   try {
     const tripId = req.params.id;
@@ -73,11 +107,10 @@ router.get("/:id/packing-list", authMiddleware, requirePro, async (req, res) => 
   }
 });
 
-/**
- * GET /api/trips/:id/experiences (mounted as /:id/experiences)
- * - Gratis: preview (3 første uten url)
- * - Pro: full liste med url
- */
+/* --------------------------------------------------
+   GET /api/trips/:id/experiences
+-------------------------------------------------- */
+
 router.get("/:id/experiences", authMiddleware, async (req, res) => {
   try {
     const tripId = req.params.id;
@@ -129,7 +162,6 @@ router.get("/:id/experiences", authMiddleware, async (req, res) => {
       name: x?.name || x?.title || "Opplevelse",
       location: x?.location || x?.city || x?.area || null,
       description: x?.description || null,
-      // url utelates i preview
     }));
 
     return res.json({
@@ -145,10 +177,10 @@ router.get("/:id/experiences", authMiddleware, async (req, res) => {
   }
 });
 
-/**
- * POST /api/trips (mounted as /)
- * Opprett reise
- */
+/* --------------------------------------------------
+   POST /api/trips
+-------------------------------------------------- */
+
 router.post("/", authMiddleware, async (req, res) => {
   try {
     let {
@@ -178,20 +210,17 @@ router.post("/", authMiddleware, async (req, res) => {
       return [];
     };
 
-    // --- valider title ---
     if (!title || !String(title).trim()) {
       return res.status(400).json({ error: "Mangler title i request body." });
     }
     title = String(title).trim();
 
-    // --- input parsing ---
     let finalStops = parseArrayField(stops);
     let finalPacking = parseArrayField(packing_list);
     let finalHotels = parseArrayField(hotels);
     let finalGallery = parseArrayField(gallery);
     let finalExperiences = parseArrayField(experiences);
 
-    // --- episode basert: copy canonical hvis klient mangler felt ---
     let sourceType = source_type || null;
 
     if (source_episode_id) {
@@ -212,44 +241,34 @@ router.post("/", authMiddleware, async (req, res) => {
       if (sysRes.rowCount > 0) {
         const sys = sysRes.rows[0];
 
-        // hvis klienten mangler stops → bruk system
-        if (!Array.isArray(finalStops) || finalStops.length === 0) {
-          finalStops = parseArrayField(sys.stops);
-        }
-        if (!Array.isArray(finalPacking) || finalPacking.length === 0) {
-          finalPacking = parseArrayField(sys.packing_list);
-        }
-        if (!Array.isArray(finalHotels) || finalHotels.length === 0) {
-          finalHotels = parseArrayField(sys.hotels);
-        }
+        if (!Array.isArray(finalStops) || finalStops.length === 0) finalStops = parseArrayField(sys.stops);
+        if (!Array.isArray(finalPacking) || finalPacking.length === 0) finalPacking = parseArrayField(sys.packing_list);
+        if (!Array.isArray(finalHotels) || finalHotels.length === 0) finalHotels = parseArrayField(sys.hotels);
+
         if (!Array.isArray(finalGallery) || finalGallery.length === 0) {
           const g = parseArrayField(sys.gallery);
           if (g.length) finalGallery = g;
         }
-        if (!Array.isArray(finalExperiences) || finalExperiences.length === 0) {
-          finalExperiences = parseArrayField(sys.experiences);
-        }
+
+        if (!Array.isArray(finalExperiences) || finalExperiences.length === 0) finalExperiences = parseArrayField(sys.experiences);
       }
 
       if (!Array.isArray(finalStops) || finalStops.length === 0) {
         return res.status(400).json({
-          error:
-            "Episode-reise mangler stops. Fant heller ingen system-trip å kopiere stops fra.",
+          error: "Episode-reise mangler stops. Fant heller ingen system-trip å kopiere stops fra.",
         });
       }
     } else {
-      // ikke-episode: må ha stops
       if (!Array.isArray(finalStops) || finalStops.length === 0) {
         return res.status(400).json({ error: "Mangler stops (array) i request body." });
       }
 
-      // generer galleri hvis tomt
       if (!Array.isArray(finalGallery) || finalGallery.length === 0) {
         finalGallery = await generateGalleryForTrip(title, description, finalStops);
       }
     }
 
-    // --- URL sanitize/fallback ---
+    // URL sanitize/fallback
     finalHotels = (finalHotels || []).map((h) => {
       const direct =
         sanitizeUrl(h?.url) ||
@@ -271,7 +290,6 @@ router.post("/", authMiddleware, async (req, res) => {
         makeExperienceUrl(x),
     }));
 
-    // --- lagre i DB (DB normaliserer stops via normalize_stop) ---
     const insert = await pool.query(
       `
       INSERT INTO trips (
@@ -323,11 +341,15 @@ router.post("/", authMiddleware, async (req, res) => {
 
     const row = insert.rows[0];
 
+    const stopsNorm = normalizeStops(row.stops);
+    const destination = pickDestinationFromStops(stopsNorm);
+
     return res.status(201).json({
       ok: true,
       trip: {
         ...row,
-        stops: Array.isArray(row.stops) ? row.stops : parseJsonArray(row.stops),
+        stops: stopsNorm,
+        destination,
         packing_list: parseJsonArray(row.packing_list),
         hotels: parseJsonArray(row.hotels),
         gallery: parseJsonArray(row.gallery),
@@ -340,10 +362,11 @@ router.post("/", authMiddleware, async (req, res) => {
   }
 });
 
-/**
- * GET /api/trips/:id (mounted as /:id)
- * Canonical override + entitlements gating
- */
+/* --------------------------------------------------
+   GET /api/trips/:id
+   Canonical override + entitlements gating + destination
+-------------------------------------------------- */
+
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
     const tripId = req.params.id;
@@ -413,6 +436,11 @@ router.get("/:id", authMiddleware, async (req, res) => {
       }
     }
 
+    const stopsNorm = normalizeStops(stops);
+    const destination =
+      pickDestinationFromStops(stopsNorm) ||
+      (typeof extractDestinationFromStop1 === "function" ? extractDestinationFromStop1(stopsNorm) : null);
+
     const hotelsFull = (hotels || [])
       .filter((h) => h && typeof h === "object")
       .map((h) => ({ ...h, url: makeHotelUrl(h) }));
@@ -453,7 +481,8 @@ router.get("/:id", authMiddleware, async (req, res) => {
       created_at: row.created_at,
       updated_at: row.updated_at,
 
-      stops,
+      stops: stopsNorm,
+      destination,
       gallery,
 
       hotels: isPro ? hotelsFull : hotelsPreview,
@@ -465,8 +494,8 @@ router.get("/:id", authMiddleware, async (req, res) => {
         hotels: hotelsFull.length,
         experiences: experiencesFull.length,
         packing_list: Array.isArray(packingFull) ? packingFull.length : 0,
-        stops: stops.length,
-        gallery: gallery.length,
+        stops: stopsNorm.length,
+        gallery: Array.isArray(gallery) ? gallery.length : 0,
       },
     });
   } catch (err) {
@@ -475,9 +504,11 @@ router.get("/:id", authMiddleware, async (req, res) => {
   }
 });
 
-/**
- * GET /api/trips/:id/hotels (mounted as /:id/hotels)
- */
+/* --------------------------------------------------
+   GET /api/trips/:id/hotels
+   Returnerer destination (inkl iata) + entitlements gating
+-------------------------------------------------- */
+
 router.get("/:id/hotels", authMiddleware, async (req, res) => {
   try {
     const tripId = req.params.id;
@@ -500,12 +531,14 @@ router.get("/:id/hotels", authMiddleware, async (req, res) => {
     }
 
     const row = tripRes.rows[0];
+
+    let stops = parseJsonArray(row.stops);
     let hotels = parseJsonArray(row.hotels);
 
     if (row.source_episode_id) {
       const canonRes = await pool.query(
         `
-        SELECT hotels
+        SELECT hotels, stops
         FROM trips
         WHERE source_type = 'grenselos_episode'
           AND source_episode_id = $1
@@ -514,8 +547,19 @@ router.get("/:id/hotels", authMiddleware, async (req, res) => {
         `,
         [row.source_episode_id]
       );
-      if (canonRes.rows?.[0]) hotels = parseJsonArray(canonRes.rows[0].hotels);
+      if (canonRes.rows?.[0]) {
+        hotels = parseJsonArray(canonRes.rows[0].hotels);
+        const canonStops = parseJsonArray(canonRes.rows[0].stops);
+        if (canonStops.length) stops = canonStops;
+      }
     }
+
+    const stopsNorm = normalizeStops(stops);
+
+    // foretrekk vår deterministiske destination
+    const destination =
+      pickDestinationFromStops(stopsNorm) ||
+      (typeof extractDestinationFromStop1 === "function" ? extractDestinationFromStop1(stopsNorm) : null);
 
     const hotelsFull = (hotels || [])
       .filter((h) => h && typeof h === "object")
@@ -528,8 +572,6 @@ router.get("/:id/hotels", authMiddleware, async (req, res) => {
       name: h?.name || h?.title || "Hotell",
       location: h?.location || h?.city || h?.area || null,
     }));
-
-    const destination = extractDestinationFromStop1(row.stops);
 
     return res.json({
       ok: true,
@@ -550,9 +592,10 @@ router.get("/:id/hotels", authMiddleware, async (req, res) => {
   }
 });
 
-/**
- * GET /api/trips/:id/travel-advice (mounted as /:id/travel-advice)
- */
+/* --------------------------------------------------
+   GET /api/trips/:id/travel-advice
+-------------------------------------------------- */
+
 router.get("/:id/travel-advice", authMiddleware, async (req, res) => {
   try {
     const tripId = (req.params.id || "").toString().trim();
@@ -573,7 +616,7 @@ router.get("/:id/travel-advice", authMiddleware, async (req, res) => {
     }
 
     const trip = tripRes.rows[0];
-    const tripNormalized = { ...trip, stops: parseJsonArray(trip.stops) };
+    const tripNormalized = { ...trip, stops: normalizeStops(trip.stops) };
 
     let country = null;
     try {
@@ -599,9 +642,10 @@ router.get("/:id/travel-advice", authMiddleware, async (req, res) => {
   }
 });
 
-/**
- * POST /api/trips/:id/delete (mounted as /:id/delete)
- */
+/* --------------------------------------------------
+   POST /api/trips/:id/delete
+-------------------------------------------------- */
+
 router.post("/:id/delete", authMiddleware, async (req, res) => {
   try {
     const tripId = req.params.id;
@@ -629,10 +673,7 @@ router.post("/:id/delete", authMiddleware, async (req, res) => {
       });
     }
 
-    const result = await pool.query(
-      `DELETE FROM trips WHERE id = $1 AND user_id = $2 RETURNING id`,
-      [tripId, userId]
-    );
+    const result = await pool.query(`DELETE FROM trips WHERE id = $1 AND user_id = $2 RETURNING id`, [tripId, userId]);
 
     if (result.rowCount === 0) {
       return res.status(404).json({ error: "Reise ikke funnet." });
@@ -645,10 +686,13 @@ router.post("/:id/delete", authMiddleware, async (req, res) => {
   }
 });
 
-/**
- * GET /api/trips (mounted as /)
- * Liste over brukerreiser (med canonical override for episode-trips)
- */
+/* --------------------------------------------------
+   GET /api/trips
+   Liste over brukerreiser (canonical override for episode-trips)
+   + FIX: ikke dobbelt-parse canonical arrays
+   + destination i liste
+-------------------------------------------------- */
+
 router.get("/", authMiddleware, async (req, res) => {
   try {
     const ent = await getUserEntitlements(req.user.id);
@@ -689,6 +733,7 @@ router.get("/", authMiddleware, async (req, res) => {
           hotels,
           packing_list,
           experiences,
+          stops,
           created_at
         FROM trips
         WHERE source_type = 'grenselos_episode'
@@ -698,6 +743,7 @@ router.get("/", authMiddleware, async (req, res) => {
         [episodeIds]
       );
 
+      // ✅ lagrer PARSET arrays én gang
       canonicalByEpisodeId = canonRes.rows.reduce((acc, row) => {
         const epId = row.source_episode_id;
         if (!epId) return acc;
@@ -707,6 +753,7 @@ router.get("/", authMiddleware, async (req, res) => {
             hotels: parseJsonArray(row.hotels),
             packing_list: row.packing_list,
             experiences: parseJsonArray(row.experiences),
+            stops: parseJsonArray(row.stops),
           };
         }
         return acc;
@@ -714,7 +761,7 @@ router.get("/", authMiddleware, async (req, res) => {
     }
 
     const trips = rows.map((row) => {
-      const stops = parseJsonArray(row.stops);
+      let stops = parseJsonArray(row.stops);
 
       let gallery = parseJsonArray(row.gallery);
       let hotels = parseJsonArray(row.hotels);
@@ -725,15 +772,23 @@ router.get("/", authMiddleware, async (req, res) => {
 
       if (episodeId && canonicalByEpisodeId[episodeId]) {
         const canon = canonicalByEpisodeId[episodeId];
-        gallery = parseJsonArray(canon.gallery);
-        hotels = parseJsonArray(canon.hotels);
+
+        // ✅ IKKE parse igjen
+        stops = canon.stops;
+        gallery = canon.gallery;
+        hotels = canon.hotels;
         packing = canon.packing_list;
-        experiences = parseJsonArray(canon.experiences);
+        experiences = canon.experiences;
       } else {
         if (!Array.isArray(gallery) || gallery.length === 0) {
           gallery = getGenericVirtualTripGallery(3);
         }
       }
+
+      const stopsNorm = normalizeStops(stops);
+      const destination =
+        pickDestinationFromStops(stopsNorm) ||
+        (typeof extractDestinationFromStop1 === "function" ? extractDestinationFromStop1(stopsNorm) : null);
 
       const hotelsFull = (hotels || [])
         .filter((h) => h && typeof h === "object")
@@ -765,7 +820,8 @@ router.get("/", authMiddleware, async (req, res) => {
 
       return {
         ...row,
-        stops,
+        stops: stopsNorm,
+        destination,
         gallery,
 
         hotels: isPro ? hotelsFull : hotelsPreview,
