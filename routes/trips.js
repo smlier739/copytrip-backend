@@ -1,4 +1,5 @@
 // backend/routes/trips.js (ESM)
+import axios from "axios";
 import express from "express";
 import authMiddleware from "../middleware/authMiddleware.js";
 import requirePro from "../middleware/requirePro.js";
@@ -21,6 +22,65 @@ import { buildTravelAdviceText } from "../services/travelAdvice/buildTravelAdvic
 import { extractDestinationFromStop1 } from "../services/trips/extractDestinationFromStop1.js";
 
 const router = express.Router();
+
+const TP_PLACES_URL = "https://autocomplete.travelpayouts.com/places2";
+
+// Finn beste "place" fra TP autocomplete (prefer city)
+function pickBestPlace(places = []) {
+  const arr = Array.isArray(places) ? places : [];
+  if (!arr.length) return null;
+
+  const city = arr.find((p) => String(p?.type || "").toLowerCase() === "city" && p?.code);
+  if (city) return city;
+
+  const airport = arr.find((p) => String(p?.type || "").toLowerCase() === "airport" && p?.code);
+  if (airport) return airport;
+
+  return arr.find((p) => p?.code) || null;
+}
+
+async function resolveIataFromPlaceName(placeName, locale = "no") {
+  const term = String(placeName || "").trim();
+  if (!term) return null;
+
+  const r = await axios.get(TP_PLACES_URL, {
+    params: { term, locale, "types[]": ["city", "airport"] },
+    timeout: 12000,
+  });
+
+  const raw = Array.isArray(r.data) ? r.data : [];
+  const picked = pickBestPlace(raw);
+  const code = picked?.code ? String(picked.code).trim().toUpperCase() : null;
+  return code || null;
+}
+
+/**
+ * Persist iata inn i stops[0] i DB (jsonb array)
+ * - tripId: target trip row id
+ * - iata: "RAI"
+ */
+async function persistStop1Iata(tripId, iata) {
+  const code = String(iata || "").trim().toUpperCase();
+  if (!code) return false;
+
+  // stops[0] finnes? setter {0,iata}
+  const r = await pool.query(
+    `
+    UPDATE trips
+    SET stops = jsonb_set(
+      COALESCE(stops, '[]'::jsonb),
+      '{0,iata}',
+      to_jsonb($2::text),
+      true
+    ),
+    updated_at = NOW()
+    WHERE id = $1
+    `,
+    [tripId, code]
+  );
+
+  return r.rowCount > 0;
+}
 
 /* --------------------------------------------------
    Helpers: stops normalization + destination
@@ -437,10 +497,37 @@ router.get("/:id", authMiddleware, async (req, res) => {
     }
 
     const stopsNorm = normalizeStops(stops);
-    const destination =
+
+    // 1) bygg destination fra stop1
+    let destination =
       pickDestinationFromStops(stopsNorm) ||
       (typeof extractDestinationFromStop1 === "function" ? extractDestinationFromStop1(stopsNorm) : null);
 
+    // 2) hvis iata mangler -> resolve + persist
+    if (!destination?.iata) {
+      const placeName =
+        String(destination?.name || "").trim() ||
+        String(stopsNorm?.[0]?.name || "").trim() ||
+        String(stopsNorm?.[0]?.city || "").trim() ||
+        String(stopsNorm?.[0]?.location || "").trim();
+
+      const locale = "no";
+      const resolvedIata = await resolveIataFromPlaceName(placeName, locale);
+
+      if (resolvedIata) {
+          // Persister på RIKTIG row:
+          // - Hvis dette er en episode-trip: vi har lest canonical stops fra canonical row (hvis du gjorde det),
+          //   men i denne handleren har vi `row.id` for bruker-trip.
+          //   Velg strategi:
+          //   a) persister alltid på bruker-trip (row.id) ✅
+        await persistStop1Iata(row.id, resolvedIata);
+
+        // Oppdater responsobjektet også
+        destination = { ...(destination || {}), iata: resolvedIata };
+      }
+    }
+
+    // bruk destination videre i responsen
     const hotelsFull = (hotels || [])
       .filter((h) => h && typeof h === "object")
       .map((h) => ({ ...h, url: makeHotelUrl(h) }));
@@ -556,10 +643,36 @@ router.get("/:id/hotels", authMiddleware, async (req, res) => {
 
     const stopsNorm = normalizeStops(stops);
 
-    // foretrekk vår deterministiske destination
-    const destination =
+    // 1) bygg destination fra stop1
+    let destination =
       pickDestinationFromStops(stopsNorm) ||
       (typeof extractDestinationFromStop1 === "function" ? extractDestinationFromStop1(stopsNorm) : null);
+
+    // 2) hvis iata mangler -> resolve + persist
+    if (!destination?.iata) {
+      const placeName =
+        String(destination?.name || "").trim() ||
+        String(stopsNorm?.[0]?.name || "").trim() ||
+        String(stopsNorm?.[0]?.city || "").trim() ||
+        String(stopsNorm?.[0]?.location || "").trim();
+
+      const locale = "no";
+      const resolvedIata = await resolveIataFromPlaceName(placeName, locale);
+
+      if (resolvedIata) {
+          // Persister på RIKTIG row:
+          // - Hvis dette er en episode-trip: vi har lest canonical stops fra canonical row (hvis du gjorde det),
+          //   men i denne handleren har vi `row.id` for bruker-trip.
+          //   Velg strategi:
+          //   a) persister alltid på bruker-trip (row.id) ✅
+        await persistStop1Iata(row.id, resolvedIata);
+
+        // Oppdater responsobjektet også
+        destination = { ...(destination || {}), iata: resolvedIata };
+      }
+    }
+
+    // bruk destination videre i responsen
 
     const hotelsFull = (hotels || [])
       .filter((h) => h && typeof h === "object")
@@ -786,10 +899,37 @@ router.get("/", authMiddleware, async (req, res) => {
       }
 
       const stopsNorm = normalizeStops(stops);
-      const destination =
+
+      // 1) bygg destination fra stop1
+      let destination =
         pickDestinationFromStops(stopsNorm) ||
         (typeof extractDestinationFromStop1 === "function" ? extractDestinationFromStop1(stopsNorm) : null);
 
+      // 2) hvis iata mangler -> resolve + persist
+      if (!destination?.iata) {
+        const placeName =
+          String(destination?.name || "").trim() ||
+          String(stopsNorm?.[0]?.name || "").trim() ||
+          String(stopsNorm?.[0]?.city || "").trim() ||
+          String(stopsNorm?.[0]?.location || "").trim();
+
+        const locale = "no";
+        const resolvedIata = await resolveIataFromPlaceName(placeName, locale);
+
+        if (resolvedIata) {
+            // Persister på RIKTIG row:
+            // - Hvis dette er en episode-trip: vi har lest canonical stops fra canonical row (hvis du gjorde det),
+            //   men i denne handleren har vi `row.id` for bruker-trip.
+            //   Velg strategi:
+            //   a) persister alltid på bruker-trip (row.id) ✅
+          await persistStop1Iata(row.id, resolvedIata);
+
+          // Oppdater responsobjektet også
+          destination = { ...(destination || {}), iata: resolvedIata };
+        }
+      }
+
+      // bruk destination videre i responsen
       const hotelsFull = (hotels || [])
         .filter((h) => h && typeof h === "object")
         .map((h) => ({ ...h, url: makeHotelUrl(h) }));
