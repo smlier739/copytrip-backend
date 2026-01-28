@@ -1,4 +1,5 @@
 // backend/routes/trips.js (ESM)
+
 import axios from "axios";
 import express from "express";
 import authMiddleware from "../middleware/authMiddleware.js";
@@ -15,8 +16,11 @@ import { sanitizeUrl } from "../services/utils/sanitizeUrl.js";
 
 import { getUserEntitlements } from "../services/utils/entitlements.js";
 
-// Trip services (tilpass hvis du har dem andre steder)
-import { generateGalleryForTrip, getGenericVirtualTripGallery } from "../services/gallery/galleryService.js";
+// Trip services
+import {
+  generateGalleryForTrip,
+  getGenericVirtualTripGallery,
+} from "../services/gallery/galleryService.js";
 import { inferCountryForTrip } from "../services/travelAdvice/inferCountryForTrip.js";
 import { buildTravelAdviceText } from "../services/travelAdvice/buildTravelAdviceText.js";
 import { extractDestinationFromStop1 } from "../services/trips/extractDestinationFromStop1.js";
@@ -25,15 +29,22 @@ const router = express.Router();
 
 const TP_PLACES_URL = "https://autocomplete.travelpayouts.com/places2";
 
-// Finn beste "place" fra TP autocomplete (prefer city)
+/* --------------------------------------------------
+   TP Places: pick + resolve IATA
+-------------------------------------------------- */
+
 function pickBestPlace(places = []) {
   const arr = Array.isArray(places) ? places : [];
   if (!arr.length) return null;
 
-  const city = arr.find((p) => String(p?.type || "").toLowerCase() === "city" && p?.code);
+  const city = arr.find(
+    (p) => String(p?.type || "").toLowerCase() === "city" && p?.code
+  );
   if (city) return city;
 
-  const airport = arr.find((p) => String(p?.type || "").toLowerCase() === "airport" && p?.code);
+  const airport = arr.find(
+    (p) => String(p?.type || "").toLowerCase() === "airport" && p?.code
+  );
   if (airport) return airport;
 
   return arr.find((p) => p?.code) || null;
@@ -54,16 +65,38 @@ async function resolveIataFromPlaceName(placeName, locale = "no") {
   return code || null;
 }
 
-/**
- * Persist iata inn i stops[0] i DB (jsonb array)
- * - tripId: target trip row id
- * - iata: "RAI"
- */
-async function persistStop1Iata(tripId, iata) {
+/* --------------------------------------------------
+   Persist iata into stops[0] on a specific trip row
+   (secure: requires user_id match)
+-------------------------------------------------- */
+
+async function persistStop1Iata(tripId, userId, iata) {
   const code = String(iata || "").trim().toUpperCase();
   if (!code) return false;
 
-  // stops[0] finnes? setter {0,iata}
+  const r = await pool.query(
+    `
+    UPDATE trips
+    SET stops = jsonb_set(
+      COALESCE(stops, '[]'::jsonb),
+      '{0,iata}',
+      to_jsonb($3::text),
+      true
+    ),
+    updated_at = NOW()
+    WHERE id = $1 AND user_id = $2
+    `,
+    [tripId, userId, code]
+  );
+
+  return r.rowCount > 0;
+}
+
+// For canonical system trip (no user_id constraint, but restricted to correct type/id)
+async function persistCanonicalStop1Iata(canonicalTripId, iata) {
+  const code = String(iata || "").trim().toUpperCase();
+  if (!code) return false;
+
   const r = await pool.query(
     `
     UPDATE trips
@@ -74,9 +107,9 @@ async function persistStop1Iata(tripId, iata) {
       true
     ),
     updated_at = NOW()
-    WHERE id = $1
+    WHERE id = $1 AND source_type = 'grenselos_episode'
     `,
-    [tripId, code]
+    [canonicalTripId, code]
   );
 
   return r.rowCount > 0;
@@ -88,20 +121,37 @@ async function persistStop1Iata(tripId, iata) {
 
 function normalizeStops(stopsRaw) {
   const arr = Array.isArray(stopsRaw) ? stopsRaw : parseJsonArray(stopsRaw);
+
   return (arr || [])
     .filter((s) => s && typeof s === "object")
     .map((s) => {
       const iata =
-        (s.iata || s.code || s.airport_iata || s.airportIata || s.iata_code || "")
+        (s.iata ||
+          s.code ||
+          s.airport_iata ||
+          s.airportIata ||
+          s.iata_code ||
+          "")
           .toString()
           .trim()
           .toUpperCase() || null;
 
       const name =
-        (s.name || s.city || s.place || s.location || s.title || "").toString().trim() || null;
+        (s.name ||
+          s.city ||
+          s.place ||
+          s.location ||
+          s.title ||
+          s.label ||
+          s.destinationName ||
+          "")
+          .toString()
+          .trim() || null;
 
       const country =
-        (s.country || s.country_name || s.countryName || "").toString().trim() || null;
+        (s.country || s.country_name || s.countryName || "")
+          .toString()
+          .trim() || null;
 
       return { ...s, iata, name, country };
     });
@@ -110,11 +160,58 @@ function normalizeStops(stopsRaw) {
 function pickDestinationFromStops(stopsNorm) {
   const s0 = Array.isArray(stopsNorm) ? stopsNorm[0] : null;
   if (!s0) return null;
-  return {
-    name: s0.name || null,
-    country: s0.country || null,
-    iata: s0.iata || null,
-  };
+  return { name: s0.name || null, country: s0.country || null, iata: s0.iata || null };
+}
+
+function buildPlaceNameForIataLookup(destination, stopsNorm) {
+  const s0 = Array.isArray(stopsNorm) ? stopsNorm[0] : null;
+  const name =
+    String(destination?.name || "").trim() ||
+    String(s0?.name || "").trim() ||
+    String(s0?.city || "").trim() ||
+    String(s0?.location || "").trim() ||
+    "";
+
+  const country = String(destination?.country || s0?.country || "").trim();
+
+  // Prefer "Name, Country" if we have both
+  if (name && country && !name.toLowerCase().includes(country.toLowerCase())) {
+    return `${name}, ${country}`;
+  }
+  return name || "";
+}
+
+/**
+ * Ensure destination has iata. If missing:
+ * - resolve via TP autocomplete
+ * - persist into user-trip stops[0]
+ * - if episode-trip and we know canonicalTripId, persist there too
+ */
+async function ensureDestinationIata({
+  userTripId,
+  userId,
+  destination,
+  stopsNorm,
+  canonicalTripId = null,
+  locale = "no",
+}) {
+  if (destination?.iata) return destination;
+
+  const placeName = buildPlaceNameForIataLookup(destination, stopsNorm);
+  if (!placeName) return destination;
+
+  const resolvedIata = await resolveIataFromPlaceName(placeName, locale);
+  if (!resolvedIata) return destination;
+
+  // persist on user trip
+  await persistStop1Iata(userTripId, userId, resolvedIata);
+
+  // persist on canonical trip if relevant
+  if (canonicalTripId) {
+    await persistCanonicalStop1Iata(canonicalTripId, resolvedIata);
+  }
+
+  return { ...(destination || {}), iata: resolvedIata };
 }
 
 /* --------------------------------------------------
@@ -136,14 +233,13 @@ router.get("/:id/packing-list", authMiddleware, requirePro, async (req, res) => 
       [tripId, userId]
     );
 
-    if (tripRes.rows.length === 0) {
+    if (!tripRes.rows.length) {
       return res.status(404).json({ error: "Fant ikke denne reisen." });
     }
 
     const row = tripRes.rows[0];
     let packing = row.packing_list;
 
-    // episode-trip: canonical packing_list fra system-trip
     if (row.source_episode_id) {
       const canonRes = await pool.query(
         `
@@ -189,14 +285,13 @@ router.get("/:id/experiences", authMiddleware, async (req, res) => {
       [tripId, userId]
     );
 
-    if (tripRes.rows.length === 0) {
+    if (!tripRes.rows.length) {
       return res.status(404).json({ error: "Fant ikke denne reisen." });
     }
 
     const row = tripRes.rows[0];
     let experiences = parseJsonArray(row.experiences);
 
-    // episode-trip: canonical experiences
     if (row.source_episode_id) {
       const canonRes = await pool.query(
         `
@@ -209,9 +304,7 @@ router.get("/:id/experiences", authMiddleware, async (req, res) => {
         `,
         [row.source_episode_id]
       );
-      if (canonRes.rows?.[0]) {
-        experiences = parseJsonArray(canonRes.rows[0].experiences);
-      }
+      if (canonRes.rows?.[0]) experiences = parseJsonArray(canonRes.rows[0].experiences);
     }
 
     const experiencesFull = (experiences || [])
@@ -301,29 +394,31 @@ router.post("/", authMiddleware, async (req, res) => {
       if (sysRes.rowCount > 0) {
         const sys = sysRes.rows[0];
 
-        if (!Array.isArray(finalStops) || finalStops.length === 0) finalStops = parseArrayField(sys.stops);
-        if (!Array.isArray(finalPacking) || finalPacking.length === 0) finalPacking = parseArrayField(sys.packing_list);
-        if (!Array.isArray(finalHotels) || finalHotels.length === 0) finalHotels = parseArrayField(sys.hotels);
+        if (!Array.isArray(finalStops) || !finalStops.length) finalStops = parseArrayField(sys.stops);
+        if (!Array.isArray(finalPacking) || !finalPacking.length) finalPacking = parseArrayField(sys.packing_list);
+        if (!Array.isArray(finalHotels) || !finalHotels.length) finalHotels = parseArrayField(sys.hotels);
 
-        if (!Array.isArray(finalGallery) || finalGallery.length === 0) {
+        if (!Array.isArray(finalGallery) || !finalGallery.length) {
           const g = parseArrayField(sys.gallery);
           if (g.length) finalGallery = g;
         }
 
-        if (!Array.isArray(finalExperiences) || finalExperiences.length === 0) finalExperiences = parseArrayField(sys.experiences);
+        if (!Array.isArray(finalExperiences) || !finalExperiences.length) {
+          finalExperiences = parseArrayField(sys.experiences);
+        }
       }
 
-      if (!Array.isArray(finalStops) || finalStops.length === 0) {
+      if (!Array.isArray(finalStops) || !finalStops.length) {
         return res.status(400).json({
           error: "Episode-reise mangler stops. Fant heller ingen system-trip å kopiere stops fra.",
         });
       }
     } else {
-      if (!Array.isArray(finalStops) || finalStops.length === 0) {
+      if (!Array.isArray(finalStops) || !finalStops.length) {
         return res.status(400).json({ error: "Mangler stops (array) i request body." });
       }
 
-      if (!Array.isArray(finalGallery) || finalGallery.length === 0) {
+      if (!Array.isArray(finalGallery) || !finalGallery.length) {
         finalGallery = await generateGalleryForTrip(title, description, finalStops);
       }
     }
@@ -400,7 +495,6 @@ router.post("/", authMiddleware, async (req, res) => {
     );
 
     const row = insert.rows[0];
-
     const stopsNorm = normalizeStops(row.stops);
     const destination = pickDestinationFromStops(stopsNorm);
 
@@ -424,14 +518,15 @@ router.post("/", authMiddleware, async (req, res) => {
 
 /* --------------------------------------------------
    GET /api/trips/:id
-   Canonical override + entitlements gating + destination
+   Canonical override + entitlements gating + destination (with IATA ensure)
 -------------------------------------------------- */
 
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
     const tripId = req.params.id;
+    const userId = req.user.id;
 
-    const ent = await getUserEntitlements(req.user.id);
+    const ent = await getUserEntitlements(userId);
     const isPro = !!ent?.isPro;
 
     const tripRes = await pool.query(
@@ -455,10 +550,10 @@ router.get("/:id", authMiddleware, async (req, res) => {
       WHERE id = $1 AND user_id = $2
       LIMIT 1
       `,
-      [tripId, req.user.id]
+      [tripId, userId]
     );
 
-    if (tripRes.rows.length === 0) {
+    if (!tripRes.rows.length) {
       return res.status(404).json({ error: "Fant ikke denne reisen." });
     }
 
@@ -470,11 +565,12 @@ router.get("/:id", authMiddleware, async (req, res) => {
     let experiences = parseJsonArray(row.experiences);
     let packing = row.packing_list;
 
-    // canonical override for episode
+    let canonicalTripId = null;
+
     if (row.source_episode_id) {
       const canonRes = await pool.query(
         `
-        SELECT gallery, hotels, packing_list, experiences, stops
+        SELECT id, gallery, hotels, packing_list, experiences, stops
         FROM trips
         WHERE source_type = 'grenselos_episode'
           AND source_episode_id = $1
@@ -486,6 +582,8 @@ router.get("/:id", authMiddleware, async (req, res) => {
 
       const c = canonRes.rows?.[0] || null;
       if (c) {
+        canonicalTripId = c.id;
+
         const canonStops = parseJsonArray(c.stops);
         if (canonStops.length) stops = canonStops;
 
@@ -498,36 +596,21 @@ router.get("/:id", authMiddleware, async (req, res) => {
 
     const stopsNorm = normalizeStops(stops);
 
-    // 1) bygg destination fra stop1
     let destination =
       pickDestinationFromStops(stopsNorm) ||
-      (typeof extractDestinationFromStop1 === "function" ? extractDestinationFromStop1(stopsNorm) : null);
+      (typeof extractDestinationFromStop1 === "function"
+        ? extractDestinationFromStop1(stopsNorm)
+        : null);
 
-    // 2) hvis iata mangler -> resolve + persist
-    if (!destination?.iata) {
-      const placeName =
-        String(destination?.name || "").trim() ||
-        String(stopsNorm?.[0]?.name || "").trim() ||
-        String(stopsNorm?.[0]?.city || "").trim() ||
-        String(stopsNorm?.[0]?.location || "").trim();
+    destination = await ensureDestinationIata({
+      userTripId: row.id,
+      userId,
+      destination,
+      stopsNorm,
+      canonicalTripId,
+      locale: "no",
+    });
 
-      const locale = "no";
-      const resolvedIata = await resolveIataFromPlaceName(placeName, locale);
-
-      if (resolvedIata) {
-          // Persister på RIKTIG row:
-          // - Hvis dette er en episode-trip: vi har lest canonical stops fra canonical row (hvis du gjorde det),
-          //   men i denne handleren har vi `row.id` for bruker-trip.
-          //   Velg strategi:
-          //   a) persister alltid på bruker-trip (row.id) ✅
-        await persistStop1Iata(row.id, resolvedIata);
-
-        // Oppdater responsobjektet også
-        destination = { ...(destination || {}), iata: resolvedIata };
-      }
-    }
-
-    // bruk destination videre i responsen
     const hotelsFull = (hotels || [])
       .filter((h) => h && typeof h === "object")
       .map((h) => ({ ...h, url: makeHotelUrl(h) }));
@@ -551,11 +634,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 
     const packingPreview = Array.isArray(packingFull) ? packingFull.slice(0, 6) : [];
 
-    const locked = {
-      hotels: !isPro,
-      experiences: !isPro,
-      packing_list: !isPro,
-    };
+    const locked = { hotels: !isPro, experiences: !isPro, packing_list: !isPro };
 
     return res.json({
       id: row.id,
@@ -593,14 +672,15 @@ router.get("/:id", authMiddleware, async (req, res) => {
 
 /* --------------------------------------------------
    GET /api/trips/:id/hotels
-   Returnerer destination (inkl iata) + entitlements gating
+   Returns destination (incl iata) + entitlements gating
 -------------------------------------------------- */
 
 router.get("/:id/hotels", authMiddleware, async (req, res) => {
   try {
     const tripId = req.params.id;
+    const userId = req.user.id;
 
-    const ent = await getUserEntitlements(req.user.id);
+    const ent = await getUserEntitlements(userId);
     const isPro = !!ent?.isPro;
 
     const tripRes = await pool.query(
@@ -610,10 +690,10 @@ router.get("/:id/hotels", authMiddleware, async (req, res) => {
       WHERE id = $1 AND user_id = $2
       LIMIT 1
       `,
-      [tripId, req.user.id]
+      [tripId, userId]
     );
 
-    if (tripRes.rows.length === 0) {
+    if (!tripRes.rows.length) {
       return res.status(404).json({ error: "Fant ikke denne reisen." });
     }
 
@@ -622,10 +702,12 @@ router.get("/:id/hotels", authMiddleware, async (req, res) => {
     let stops = parseJsonArray(row.stops);
     let hotels = parseJsonArray(row.hotels);
 
+    let canonicalTripId = null;
+
     if (row.source_episode_id) {
       const canonRes = await pool.query(
         `
-        SELECT hotels, stops
+        SELECT id, hotels, stops
         FROM trips
         WHERE source_type = 'grenselos_episode'
           AND source_episode_id = $1
@@ -634,7 +716,10 @@ router.get("/:id/hotels", authMiddleware, async (req, res) => {
         `,
         [row.source_episode_id]
       );
+
       if (canonRes.rows?.[0]) {
+        canonicalTripId = canonRes.rows[0].id;
+
         hotels = parseJsonArray(canonRes.rows[0].hotels);
         const canonStops = parseJsonArray(canonRes.rows[0].stops);
         if (canonStops.length) stops = canonStops;
@@ -643,36 +728,20 @@ router.get("/:id/hotels", authMiddleware, async (req, res) => {
 
     const stopsNorm = normalizeStops(stops);
 
-    // 1) bygg destination fra stop1
     let destination =
       pickDestinationFromStops(stopsNorm) ||
-      (typeof extractDestinationFromStop1 === "function" ? extractDestinationFromStop1(stopsNorm) : null);
+      (typeof extractDestinationFromStop1 === "function"
+        ? extractDestinationFromStop1(stopsNorm)
+        : null);
 
-    // 2) hvis iata mangler -> resolve + persist
-    if (!destination?.iata) {
-      const placeName =
-        String(destination?.name || "").trim() ||
-        String(stopsNorm?.[0]?.name || "").trim() ||
-        String(stopsNorm?.[0]?.city || "").trim() ||
-        String(stopsNorm?.[0]?.location || "").trim();
-
-      const locale = "no";
-      const resolvedIata = await resolveIataFromPlaceName(placeName, locale);
-
-      if (resolvedIata) {
-          // Persister på RIKTIG row:
-          // - Hvis dette er en episode-trip: vi har lest canonical stops fra canonical row (hvis du gjorde det),
-          //   men i denne handleren har vi `row.id` for bruker-trip.
-          //   Velg strategi:
-          //   a) persister alltid på bruker-trip (row.id) ✅
-        await persistStop1Iata(row.id, resolvedIata);
-
-        // Oppdater responsobjektet også
-        destination = { ...(destination || {}), iata: resolvedIata };
-      }
-    }
-
-    // bruk destination videre i responsen
+    destination = await ensureDestinationIata({
+      userTripId: row.id,
+      userId,
+      destination,
+      stopsNorm,
+      canonicalTripId,
+      locale: "no",
+    });
 
     const hotelsFull = (hotels || [])
       .filter((h) => h && typeof h === "object")
@@ -711,7 +780,7 @@ router.get("/:id/hotels", authMiddleware, async (req, res) => {
 
 router.get("/:id/travel-advice", authMiddleware, async (req, res) => {
   try {
-    const tripId = (req.params.id || "").toString().trim();
+    const tripId = String(req.params.id || "").trim();
     if (!tripId) return res.status(400).json({ error: "Mangler trip-id i URL." });
 
     const tripRes = await pool.query(
@@ -773,7 +842,7 @@ router.post("/:id/delete", authMiddleware, async (req, res) => {
       [tripId, userId]
     );
 
-    if (checkRes.rowCount === 0) {
+    if (!checkRes.rowCount) {
       return res.status(404).json({ error: "Reise ikke funnet." });
     }
 
@@ -786,9 +855,12 @@ router.post("/:id/delete", authMiddleware, async (req, res) => {
       });
     }
 
-    const result = await pool.query(`DELETE FROM trips WHERE id = $1 AND user_id = $2 RETURNING id`, [tripId, userId]);
+    const result = await pool.query(
+      `DELETE FROM trips WHERE id = $1 AND user_id = $2 RETURNING id`,
+      [tripId, userId]
+    );
 
-    if (result.rowCount === 0) {
+    if (!result.rowCount) {
       return res.status(404).json({ error: "Reise ikke funnet." });
     }
 
@@ -801,9 +873,8 @@ router.post("/:id/delete", authMiddleware, async (req, res) => {
 
 /* --------------------------------------------------
    GET /api/trips
-   Liste over brukerreiser (canonical override for episode-trips)
-   + FIX: ikke dobbelt-parse canonical arrays
-   + destination i liste
+   List user trips
+   NOTE: No async IATA resolving here (avoid N+1 network calls)
 -------------------------------------------------- */
 
 router.get("/", authMiddleware, async (req, res) => {
@@ -856,7 +927,6 @@ router.get("/", authMiddleware, async (req, res) => {
         [episodeIds]
       );
 
-      // ✅ lagrer PARSET arrays én gang
       canonicalByEpisodeId = canonRes.rows.reduce((acc, row) => {
         const epId = row.source_episode_id;
         if (!epId) return acc;
@@ -885,8 +955,6 @@ router.get("/", authMiddleware, async (req, res) => {
 
       if (episodeId && canonicalByEpisodeId[episodeId]) {
         const canon = canonicalByEpisodeId[episodeId];
-
-        // ✅ IKKE parse igjen
         stops = canon.stops;
         gallery = canon.gallery;
         hotels = canon.hotels;
@@ -900,36 +968,13 @@ router.get("/", authMiddleware, async (req, res) => {
 
       const stopsNorm = normalizeStops(stops);
 
-      // 1) bygg destination fra stop1
-      let destination =
+      // Best-effort destination (NO network resolving here)
+      const destination =
         pickDestinationFromStops(stopsNorm) ||
-        (typeof extractDestinationFromStop1 === "function" ? extractDestinationFromStop1(stopsNorm) : null);
+        (typeof extractDestinationFromStop1 === "function"
+          ? extractDestinationFromStop1(stopsNorm)
+          : null);
 
-      // 2) hvis iata mangler -> resolve + persist
-      if (!destination?.iata) {
-        const placeName =
-          String(destination?.name || "").trim() ||
-          String(stopsNorm?.[0]?.name || "").trim() ||
-          String(stopsNorm?.[0]?.city || "").trim() ||
-          String(stopsNorm?.[0]?.location || "").trim();
-
-        const locale = "no";
-        const resolvedIata = await resolveIataFromPlaceName(placeName, locale);
-
-        if (resolvedIata) {
-            // Persister på RIKTIG row:
-            // - Hvis dette er en episode-trip: vi har lest canonical stops fra canonical row (hvis du gjorde det),
-            //   men i denne handleren har vi `row.id` for bruker-trip.
-            //   Velg strategi:
-            //   a) persister alltid på bruker-trip (row.id) ✅
-          await persistStop1Iata(row.id, resolvedIata);
-
-          // Oppdater responsobjektet også
-          destination = { ...(destination || {}), iata: resolvedIata };
-        }
-      }
-
-      // bruk destination videre i responsen
       const hotelsFull = (hotels || [])
         .filter((h) => h && typeof h === "object")
         .map((h) => ({ ...h, url: makeHotelUrl(h) }));
@@ -952,11 +997,7 @@ router.get("/", authMiddleware, async (req, res) => {
 
       const packingPreview = Array.isArray(packingFull) ? packingFull.slice(0, 6) : [];
 
-      const locked = {
-        hotels: !isPro,
-        experiences: !isPro,
-        packing_list: !isPro,
-      };
+      const locked = { hotels: !isPro, experiences: !isPro, packing_list: !isPro };
 
       return {
         ...row,
